@@ -1,0 +1,58 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  docker-compose.yml — Система контроля токарных станков
+#
+#  Запуск:   docker-compose up -d
+#  Остановка: docker-compose down
+#  Логи:     docker-compose logs -f
+#  Открыть:  http://localhost:8501
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  lathe_app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lathe_app
+    restart: unless-stopped
+    ports:
+      - "8501:8501"         # Основной порт Streamlit
+    volumes:
+      # Персистентное хранилище: БД + конфиг
+      - lathe_data:/data
+      # Опционально: монтировать свой config.yml (раскомментируйте)
+      # - ./config.yml:/data/config.yml:ro
+    environment:
+      - DB_PATH=/data/app.db
+      - CONFIG_PATH=/data/config.yml
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      # Укажите свой секрет cookie (измените в продакшене!)
+      - COOKIE_SECRET=lathe_control_super_secret_2024
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    # Ограничения ресурсов (опционально)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 512M
+    #       cpus: '0.5'
+    labels:
+      - "com.lathe.description=Lathe machine monitoring system"
+      - "com.lathe.version=1.0"
+
+volumes:
+  lathe_data:
+    driver: local
+    # Для production используйте внешний volume или bind mount:
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /opt/lathe_data
