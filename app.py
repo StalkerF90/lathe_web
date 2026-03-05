@@ -132,8 +132,21 @@ def init_db():
         );
     """)
 
-    # Начальные данные станков
-    if c.execute("SELECT COUNT(*) FROM machines").fetchone()[0] == 0:
+    # ── Начальные данные: только при самом первом запуске (таблицы только что созданы).
+    # После явного удаления пользователем через UI реестры остаются пустыми — не пересоздаём.
+    # Маркер первого запуска — таблица db_meta с флагом seeded.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS db_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    already_seeded = c.execute(
+        "SELECT value FROM db_meta WHERE key='seeded'"
+    ).fetchone()
+
+    if not already_seeded:
+        # Станки (6 шт.)
         machines_data = [
             ("Токарный ЧПУ №1",           "16К20",       12.0, "busy",  ""),
             ("Токарный ЧПУ №2",           "16К20",       10.0, "free",  ""),
@@ -147,8 +160,7 @@ def init_db():
             machines_data
         )
 
-    # Начальные данные операторов
-    if c.execute("SELECT COUNT(*) FROM operators").fetchone()[0] == 0:
+        # Операторы (5 чел.)
         operators_data = [
             ("Петров Иван Алексеевич",    "5-й разряд"),
             ("Сидоров Василий Петрович",  "4-й разряд"),
@@ -161,17 +173,16 @@ def init_db():
             operators_data
         )
 
-    # Демо-история за 10 дней
-    if c.execute("SELECT COUNT(*) FROM production").fetchone()[0] == 0:
+        # Демо-история за 10 дней (только при первом старте)
         import random
         random.seed(42)
-        machines = c.execute("SELECT id, productivity FROM machines").fetchall()
-        operators = c.execute("SELECT id FROM operators").fetchall()
+        machines_rows = c.execute("SELECT id, productivity FROM machines").fetchall()
+        operators_rows = c.execute("SELECT id FROM operators").fetchall()
         for delta in range(10, 0, -1):
             d = (date.today() - timedelta(days=delta)).isoformat()
-            for m in machines:
+            for m in machines_rows:
                 if random.random() < 0.75:
-                    op = random.choice(operators)
+                    op = random.choice(operators_rows)
                     qty = random.randint(int(m["productivity"] * 4),
                                         int(m["productivity"] * 9))
                     at  = round(qty / m["productivity"], 2)
@@ -187,6 +198,9 @@ def init_db():
                           f"П-{delta:03d}-{m['id']}",
                           round(random.uniform(0.25, 1.5), 2),
                           qty, at))
+
+        # Ставим флаг — больше не инициализируем
+        c.execute("INSERT INTO db_meta (key, value) VALUES ('seeded', '1')")
 
     conn.commit()
     conn.close()
@@ -387,7 +401,44 @@ def page_machines(role):
 def page_history(role):
     st.title("📋 История выпуска")
 
-    # Фильтры
+    # ── Кнопка «Очистить всю историю» — только для admin ──────────────
+    if role == "admin":
+        # Состояние диалога подтверждения хранится в session_state
+        if "confirm_clear_history" not in st.session_state:
+            st.session_state["confirm_clear_history"] = False
+
+        total_count = q("SELECT COUNT(*) AS cnt FROM production", fetch="one")
+        total_cnt   = total_count["cnt"] if total_count else 0
+
+        col_title, col_btn = st.columns([8, 2])
+        with col_btn:
+            if not st.session_state["confirm_clear_history"]:
+                if st.button("🗑 Очистить всю историю", type="primary",
+                             use_container_width=True,
+                             disabled=(total_cnt == 0)):
+                    st.session_state["confirm_clear_history"] = True
+                    st.rerun()
+            else:
+                # Диалог подтверждения
+                st.warning(
+                    "⚠️ **Вы уверены?**\n\n"
+                    "Вы хотите удалить **ВСЮ** историю выпуска "
+                    f"({total_cnt} записей). Это действие **невозможно отменить**."
+                )
+                yes_col, no_col = st.columns(2)
+                with yes_col:
+                    if st.button("✔ Да, удалить всё", type="primary",
+                                 use_container_width=True):
+                        exec_sql("DELETE FROM production")
+                        st.session_state["confirm_clear_history"] = False
+                        st.success("✅ Вся история выпуска удалена.")
+                        st.rerun()
+                with no_col:
+                    if st.button("✘ Отмена", use_container_width=True):
+                        st.session_state["confirm_clear_history"] = False
+                        st.rerun()
+
+    # ── Фильтры ────────────────────────────────────────────────────────
     with st.expander("🔍 Фильтры", expanded=True):
         fc1, fc2, fc3, fc4 = st.columns(4)
         machines  = q("SELECT id, name FROM machines ORDER BY name")
@@ -423,8 +474,13 @@ def page_history(role):
 
     rows = q(sql, params)
 
+    # ── Нулевое состояние: пустая таблица — просто сообщение ──────────
     if not rows:
-        st.info("Нет записей за выбранный период.")
+        any_records = q("SELECT COUNT(*) AS cnt FROM production", fetch="one")
+        if any_records and any_records["cnt"] == 0:
+            st.info("📭 Записей пока нет. Используйте форму «Внести выпуск» на странице «Станки».")
+        else:
+            st.info("Нет записей, соответствующих выбранным фильтрам.")
         return
 
     df = pd.DataFrame(rows)
@@ -443,12 +499,12 @@ def page_history(role):
 
     # Таблица
     if role == "admin":
-        st.markdown("*Для удаления — введите ID записи ниже таблицы*")
+        st.markdown("*Для удаления одной записи — введите её ID в форме ниже*")
 
     st.dataframe(df.drop(columns=["ID"] if role != "admin" else []),
                  use_container_width=True, hide_index=True,
                  column_config={
-                     "Выпущено":       st.column_config.NumberColumn(format="%d шт"),
+                     "Выпущено":        st.column_config.NumberColumn(format="%d шт"),
                      "Факт. время (ч)": st.column_config.NumberColumn(format="%.2f"),
                  })
 
@@ -919,7 +975,6 @@ def main():
         st.stop()
     elif auth_status is None:
         st.warning("⚠️ Введите логин и пароль.")
-        st.info("**Демо:** admin / admin123  |  user1 / user123")
         st.stop()
 
     # Авторизован
@@ -930,7 +985,7 @@ def main():
     with st.sidebar:
         st.markdown(f"""
 <div style="background:#2a2d40; border-radius:10px; padding:14px; margin-bottom:16px;">
-  <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">⚙️ ЛатхеКонтроль</div>
+  <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">⚙️ НТА Контроль</div>
   <div style="color:#8888aa; font-size:0.85rem; margin-top:4px;">
     👤 {st.session_state.get('name', username)}<br>
     🔑 {'Администратор' if role == 'admin' else 'Оператор'}
