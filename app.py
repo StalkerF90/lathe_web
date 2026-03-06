@@ -132,6 +132,25 @@ def init_db():
         );
     """)
 
+    # ── Миграции: добавляем новые колонки/таблицы в существующую БД без удаления данных ─
+    # actual_duration_minutes — фактическое время выпуска, введённое оператором вручную
+    existing_cols = [row[1] for row in
+                     c.execute("PRAGMA table_info(production)").fetchall()]
+    if "actual_duration_minutes" not in existing_cols:
+        c.execute("ALTER TABLE production ADD COLUMN actual_duration_minutes REAL DEFAULT NULL")
+
+    # Журнал смены статусов станков
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS machine_status_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id  INTEGER NOT NULL,
+            status      TEXT    NOT NULL,
+            changed_by  TEXT    DEFAULT '',
+            changed_at  TEXT    NOT NULL,
+            FOREIGN KEY (machine_id) REFERENCES machines(id)
+        )
+    """)
+
     # ── Начальные данные: только при самом первом запуске (таблицы только что созданы).
     # После явного удаления пользователем через UI реестры остаются пустыми — не пересоздаём.
     # Маркер первого запуска — таблица db_meta с флагом seeded.
@@ -255,15 +274,25 @@ def exec_sql(sql, params=()):
     return lid
 
 STATUS_LABELS = {
-    "busy":  "🔴 Занят",
-    "free":  "🟢 Свободен",
-    "setup": "🟡 Наладка",
-    "idle":  "⚫ Простой",
+    "busy":     "🔴 Занят",
+    "free":     "🟢 Свободен",
+    "setup":    "🟡 Наладка",
+    "idle":     "⚫ Простой",
+    "waiting":  "🔵 Ожидание материала",
+    "repair":   "🟠 Ремонт / ТО",
+    "break":    "⬜ Перерыв",
 }
 STATUS_COLORS = {
-    "busy": "#f94144", "free": "#43c59e",
-    "setup": "#f9c74f", "idle": "#6c6c8a",
+    "busy":    "#f94144",
+    "free":    "#43c59e",
+    "setup":   "#f9c74f",
+    "idle":    "#6c6c8a",
+    "waiting": "#56cfe1",
+    "repair":  "#ff8c42",
+    "break":   "#aaaacc",
 }
+# Полный упорядоченный список — пополняйте здесь при необходимости
+MACHINE_STATUSES = list(STATUS_LABELS.keys())
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  СТРАНИЦЫ
@@ -286,11 +315,9 @@ def page_machines(role):
     for m in machines:
         counts[m["status"]] = counts.get(m["status"], 0) + 1
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("🔴 Занят",    counts["busy"])
-    c2.metric("🟢 Свободен", counts["free"])
-    c3.metric("🟡 Наладка",  counts["setup"])
-    c4.metric("⚫ Простой",  counts["idle"])
+    stat_cols = st.columns(len(STATUS_LABELS))
+    for col, (sk, slabel) in zip(stat_cols, STATUS_LABELS.items()):
+        col.metric(slabel, counts.get(sk, 0))
 
     st.divider()
 
@@ -298,7 +325,6 @@ def page_machines(role):
     operators = q("SELECT id, name FROM operators ORDER BY name")
     op_map    = {0: "—"} | {o["id"]: o["name"] for o in operators}
 
-    # Последний выпуск для каждого станка
     last_prod = q("""
         SELECT p.machine_id,
                p.batch, p.batch_number,
@@ -340,22 +366,56 @@ def page_machines(role):
 
     st.divider()
 
+    # ── Смена статуса (доступна и user, и admin) ───────────────────────
+    st.markdown("### 🔄 Изменить статус станка")
+    with st.form("status_form", clear_on_submit=True):
+        sc1, sc2, sc3 = st.columns([3, 2, 2])
+        ch_machine = sc1.selectbox("Станок",
+            options=[m["id"] for m in machines],
+            format_func=lambda x: next(m["name"] for m in machines if m["id"] == x))
+        ch_status  = sc2.selectbox("Новый статус",
+            options=MACHINE_STATUSES,
+            format_func=lambda x: STATUS_LABELS.get(x, x))
+        ch_notes   = sc3.text_input("Примечание")
+        if st.form_submit_button("Обновить статус", use_container_width=True):
+            now_str  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            username = st.session_state.get("username", "")
+            exec_sql("UPDATE machines SET status=?, notes=? WHERE id=?",
+                     (ch_status, ch_notes, ch_machine))
+            exec_sql("""
+                INSERT INTO machine_status_log (machine_id, status, changed_by, changed_at)
+                VALUES (?,?,?,?)
+            """, (ch_machine, ch_status, username, now_str))
+            st.success(f"✅ Статус обновлён на «{STATUS_LABELS.get(ch_status, ch_status)}»")
+            st.rerun()
+
+    st.divider()
+
     # ── Ввод выпуска (User + Admin) ────────────────────────────────────
     st.markdown("### ➕ Внести выпуск")
     with st.form("production_form", clear_on_submit=True):
-        cols = st.columns([2, 2, 1, 2, 1, 1, 1])
-        sel_machine  = cols[0].selectbox("Станок*",
+        r1c1, r1c2, r1c3, r1c4 = st.columns([3, 3, 2, 2])
+        sel_machine  = r1c1.selectbox("Станок*",
             options=[m["id"] for m in machines],
             format_func=lambda x: next(m["name"] for m in machines if m["id"] == x))
-        sel_operator = cols[1].selectbox("Оператор",
+        sel_operator = r1c2.selectbox("Оператор",
             options=[0] + [o["id"] for o in operators],
             format_func=lambda x: op_map[x])
-        prod_date    = cols[2].date_input("Дата*", value=date.today())
-        batch_name   = cols[3].text_input("Название партии")
-        batch_no     = cols[3].text_input("№ партии")
-        setup_time   = cols[4].number_input("Наладка (ч)", min_value=0.0, step=0.25)
-        produced_qty = cols[5].number_input("Выпущено*", min_value=0, step=1)
-        notes_prod   = cols[6].text_input("Примечание")
+        prod_date    = r1c3.date_input("Дата*", value=date.today())
+        produced_qty = r1c4.number_input("Выпущено* (шт)", min_value=0, step=1)
+
+        r2c1, r2c2, r2c3, r2c4 = st.columns([3, 2, 2, 3])
+        batch_name   = r2c1.text_input("Название партии")
+        batch_no     = r2c2.text_input("№ партии")
+        setup_time   = r2c3.number_input("Наладка (ч)", min_value=0.0, step=0.25)
+        # ▶ НОВОЕ ПОЛЕ: фактическое время, введённое оператором
+        actual_dur_min = r2c4.number_input(
+            "Факт. время выпуска (мин)",
+            min_value=0.0, step=1.0, value=0.0,
+            help="Введите реально потраченное время на выпуск партии в минутах. "
+                 "0 — не заполнено."
+        )
+        notes_prod   = st.text_input("Примечание")
 
         submitted = st.form_submit_button("✔ Записать", type="primary",
                                           use_container_width=True)
@@ -363,38 +423,25 @@ def page_machines(role):
             if produced_qty <= 0:
                 st.error("Укажите количество выпущенных деталей.")
             else:
-                sel_m = next(m for m in machines if m["id"] == sel_machine)
-                actual = round(produced_qty / sel_m["productivity"], 3)
+                sel_m  = next(m for m in machines if m["id"] == sel_machine)
+                # Плановое время (из производительности)
+                plan_h = round(produced_qty / sel_m["productivity"], 3)
+                # Фактическое время: если введено > 0, сохраняем; иначе NULL
+                fact_min = float(actual_dur_min) if actual_dur_min > 0 else None
                 exec_sql("""
                     INSERT INTO production
                     (date, machine_id, operator_id, batch, batch_number,
-                     setup_time, produced_qty, actual_time, notes)
-                    VALUES (?,?,?,?,?,?,?,?,?)
+                     setup_time, produced_qty, actual_time, actual_duration_minutes, notes)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
                 """, (prod_date.isoformat(),
                       sel_machine,
                       sel_operator if sel_operator else None,
                       batch_name, batch_no,
-                      setup_time, produced_qty, actual, notes_prod))
-                st.success(f"✅ Записано: {produced_qty} шт  |  Факт. время: {actual:.2f} ч")
-                st.rerun()
-
-    # ── Admin: CRUD статусов ───────────────────────────────────────────
-    if role == "admin":
-        st.divider()
-        st.markdown("### 🔧 Изменить статус станка")
-        with st.form("status_form", clear_on_submit=True):
-            sc1, sc2, sc3 = st.columns([3, 2, 1])
-            ch_machine = sc1.selectbox("Станок",
-                options=[m["id"] for m in machines],
-                format_func=lambda x: next(m["name"] for m in machines if m["id"] == x))
-            ch_status  = sc2.selectbox("Новый статус",
-                options=list(STATUS_LABELS.keys()),
-                format_func=lambda x: STATUS_LABELS[x])
-            ch_notes   = sc3.text_input("Примечание")
-            if st.form_submit_button("Обновить статус", use_container_width=True):
-                exec_sql("UPDATE machines SET status=?, notes=? WHERE id=?",
-                         (ch_status, ch_notes, ch_machine))
-                st.success("✅ Статус обновлён")
+                      setup_time, produced_qty, plan_h, fact_min, notes_prod))
+                msg = f"✅ Записано: {produced_qty} шт | Плановое время: {plan_h:.2f} ч"
+                if fact_min is not None:
+                    msg += f" | Факт. время: {fact_min:.0f} мин"
+                st.success(msg)
                 st.rerun()
 
 
@@ -457,7 +504,9 @@ def page_history(role):
     sql = """
         SELECT p.id, p.date, m.name AS machine, o.name AS operator,
                p.batch, p.batch_number,
-               p.setup_time, p.produced_qty, p.actual_time, p.notes
+               p.setup_time, p.produced_qty, p.actual_time,
+               p.actual_duration_minutes,
+               p.notes
         FROM production p
         LEFT JOIN machines  m ON m.id = p.machine_id
         LEFT JOIN operators o ON o.id = p.operator_id
@@ -485,27 +534,46 @@ def page_history(role):
 
     df = pd.DataFrame(rows)
     df.columns = ["ID", "Дата", "Станок", "Оператор", "Партия", "№ партии",
-                  "Наладка (ч)", "Выпущено", "Факт. время (ч)", "Примечание"]
+                  "Наладка (ч)", "Выпущено", "План. время (ч)", "Факт. мин", "Примечание"]
+
+    # ── KPI план/факт: разница в минутах ─────────────────────────────
+    # План. время (ч) → в минуты для сравнения
+    df["План. мин"] = (df["План. время (ч)"] * 60).round(1)
+    # Δ = Факт.мин - План.мин; NaN если фактическое не введено
+    df["Δ план/факт (мин)"] = df.apply(
+        lambda r: round(r["Факт. мин"] - r["План. мин"], 1)
+        if pd.notna(r["Факт. мин"]) and r["Факт. мин"] > 0 else None,
+        axis=1
+    )
 
     # Итоги
     total_qty  = df["Выпущено"].sum()
-    total_time = df["Факт. время (ч)"].sum()
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Записей",        len(df))
-    m2.metric("Всего выпущено", f"{total_qty:,} шт")
-    m3.metric("Суммарно часов", f"{total_time:.1f} ч")
+    total_plan = df["План. время (ч)"].sum()
+    fact_filled = df["Факт. мин"].dropna()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Записей",          len(df))
+    m2.metric("Всего выпущено",   f"{total_qty:,} шт")
+    m3.metric("Суммарно план (ч)", f"{total_plan:.1f}")
+    m4.metric("Записей с факт.",   f"{len(fact_filled)}")
 
     st.divider()
 
-    # Таблица
+    display_cols = ["Дата", "Станок", "Оператор", "Партия", "№ партии",
+                    "Наладка (ч)", "Выпущено", "План. время (ч)",
+                    "Факт. мин", "Δ план/факт (мин)", "Примечание"]
     if role == "admin":
+        display_cols = ["ID"] + display_cols
         st.markdown("*Для удаления одной записи — введите её ID в форме ниже*")
 
-    st.dataframe(df.drop(columns=["ID"] if role != "admin" else []),
+    st.dataframe(df[display_cols],
                  use_container_width=True, hide_index=True,
                  column_config={
-                     "Выпущено":        st.column_config.NumberColumn(format="%d шт"),
-                     "Факт. время (ч)": st.column_config.NumberColumn(format="%.2f"),
+                     "Выпущено":           st.column_config.NumberColumn(format="%d шт"),
+                     "План. время (ч)":    st.column_config.NumberColumn(format="%.2f"),
+                     "Факт. мин":          st.column_config.NumberColumn(
+                         format="%.0f мин", help="Фактическое время, введённое оператором. Пусто = нет данных."),
+                     "Δ план/факт (мин)":  st.column_config.NumberColumn(
+                         format="%.1f мин", help="> 0 — перерасход; < 0 — опережение графика."),
                  })
 
     if role == "admin":
@@ -687,7 +755,7 @@ def page_charts():
     st.title("📊 Графики и аналитика")
 
     col_ctrl1, col_ctrl2 = st.columns([1, 3])
-    days = col_ctrl1.slider("Период (дней)", 7, 90, 14)
+    days  = col_ctrl1.slider("Период (дней)", 7, 90, 14)
     since = (date.today() - timedelta(days=days)).isoformat()
 
     data = q("""
@@ -701,132 +769,156 @@ def page_charts():
         ORDER BY p.date
     """, (since,))
 
-    if not data:
-        st.warning("Нет данных за выбранный период.")
-        return
-
-    df = pd.DataFrame(data)
-    df["date"] = pd.to_datetime(df["date"])
-
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📈 Загрузка по дням",
         "🏭 Выпуск по станкам",
         "👤 По операторам",
         "⚡ Производительность",
+        "🔄 Статусы станков",
     ])
 
-    # ── График 1: Загрузка по дням ─────────────────────────────────
+    # ── График 1: Загрузка по дням ─────────────────────────────────────
     with tab1:
-        daily = df.groupby(["date", "machine"])["produced_qty"].sum().reset_index()
-        fig = px.bar(daily, x="date", y="produced_qty", color="machine",
-                     barmode="group", title=f"Загрузка станков по дням ({days} дней)",
-                     labels={"date": "Дата", "produced_qty": "Выпущено (шт)",
-                             "machine": "Станок"},
-                     template="plotly_dark",
-                     color_discrete_sequence=px.colors.qualitative.Bold)
-        fig.update_layout(
-            plot_bgcolor="#1e2130", paper_bgcolor="#0f1117",
-            font_color="#e0e0f0", legend_title_text="Станок",
-            xaxis=dict(tickformat="%d.%m"),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Тепловая карта
-        pivot = daily.pivot_table(
-            index="machine", columns=df["date"].dt.strftime("%d.%m").unique()[:len(daily["date"].unique())],
-            values="produced_qty", fill_value=0, aggfunc="sum"
-        )
-        if not pivot.empty:
-            pivot2 = daily.pivot_table(index="machine", columns="date",
-                                       values="produced_qty", fill_value=0, aggfunc="sum")
-            pivot2.columns = pivot2.columns.strftime("%d.%m")
-            fig_hm = px.imshow(pivot2, title="Тепловая карта загрузки",
-                               template="plotly_dark",
-                               color_continuous_scale="Blues",
-                               labels=dict(color="Шт."))
-            fig_hm.update_layout(paper_bgcolor="#0f1117", font_color="#e0e0f0")
-            st.plotly_chart(fig_hm, use_container_width=True)
-
-    # ── График 2: Выпуск по станкам ────────────────────────────────
-    with tab2:
-        by_machine = df.groupby("machine")["produced_qty"].sum().reset_index()
-        by_machine.columns = ["Станок", "Выпущено"]
-        by_machine = by_machine.sort_values("Выпущено", ascending=False)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            fig_bar = px.bar(by_machine, x="Станок", y="Выпущено",
-                             title="Суммарный выпуск",
-                             template="plotly_dark",
-                             color="Выпущено",
-                             color_continuous_scale="Viridis",
-                             text="Выпущено")
-            fig_bar.update_traces(textposition="outside")
-            fig_bar.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-                                  font_color="#e0e0f0", showlegend=False)
-            st.plotly_chart(fig_bar, use_container_width=True)
-        with c2:
-            fig_pie = px.pie(by_machine, names="Станок", values="Выпущено",
-                             title="Доля выпуска",
-                             template="plotly_dark",
-                             hole=0.4)
-            fig_pie.update_layout(paper_bgcolor="#0f1117", font_color="#e0e0f0")
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        # Суммарное время наладки
-        setup_total = df.groupby("machine")["setup_time"].sum().reset_index()
-        setup_total.columns = ["Станок", "Время наладки (ч)"]
-        fig_setup = px.bar(setup_total.sort_values("Время наладки (ч)", ascending=False),
-                           x="Станок", y="Время наладки (ч)",
-                           title="Суммарное время наладки",
-                           template="plotly_dark",
-                           color_discrete_sequence=["#f9c74f"])
-        fig_setup.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-                                font_color="#e0e0f0")
-        st.plotly_chart(fig_setup, use_container_width=True)
-
-    # ── График 3: По операторам ────────────────────────────────────
-    with tab3:
-        df_op = df[df["operator"].notna()]
-        if df_op.empty:
-            st.info("Нет данных по операторам.")
+        if not data:
+            st.info("Нет данных за выбранный период.")
         else:
-            by_op = df_op.groupby("operator")["produced_qty"].sum().reset_index()
-            by_op.columns = ["Оператор", "Выпущено"]
-            by_op = by_op.sort_values("Выпущено", ascending=True)
+            df = pd.DataFrame(data)
+            df["date"] = pd.to_datetime(df["date"])
+            df["date_str"] = df["date"].dt.strftime("%d.%m")
 
-            fig_op = px.bar(by_op, y="Оператор", x="Выпущено",
-                            orientation="h", title="Выпуск по операторам",
-                            template="plotly_dark",
-                            color="Выпущено",
-                            color_continuous_scale="Sunset",
-                            text="Выпущено")
-            fig_op.update_traces(textposition="outside")
-            fig_op.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-                                 font_color="#e0e0f0", showlegend=False,
-                                 height=max(300, len(by_op) * 60))
-            st.plotly_chart(fig_op, use_container_width=True)
+            daily = df.groupby(["date", "machine"])["produced_qty"].sum().reset_index()
 
-            # Динамика по операторам
-            op_daily = df_op.groupby(["date", "operator"])["produced_qty"].sum().reset_index()
-            fig_op2 = px.line(op_daily, x="date", y="produced_qty", color="operator",
-                              title="Динамика выпуска по операторам",
-                              template="plotly_dark",
-                              labels={"date": "Дата", "produced_qty": "Выпущено",
-                                      "operator": "Оператор"},
-                              markers=True)
-            fig_op2.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-                                  font_color="#e0e0f0",
-                                  xaxis=dict(tickformat="%d.%m"))
-            st.plotly_chart(fig_op2, use_container_width=True)
+            fig = px.bar(daily, x="date", y="produced_qty", color="machine",
+                         barmode="group",
+                         title=f"Загрузка станков по дням ({days} дней)",
+                         labels={"date": "Дата", "produced_qty": "Выпущено (шт)",
+                                 "machine": "Станок"},
+                         template="plotly_dark",
+                         color_discrete_sequence=px.colors.qualitative.Bold)
+            fig.update_layout(
+                plot_bgcolor="#1e2130", paper_bgcolor="#0f1117",
+                font_color="#e0e0f0", legend_title_text="Станок",
+                xaxis=dict(tickformat="%d.%m"),
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    # ── График 4: Производительность ──────────────────────────────
+            # ── Тепловая карта (исправление ValueError) ──────────────────
+            # Используем pivot_table с именами колонок из daily, не из df другой длины
+            if not daily.empty:
+                # Приводим дату к строке прямо в daily (одинаковая длина с daily)
+                daily_hm = daily.copy()
+                daily_hm["date_lbl"] = daily_hm["date"].dt.strftime("%d.%m")
+                try:
+                    pivot2 = daily_hm.pivot_table(
+                        index="machine",
+                        columns="date_lbl",
+                        values="produced_qty",
+                        fill_value=0,
+                        aggfunc="sum"
+                    )
+                    if not pivot2.empty:
+                        fig_hm = px.imshow(pivot2,
+                                           title="Тепловая карта загрузки",
+                                           template="plotly_dark",
+                                           color_continuous_scale="Blues",
+                                           labels=dict(color="Шт."))
+                        fig_hm.update_layout(paper_bgcolor="#0f1117", font_color="#e0e0f0")
+                        st.plotly_chart(fig_hm, use_container_width=True)
+                except Exception as e:
+                    st.info(f"Не удалось построить тепловую карту: {e}")
+
+    # ── График 2: Выпуск по станкам ────────────────────────────────────
+    with tab2:
+        if not data:
+            st.info("Нет данных за выбранный период.")
+        else:
+            df = pd.DataFrame(data)
+            df["date"] = pd.to_datetime(df["date"])
+
+            by_machine = df.groupby("machine")["produced_qty"].sum().reset_index()
+            by_machine.columns = ["Станок", "Выпущено"]
+            by_machine = by_machine.sort_values("Выпущено", ascending=False)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                fig_bar = px.bar(by_machine, x="Станок", y="Выпущено",
+                                 title="Суммарный выпуск",
+                                 template="plotly_dark",
+                                 color="Выпущено",
+                                 color_continuous_scale="Viridis",
+                                 text="Выпущено")
+                fig_bar.update_traces(textposition="outside")
+                fig_bar.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                                      font_color="#e0e0f0", showlegend=False)
+                st.plotly_chart(fig_bar, use_container_width=True)
+            with c2:
+                fig_pie = px.pie(by_machine, names="Станок", values="Выпущено",
+                                 title="Доля выпуска",
+                                 template="plotly_dark",
+                                 hole=0.4)
+                fig_pie.update_layout(paper_bgcolor="#0f1117", font_color="#e0e0f0")
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+            setup_total = df.groupby("machine")["setup_time"].sum().reset_index()
+            setup_total.columns = ["Станок", "Время наладки (ч)"]
+            fig_setup = px.bar(
+                setup_total.sort_values("Время наладки (ч)", ascending=False),
+                x="Станок", y="Время наладки (ч)",
+                title="Суммарное время наладки",
+                template="plotly_dark",
+                color_discrete_sequence=["#f9c74f"])
+            fig_setup.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                                    font_color="#e0e0f0")
+            st.plotly_chart(fig_setup, use_container_width=True)
+
+    # ── График 3: По операторам ────────────────────────────────────────
+    with tab3:
+        if not data:
+            st.info("Нет данных за выбранный период.")
+        else:
+            df = pd.DataFrame(data)
+            df["date"] = pd.to_datetime(df["date"])
+            df_op = df[df["operator"].notna() & (df["operator"] != "")]
+            if df_op.empty:
+                st.info("Нет данных по операторам.")
+            else:
+                by_op = df_op.groupby("operator")["produced_qty"].sum().reset_index()
+                by_op.columns = ["Оператор", "Выпущено"]
+                by_op = by_op.sort_values("Выпущено", ascending=True)
+
+                fig_op = px.bar(by_op, y="Оператор", x="Выпущено",
+                                orientation="h", title="Выпуск по операторам",
+                                template="plotly_dark",
+                                color="Выпущено",
+                                color_continuous_scale="Sunset",
+                                text="Выпущено")
+                fig_op.update_traces(textposition="outside")
+                fig_op.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                                     font_color="#e0e0f0", showlegend=False,
+                                     height=max(300, len(by_op) * 60))
+                st.plotly_chart(fig_op, use_container_width=True)
+
+                op_daily = df_op.groupby(["date", "operator"])["produced_qty"].sum().reset_index()
+                fig_op2 = px.line(op_daily, x="date", y="produced_qty", color="operator",
+                                  title="Динамика выпуска по операторам",
+                                  template="plotly_dark",
+                                  labels={"date": "Дата", "produced_qty": "Выпущено",
+                                          "operator": "Оператор"},
+                                  markers=True)
+                fig_op2.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                                      font_color="#e0e0f0",
+                                      xaxis=dict(tickformat="%d.%m"))
+                st.plotly_chart(fig_op2, use_container_width=True)
+
+    # ── График 4: Производительность ──────────────────────────────────
     with tab4:
         machines_all = q("SELECT id, name, productivity FROM machines ORDER BY id")
-        if not machines_all:
-            st.info("Нет данных.")
+        if not machines_all or not data:
+            st.info("Нет данных для сравнения производительности.")
         else:
-            # Фактическая производительность = выпущено / фактическое_время
+            df = pd.DataFrame(data)
+            df["date"] = pd.to_datetime(df["date"])
+
             fact_prod = df[df["actual_time"] > 0].copy()
             fact_prod["fact_prod"] = fact_prod["produced_qty"] / fact_prod["actual_time"]
             avg_fact = fact_prod.groupby("machine")["fact_prod"].mean().reset_index()
@@ -852,15 +944,144 @@ def page_charts():
                 font_color="#e0e0f0", legend=dict(bgcolor="#1e2130"))
             st.plotly_chart(fig_cmp, use_container_width=True)
 
-            # КПИ эффективности
             df_cmp["Эффективность %"] = (
-                df_cmp["Факт д/ч"] / df_cmp["Норма д/ч"] * 100
+                df_cmp["Факт д/ч"] / df_cmp["Норма д/ч"].replace(0, float("nan")) * 100
             ).round(1).fillna(0)
             df_cmp_show = df_cmp[["Станок", "Норма д/ч", "Факт д/ч", "Эффективность %"]]
             st.dataframe(
                 df_cmp_show.style.background_gradient(
                     subset=["Эффективность %"], cmap="RdYlGn", vmin=0, vmax=120),
                 use_container_width=True, hide_index=True)
+
+    # ── Вкладка 5: Статусы станков ─────────────────────────────────────
+    with tab5:
+        _tab_status_analytics(days, since)
+
+
+def _tab_status_analytics(days: int, since: str):
+    """Аналитика по времени в статусах на основе machine_status_log."""
+    st.markdown("### 🔄 Время станков в каждом статусе")
+
+    machines_all = q("SELECT id, name FROM machines ORDER BY id")
+    if not machines_all:
+        st.info("Нет данков.")
+        return
+
+    # Фильтры
+    flt1, flt2, flt3 = st.columns(3)
+    sel_m = flt1.selectbox("Станок (фильтр)",
+        options=[0] + [m["id"] for m in machines_all],
+        format_func=lambda x: "Все" if x == 0
+            else next(m["name"] for m in machines_all if m["id"] == x),
+        key="status_filter_m")
+    flt_from = flt2.date_input("Дата от", value=date.today() - timedelta(days=days),
+                                key="status_flt_from")
+    flt_to   = flt3.date_input("Дата до", value=date.today(), key="status_flt_to")
+
+    # Загружаем журнал событий
+    log_sql = """
+        SELECT sl.machine_id, m.name AS machine, sl.status,
+               sl.changed_by, sl.changed_at
+        FROM machine_status_log sl
+        JOIN machines m ON m.id = sl.machine_id
+        WHERE DATE(sl.changed_at) BETWEEN ? AND ?
+    """
+    log_params = [flt_from.isoformat(), flt_to.isoformat()]
+    if sel_m:
+        log_sql += " AND sl.machine_id = ?"
+        log_params.append(sel_m)
+    log_sql += " ORDER BY sl.machine_id, sl.changed_at"
+
+    log_rows = q(log_sql, log_params)
+
+    if not log_rows:
+        st.info("📭 Нет записей изменений статусов за выбранный период.")
+        st.markdown("Статусы фиксируются автоматически при каждом изменении "
+                    "через форму «Изменить статус станка».")
+        return
+
+    # ── Расчёт интервалов ────────────────────────────────────────────
+    # Для каждого станка: список событий по времени.
+    # Время статуса = changed_at[i+1] - changed_at[i].
+    # Для последнего события в выборке конец = min(now, flt_to + 1 day).
+    from collections import defaultdict
+    machine_events: dict = defaultdict(list)
+    for row in log_rows:
+        machine_events[row["machine_id"]].append(row)
+
+    now_cap = datetime.combine(flt_to + timedelta(days=1), datetime.min.time())
+
+    interval_rows = []
+    for mid, events in machine_events.items():
+        for i, ev in enumerate(events):
+            t_start = datetime.fromisoformat(ev["changed_at"])
+            if i + 1 < len(events):
+                t_end = datetime.fromisoformat(events[i + 1]["changed_at"])
+            else:
+                t_end = min(datetime.now(), now_cap)
+            duration_h = max(0.0, (t_end - t_start).total_seconds() / 3600)
+            interval_rows.append({
+                "machine":    ev["machine"],
+                "machine_id": mid,
+                "status":     ev["status"],
+                "status_lbl": STATUS_LABELS.get(ev["status"], ev["status"]),
+                "duration_h": round(duration_h, 3),
+                "changed_at": ev["changed_at"],
+                "changed_by": ev["changed_by"],
+            })
+
+    if not interval_rows:
+        st.info("Нет данных для построения графиков.")
+        return
+
+    df_int = pd.DataFrame(interval_rows)
+
+    # ── Агрегация: суммарное время по станку × статус ─────────────────
+    agg = df_int.groupby(["machine", "status_lbl"])["duration_h"].sum().reset_index()
+    agg.columns = ["Станок", "Статус", "Часов"]
+    agg["Часов"] = agg["Часов"].round(2)
+
+    # Stacked bar по станкам
+    color_map = {STATUS_LABELS.get(k, k): v for k, v in STATUS_COLORS.items()}
+    fig_stack = px.bar(agg, x="Станок", y="Часов", color="Статус",
+                       barmode="stack",
+                       title=f"Распределение времени по статусам (часов)",
+                       template="plotly_dark",
+                       color_discrete_map=color_map)
+    fig_stack.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                            font_color="#e0e0f0")
+    st.plotly_chart(fig_stack, use_container_width=True)
+
+    # Bar по статусам суммарно
+    agg_status = df_int.groupby("status_lbl")["duration_h"].sum().reset_index()
+    agg_status.columns = ["Статус", "Часов"]
+    agg_status = agg_status.sort_values("Часов", ascending=False)
+    fig_tot = px.bar(agg_status, x="Статус", y="Часов",
+                     title="Суммарное время по статусам (все станки)",
+                     template="plotly_dark",
+                     color="Статус", color_discrete_map=color_map,
+                     text=agg_status["Часов"].round(1))
+    fig_tot.update_traces(textposition="outside")
+    fig_tot.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                          font_color="#e0e0f0", showlegend=False)
+    st.plotly_chart(fig_tot, use_container_width=True)
+
+    # Сводная таблица
+    st.markdown("#### Сводная таблица (часов в статусе)")
+    try:
+        pivot_tbl = agg.pivot_table(index="Станок", columns="Статус",
+                                    values="Часов", fill_value=0, aggfunc="sum")
+        pivot_tbl["Итого"] = pivot_tbl.sum(axis=1)
+        st.dataframe(pivot_tbl.round(2), use_container_width=True)
+    except Exception:
+        st.dataframe(agg, use_container_width=True, hide_index=True)
+
+    # Лог событий
+    with st.expander("📋 Журнал событий статусов"):
+        df_log = pd.DataFrame(interval_rows)[
+            ["changed_at", "machine", "status_lbl", "duration_h", "changed_by"]]
+        df_log.columns = ["Время события", "Станок", "Статус", "Длит. (ч)", "Кто изменил"]
+        st.dataframe(df_log, use_container_width=True, hide_index=True)
 
 
 def page_export():
@@ -872,7 +1093,7 @@ def page_export():
     production = q("""
         SELECT p.id, p.date, m.name AS machine, o.name AS operator,
                p.batch, p.batch_number, p.setup_time,
-               p.produced_qty, p.actual_time, p.notes
+               p.produced_qty, p.actual_time, p.actual_duration_minutes, p.notes
         FROM production p
         LEFT JOIN machines  m ON m.id = p.machine_id
         LEFT JOIN operators o ON o.id = p.operator_id
@@ -910,7 +1131,8 @@ def page_export():
         st.markdown(f"**📋 История ({len(production)} записей)**")
         csv_p = to_csv(production,
                        ["id","date","machine","operator","batch","batch_number",
-                        "setup_time","produced_qty","actual_time","notes"])
+                        "setup_time","produced_qty","actual_time",
+                        "actual_duration_minutes","notes"])
         st.download_button("⬇ CSV: История", csv_p,
                            f"production_{date.today()}.csv", "text/csv",
                            use_container_width=True)
@@ -985,7 +1207,7 @@ def main():
     with st.sidebar:
         st.markdown(f"""
 <div style="background:#2a2d40; border-radius:10px; padding:14px; margin-bottom:16px;">
-  <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">⚙️ НТА Контроль</div>
+  <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">⚙️ НТАКонтроль</div>
   <div style="color:#8888aa; font-size:0.85rem; margin-top:4px;">
     👤 {st.session_state.get('name', username)}<br>
     🔑 {'Администратор' if role == 'admin' else 'Оператор'}
