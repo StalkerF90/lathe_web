@@ -35,53 +35,149 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── CSS ───────────────────────────────────────────────────────────────────
+# ── CSS — глобальная тёмная тема, весь текст белый ───────────────────────
 st.markdown("""
 <style>
-    /* Основной фон */
-    [data-testid="stAppViewContainer"] { background: #0f1117; }
-    [data-testid="stSidebar"] { background: #1a1d27; }
-    [data-testid="stSidebar"] .stMarkdown { color: #c8c8e0; }
+    /* ═══ ФОНЫ ════════════════════════════════════════════════════════════ */
+    [data-testid="stAppViewContainer"],
+    [data-testid="stApp"],
+    .main .block-container          { background: #0f1117 !important; }
+    [data-testid="stSidebar"]       { background: #1a1d27 !important; }
+    [data-testid="stHeader"]        { background: #0f1117 !important; }
 
-    /* Заголовки */
-    h1, h2, h3 { color: #e0e0f0 !important; }
-    .stDataFrame { border-radius: 8px; }
+    /* ═══ ГЛОБАЛЬНЫЙ ЦВЕТ ТЕКСТА — БЕЛЫЙ ══════════════════════════════════ */
+    html, body, [data-testid="stAppViewContainer"],
+    .main, .block-container,
+    p, span, div, li, label, small,
+    .stMarkdown, .stText             { color: #ffffff !important; }
 
-    /* Метрики */
+    /* Сайдбар */
+    [data-testid="stSidebar"],
+    [data-testid="stSidebar"] *      { color: #e8e8f8 !important; }
+
+    /* ═══ ЗАГОЛОВКИ ════════════════════════════════════════════════════════ */
+    h1, h2, h3, h4, h5, h6          { color: #ffffff !important; }
+
+    /* ═══ ПОДПИСИ ПОЛЕЙ ФОРМ ══════════════════════════════════════════════ */
+    /* label в stForm, selectbox, text_input, number_input, date_input */
+    [data-testid="stForm"]   label,
+    [data-testid="stSelectbox"]  label,
+    [data-testid="stTextInput"]  label,
+    [data-testid="stNumberInput"] label,
+    [data-testid="stDateInput"]  label,
+    [data-testid="stCheckbox"]   label,
+    [data-testid="stRadio"]      label,
+    [data-testid="stSlider"]     label,
+    [data-testid="stExpander"]   summary,
+    .stFormLabel, .st-emotion-cache-label,
+    /* универсальный фолбэк через атрибут */
+    label[data-testid]              { color: #ffffff !important; }
+
+    /* ═══ ПОЛЯ ВВОДА ═══════════════════════════════════════════════════════ */
+    input, textarea, select         { color: #ffffff !important;
+                                      background: #1e2130 !important;
+                                      border: 1px solid #3a3d5c !important; }
+    input::placeholder              { color: #8888aa !important; }
+
+    /* ═══ SELECTBOX / DROPDOWN ════════════════════════════════════════════ */
+    [data-testid="stSelectbox"] > div > div,
+    [data-testid="stMultiSelect"] > div > div { color: #ffffff !important;
+                                                 background: #1e2130 !important; }
+    /* выпадающий список */
+    [data-baseweb="select"] *,
+    [data-baseweb="menu"]   *       { color: #ffffff !important;
+                                      background: #252840 !important; }
+
+    /* ═══ ВКЛАДКИ (tabs) ══════════════════════════════════════════════════ */
+    [data-testid="stTabs"] button,
+    .stTabs [role="tab"]            { color: #ccccee !important; }
+    .stTabs [role="tab"][aria-selected="true"]
+                                    { color: #ffffff !important;
+                                      border-bottom-color: #7c6af7 !important; }
+
+    /* ═══ КНОПКИ ══════════════════════════════════════════════════════════ */
+    .stButton > button              { color: #ffffff !important;
+                                      border-radius: 6px;
+                                      font-weight: 600; }
+    .stDownloadButton > button      { color: #ffffff !important; }
+    /* Основная кнопка (type=primary) */
+    .stButton > button[kind="primary"]       { background: #7c6af7 !important; }
+    .stButton > button[kind="secondary"]     { background: #252840 !important;
+                                               border: 1px solid #3a3d5c !important; }
+
+    /* ═══ МЕТРИКИ ═════════════════════════════════════════════════════════ */
     [data-testid="metric-container"] {
-        background: #1e2130;
+        background: #1e2130 !important;
         border: 1px solid #2e3150;
         border-radius: 10px;
         padding: 12px 16px;
     }
-    [data-testid="metric-container"] label { color: #8888aa !important; }
-    [data-testid="metric-container"] [data-testid="stMetricValue"] {
-        color: #7c6af7 !important; font-size: 2rem !important;
-    }
+    [data-testid="metric-container"] label   { color: #aaaacc !important; }
+    [data-testid="stMetricValue"]            { color: #7c6af7 !important;
+                                               font-size: 2rem !important; }
+    [data-testid="stMetricDelta"]            { color: #43c59e !important; }
 
-    /* Статусные бейджи */
-    .badge-busy   { background:#f94144; color:#fff; padding:3px 10px;
-                    border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-free   { background:#43c59e; color:#000; padding:3px 10px;
-                    border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-setup  { background:#f9c74f; color:#000; padding:3px 10px;
-                    border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-idle   { background:#6c6c8a; color:#fff; padding:3px 10px;
-                    border-radius:12px; font-size:12px; font-weight:600; }
+    /* ═══ ТАБЛИЦЫ (dataframe) ═════════════════════════════════════════════ */
+    .stDataFrame                    { border-radius: 8px; }
+    /* заголовки таблицы */
+    [data-testid="stDataFrame"] th,
+    .dvn-scroller th                { color: #56cfe1 !important;
+                                      background: #1e2130 !important; }
+    [data-testid="stDataFrame"] td,
+    .dvn-scroller td                { color: #e8e8f8 !important;
+                                      background: #141624 !important; }
 
-    /* Карточки */
+    /* ═══ EXPANDER ════════════════════════════════════════════════════════ */
+    [data-testid="stExpander"]      { background: #1a1d2e !important;
+                                      border: 1px solid #2e3150 !important;
+                                      border-radius: 8px; }
+    [data-testid="stExpander"] p,
+    [data-testid="stExpander"] span { color: #e8e8f8 !important; }
+
+    /* ═══ INFO / WARNING / ERROR ══════════════════════════════════════════ */
+    [data-testid="stAlert"]         { color: #ffffff !important; }
+    [data-testid="stAlert"] *       { color: #ffffff !important; }
+
+    /* ═══ RADIO (навигация в сайдбаре) ════════════════════════════════════ */
+    [data-testid="stRadio"] label   { color: #e8e8f8 !important; }
+    [data-testid="stRadio"] div[role="radiogroup"] > label > div > p
+                                    { color: #e8e8f8 !important; }
+
+    /* ═══ DIVIDER ═════════════════════════════════════════════════════════ */
+    hr                              { border-color: #2e3150 !important; }
+
+    /* ═══ SCROLLBAR ═══════════════════════════════════════════════════════ */
+    ::-webkit-scrollbar             { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track       { background: #1a1d27; }
+    ::-webkit-scrollbar-thumb       { background: #3a3d5c; border-radius: 3px; }
+
+    /* ═══ СТАТУСНЫЕ БЕЙДЖИ ════════════════════════════════════════════════ */
+    .badge-busy  { background:#f94144; color:#fff !important; padding:3px 10px;
+                   border-radius:12px; font-size:12px; font-weight:600; }
+    .badge-free  { background:#43c59e; color:#000 !important; padding:3px 10px;
+                   border-radius:12px; font-size:12px; font-weight:600; }
+    .badge-setup { background:#f9c74f; color:#000 !important; padding:3px 10px;
+                   border-radius:12px; font-size:12px; font-weight:600; }
+    .badge-idle  { background:#6c6c8a; color:#fff !important; padding:3px 10px;
+                   border-radius:12px; font-size:12px; font-weight:600; }
+    .badge-repair{ background:#ff8c42; color:#fff !important; padding:3px 10px;
+                   border-radius:12px; font-size:12px; font-weight:600; }
+
+    /* ═══ КАРТОЧКИ ════════════════════════════════════════════════════════ */
     .info-card {
         background: #1e2130; border: 1px solid #2e3150;
         border-radius: 10px; padding: 16px; margin-bottom: 12px;
     }
-    .section-title {
-        color: #56cfe1; font-size: 1.1rem;
-        font-weight: 700; margin-bottom: 8px;
-    }
-    /* Убираем лишние отступы кнопок */
-    .stButton button {
-        border-radius: 6px; font-weight: 600;
-    }
+    .section-title { color: #56cfe1 !important; font-size: 1.1rem;
+                     font-weight: 700; margin-bottom: 8px; }
+
+    /* ═══ CODE / PRE ══════════════════════════════════════════════════════ */
+    code, pre                       { color: #a8e6cf !important;
+                                      background: #1a1d2e !important; }
+
+    /* ═══ REPAIR-тип записи (цветной бейдж в таблице истории) ════════════ */
+    .record-repair                  { color: #ff8c42 !important; font-weight: 600; }
+    .record-production              { color: #43c59e !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -138,6 +234,12 @@ def init_db():
                      c.execute("PRAGMA table_info(production)").fetchall()]
     if "actual_duration_minutes" not in existing_cols:
         c.execute("ALTER TABLE production ADD COLUMN actual_duration_minutes REAL DEFAULT NULL")
+    # record_type — тип записи: 'production' (выпуск) или 'repair' (ремонт)
+    if "record_type" not in existing_cols:
+        c.execute("ALTER TABLE production ADD COLUMN record_type TEXT DEFAULT 'production'")
+    # repair_duration_hours — длительность ремонта в часах (только для record_type='repair')
+    if "repair_duration_hours" not in existing_cols:
+        c.execute("ALTER TABLE production ADD COLUMN repair_duration_hours REAL DEFAULT NULL")
 
     # Журнал смены статусов станков
     c.execute("""
@@ -391,66 +493,115 @@ def page_machines(role):
 
     st.divider()
 
-    # ── Ввод выпуска (User + Admin) ────────────────────────────────────
-    st.markdown("### ➕ Внести выпуск")
-    with st.form("production_form", clear_on_submit=True):
-        r1c1, r1c2, r1c3, r1c4 = st.columns([3, 3, 2, 2])
-        sel_machine  = r1c1.selectbox("Станок*",
-            options=[m["id"] for m in machines],
-            format_func=lambda x: next(m["name"] for m in machines if m["id"] == x))
-        sel_operator = r1c2.selectbox("Оператор",
-            options=[0] + [o["id"] for o in operators],
-            format_func=lambda x: op_map[x])
-        prod_date    = r1c3.date_input("Дата*", value=date.today())
-        produced_qty = r1c4.number_input("Выпущено* (шт)", min_value=0, step=1)
+    # ── Внести запись (Выпуск или Ремонт) — User + Admin ──────────────
+    st.markdown("### ➕ Внести запись")
 
-        r2c1, r2c2, r2c3, r2c4 = st.columns([3, 2, 2, 3])
-        batch_name   = r2c1.text_input("Название партии")
-        batch_no     = r2c2.text_input("№ партии")
-        setup_time   = r2c3.number_input("Наладка (ч)", min_value=0.0, step=0.25)
-        # ▶ НОВОЕ ПОЛЕ: фактическое время, введённое оператором
-        actual_dur_min = r2c4.number_input(
-            "Факт. время выпуска (мин)",
-            min_value=0.0, step=1.0, value=0.0,
-            help="Введите реально потраченное время на выпуск партии в минутах. "
-                 "0 — не заполнено."
-        )
-        notes_prod   = st.text_input("Примечание")
+    # Тип записи выбирается ВНЕ формы, чтобы динамически менять поля
+    rec_type = st.radio(
+        "Тип записи",
+        options=["production", "repair"],
+        format_func=lambda x: "🟢 Выпуск" if x == "production" else "🔧 Ремонт",
+        horizontal=True,
+        key="rec_type_radio",
+    )
 
-        submitted = st.form_submit_button("✔ Записать", type="primary",
-                                          use_container_width=True)
-        if submitted:
-            if produced_qty <= 0:
-                st.error("Укажите количество выпущенных деталей.")
-            else:
-                sel_m  = next(m for m in machines if m["id"] == sel_machine)
-                # Плановое время (из производительности)
-                plan_h = round(produced_qty / sel_m["productivity"], 3)
-                # Фактическое время: если введено > 0, сохраняем; иначе NULL
-                fact_min = float(actual_dur_min) if actual_dur_min > 0 else None
-                exec_sql("""
-                    INSERT INTO production
-                    (date, machine_id, operator_id, batch, batch_number,
-                     setup_time, produced_qty, actual_time, actual_duration_minutes, notes)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                """, (prod_date.isoformat(),
-                      sel_machine,
-                      sel_operator if sel_operator else None,
-                      batch_name, batch_no,
-                      setup_time, produced_qty, plan_h, fact_min, notes_prod))
-                msg = f"✅ Записано: {produced_qty} шт | Плановое время: {plan_h:.2f} ч"
-                if fact_min is not None:
-                    msg += f" | Факт. время: {fact_min:.0f} мин"
-                st.success(msg)
-                st.rerun()
+    if rec_type == "production":
+        with st.form("production_form", clear_on_submit=True):
+            r1c1, r1c2, r1c3, r1c4 = st.columns([3, 3, 2, 2])
+            sel_machine  = r1c1.selectbox("Станок*",
+                options=[m["id"] for m in machines],
+                format_func=lambda x: next(m["name"] for m in machines if m["id"] == x))
+            sel_operator = r1c2.selectbox("Оператор",
+                options=[0] + [o["id"] for o in operators],
+                format_func=lambda x: op_map[x])
+            prod_date    = r1c3.date_input("Дата*", value=date.today())
+            produced_qty = r1c4.number_input("Выпущено* (шт)", min_value=0, step=1)
+
+            r2c1, r2c2, r2c3, r2c4 = st.columns([3, 2, 2, 3])
+            batch_name   = r2c1.text_input("Название партии")
+            batch_no     = r2c2.text_input("№ партии")
+            setup_time   = r2c3.number_input("Наладка (ч)", min_value=0.0, step=0.25)
+            actual_dur_min = r2c4.number_input(
+                "Факт. время выпуска (мин)",
+                min_value=0.0, step=1.0, value=0.0,
+                help="Реально потраченное время на выпуск партии в минутах. 0 — не заполнено.")
+            notes_prod = st.text_input("Примечание")
+
+            if st.form_submit_button("✔ Записать выпуск", type="primary",
+                                     use_container_width=True):
+                if produced_qty <= 0:
+                    st.error("Укажите количество выпущенных деталей.")
+                else:
+                    sel_m  = next(m for m in machines if m["id"] == sel_machine)
+                    plan_h = round(produced_qty / sel_m["productivity"], 3)
+                    fact_min = float(actual_dur_min) if actual_dur_min > 0 else None
+                    exec_sql("""
+                        INSERT INTO production
+                        (date, machine_id, operator_id, batch, batch_number,
+                         setup_time, produced_qty, actual_time,
+                         actual_duration_minutes, record_type, notes)
+                        VALUES (?,?,?,?,?,?,?,?,?,'production',?)
+                    """, (prod_date.isoformat(), sel_machine,
+                          sel_operator if sel_operator else None,
+                          batch_name, batch_no, setup_time,
+                          produced_qty, plan_h, fact_min, notes_prod))
+                    msg = f"✅ Выпуск записан: {produced_qty} шт | план {plan_h:.2f} ч"
+                    if fact_min:
+                        msg += f" | факт {fact_min:.0f} мин"
+                    st.success(msg)
+                    st.rerun()
+
+    else:  # repair
+        with st.form("repair_form", clear_on_submit=True):
+            rr1, rr2, rr3 = st.columns([3, 3, 2])
+            sel_machine_r  = rr1.selectbox("Станок*",
+                options=[m["id"] for m in machines],
+                format_func=lambda x: next(m["name"] for m in machines if m["id"] == x),
+                key="repair_machine")
+            sel_operator_r = rr2.selectbox("Ответственный",
+                options=[0] + [o["id"] for o in operators],
+                format_func=lambda x: op_map[x],
+                key="repair_operator")
+            repair_date    = rr3.date_input("Дата*", value=date.today(), key="repair_date")
+
+            rd1, rd2 = st.columns([2, 5])
+            repair_hours = rd1.number_input(
+                "Длительность ремонта (ч)*",
+                min_value=0.0, step=0.5, value=1.0,
+                help="Введите фактическую длительность ремонта в часах (например 1.5 = 1ч 30мин)")
+            repair_notes = rd2.text_input(
+                "Причина / комментарий*",
+                placeholder="Замена подшипника, выход из строя шпинделя…")
+
+            if st.form_submit_button("🔧 Записать ремонт", type="primary",
+                                     use_container_width=True):
+                if repair_hours <= 0:
+                    st.error("Укажите длительность ремонта.")
+                elif not repair_notes.strip():
+                    st.error("Укажите причину ремонта.")
+                else:
+                    exec_sql("""
+                        INSERT INTO production
+                        (date, machine_id, operator_id,
+                         batch, batch_number, setup_time,
+                         produced_qty, actual_time,
+                         repair_duration_hours, record_type, notes)
+                        VALUES (?,?,?,
+                                '','',0,
+                                0,0,
+                                ?,'repair',?)
+                    """, (repair_date.isoformat(), sel_machine_r,
+                          sel_operator_r if sel_operator_r else None,
+                          float(repair_hours), repair_notes.strip()))
+                    st.success(f"🔧 Ремонт записан: {repair_hours:.1f} ч — {repair_notes}")
+                    st.rerun()
 
 
 def page_history(role):
-    st.title("📋 История выпуска")
+    st.title("📋 История выпуска и ремонтов")
 
     # ── Кнопка «Очистить всю историю» — только для admin ──────────────
     if role == "admin":
-        # Состояние диалога подтверждения хранится в session_state
         if "confirm_clear_history" not in st.session_state:
             st.session_state["confirm_clear_history"] = False
 
@@ -461,15 +612,13 @@ def page_history(role):
         with col_btn:
             if not st.session_state["confirm_clear_history"]:
                 if st.button("🗑 Очистить всю историю", type="primary",
-                             use_container_width=True,
-                             disabled=(total_cnt == 0)):
+                             use_container_width=True, disabled=(total_cnt == 0)):
                     st.session_state["confirm_clear_history"] = True
                     st.rerun()
             else:
-                # Диалог подтверждения
                 st.warning(
                     "⚠️ **Вы уверены?**\n\n"
-                    "Вы хотите удалить **ВСЮ** историю выпуска "
+                    "Вы хотите удалить **ВСЮ** историю "
                     f"({total_cnt} записей). Это действие **невозможно отменить**."
                 )
                 yes_col, no_col = st.columns(2)
@@ -478,7 +627,7 @@ def page_history(role):
                                  use_container_width=True):
                         exec_sql("DELETE FROM production")
                         st.session_state["confirm_clear_history"] = False
-                        st.success("✅ Вся история выпуска удалена.")
+                        st.success("✅ Вся история удалена.")
                         st.rerun()
                 with no_col:
                     if st.button("✘ Отмена", use_container_width=True):
@@ -487,7 +636,7 @@ def page_history(role):
 
     # ── Фильтры ────────────────────────────────────────────────────────
     with st.expander("🔍 Фильтры", expanded=True):
-        fc1, fc2, fc3, fc4 = st.columns(4)
+        fc1, fc2, fc3, fc4, fc5 = st.columns(5)
         machines  = q("SELECT id, name FROM machines ORDER BY name")
         operators = q("SELECT id, name FROM operators ORDER BY name")
         date_from = fc1.date_input("Дата от", value=date.today() - timedelta(days=14))
@@ -500,12 +649,23 @@ def page_history(role):
             options=[0] + [o["id"] for o in operators],
             format_func=lambda x: "Все" if x == 0
                 else next(o["name"] for o in operators if o["id"] == x))
+        sel_type  = fc5.selectbox("Тип записи",
+            options=["all", "production", "repair"],
+            format_func=lambda x: {"all": "Все", "production": "🟢 Выпуск",
+                                    "repair": "🔧 Ремонт"}[x])
 
     sql = """
-        SELECT p.id, p.date, m.name AS machine, o.name AS operator,
+        SELECT p.id,
+               COALESCE(p.record_type, 'production') AS record_type,
+               p.date,
+               m.name  AS machine,
+               o.name  AS operator,
                p.batch, p.batch_number,
-               p.setup_time, p.produced_qty, p.actual_time,
+               p.setup_time,
+               p.produced_qty,
+               p.actual_time,
                p.actual_duration_minutes,
+               p.repair_duration_hours,
                p.notes
         FROM production p
         LEFT JOIN machines  m ON m.id = p.machine_id
@@ -519,62 +679,114 @@ def page_history(role):
     if sel_o_f:
         sql += " AND p.operator_id = ?"
         params.append(sel_o_f)
+    if sel_type != "all":
+        sql += " AND COALESCE(p.record_type,'production') = ?"
+        params.append(sel_type)
     sql += " ORDER BY p.date DESC, p.id DESC"
 
     rows = q(sql, params)
 
-    # ── Нулевое состояние: пустая таблица — просто сообщение ──────────
+    # ── Нулевое состояние ─────────────────────────────────────────────
     if not rows:
         any_records = q("SELECT COUNT(*) AS cnt FROM production", fetch="one")
         if any_records and any_records["cnt"] == 0:
-            st.info("📭 Записей пока нет. Используйте форму «Внести выпуск» на странице «Станки».")
+            st.info("📭 Записей пока нет. Используйте форму «Внести запись» на странице «Станки».")
         else:
             st.info("Нет записей, соответствующих выбранным фильтрам.")
         return
 
     df = pd.DataFrame(rows)
-    df.columns = ["ID", "Дата", "Станок", "Оператор", "Партия", "№ партии",
-                  "Наладка (ч)", "Выпущено", "План. время (ч)", "Факт. мин", "Примечание"]
+    # Нормализуем record_type: старые записи (NULL) → 'production'
+    df["record_type"] = df["record_type"].fillna("production")
 
-    # ── KPI план/факт: разница в минутах ─────────────────────────────
-    # План. время (ч) → в минуты для сравнения
-    df["План. мин"] = (df["План. время (ч)"] * 60).round(1)
-    # Δ = Факт.мин - План.мин; NaN если фактическое не введено
-    df["Δ план/факт (мин)"] = df.apply(
-        lambda r: round(r["Факт. мин"] - r["План. мин"], 1)
-        if pd.notna(r["Факт. мин"]) and r["Факт. мин"] > 0 else None,
-        axis=1
-    )
+    # ── Разделяем на выпуск и ремонты для метрик ──────────────────────
+    df_prod   = df[df["record_type"] == "production"]
+    df_repair = df[df["record_type"] == "repair"]
 
-    # Итоги
-    total_qty  = df["Выпущено"].sum()
-    total_plan = df["План. время (ч)"].sum()
-    fact_filled = df["Факт. мин"].dropna()
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Записей",          len(df))
-    m2.metric("Всего выпущено",   f"{total_qty:,} шт")
-    m3.metric("Суммарно план (ч)", f"{total_plan:.1f}")
-    m4.metric("Записей с факт.",   f"{len(fact_filled)}")
+    total_qty      = df_prod["produced_qty"].sum()
+    total_plan_h   = df_prod["actual_time"].sum()
+    total_repair_h = df_repair["repair_duration_hours"].fillna(0).sum()
+    fact_filled    = df_prod["actual_duration_minutes"].dropna()
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Всего записей",     len(df))
+    m2.metric("Выпусков",          len(df_prod))
+    m3.metric("Ремонтов",          len(df_repair))
+    m4.metric("Выпущено (шт)",     f"{int(total_qty):,}")
+    m5.metric("Ремонт (ч суммарно)", f"{total_repair_h:.1f}")
 
     st.divider()
 
-    display_cols = ["Дата", "Станок", "Оператор", "Партия", "№ партии",
-                    "Наладка (ч)", "Выпущено", "План. время (ч)",
-                    "Факт. мин", "Δ план/факт (мин)", "Примечание"]
+    # ── Формируем отображаемый DataFrame ─────────────────────────────
+    display_rows = []
+    for _, r in df.iterrows():
+        if r["record_type"] == "repair":
+            display_rows.append({
+                "ID":              r["id"],
+                "Тип":             "🔧 Ремонт",
+                "Дата":            r["date"],
+                "Станок":          r["machine"] or "—",
+                "Оператор":        r["operator"] or "—",
+                "Партия":          "—",
+                "№ партии":        "—",
+                "Наладка (ч)":     None,
+                "Выпущено":        None,
+                "План. время (ч)": None,
+                "Факт. мин":       None,
+                "Ремонт (ч)":      r["repair_duration_hours"],
+                "Δ план/факт":     None,
+                "Примечание":      r["notes"] or "",
+            })
+        else:
+            plan_h   = r["actual_time"]
+            fact_min = r["actual_duration_minutes"]
+            delta    = round(float(fact_min) - float(plan_h) * 60, 1) \
+                       if pd.notna(fact_min) and fact_min and float(fact_min) > 0 else None
+            display_rows.append({
+                "ID":              r["id"],
+                "Тип":             "🟢 Выпуск",
+                "Дата":            r["date"],
+                "Станок":          r["machine"] or "—",
+                "Оператор":        r["operator"] or "—",
+                "Партия":          r["batch"] or "—",
+                "№ партии":        r["batch_number"] or "—",
+                "Наладка (ч)":     r["setup_time"],
+                "Выпущено":        r["produced_qty"],
+                "План. время (ч)": plan_h,
+                "Факт. мин":       fact_min,
+                "Ремонт (ч)":      None,
+                "Δ план/факт":     delta,
+                "Примечание":      r["notes"] or "",
+            })
+
+    df_show = pd.DataFrame(display_rows)
+
+    base_cols = ["Тип", "Дата", "Станок", "Оператор", "Партия", "№ партии",
+                 "Наладка (ч)", "Выпущено", "План. время (ч)",
+                 "Факт. мин", "Ремонт (ч)", "Δ план/факт", "Примечание"]
     if role == "admin":
-        display_cols = ["ID"] + display_cols
+        base_cols = ["ID"] + base_cols
         st.markdown("*Для удаления одной записи — введите её ID в форме ниже*")
 
-    st.dataframe(df[display_cols],
-                 use_container_width=True, hide_index=True,
-                 column_config={
-                     "Выпущено":           st.column_config.NumberColumn(format="%d шт"),
-                     "План. время (ч)":    st.column_config.NumberColumn(format="%.2f"),
-                     "Факт. мин":          st.column_config.NumberColumn(
-                         format="%.0f мин", help="Фактическое время, введённое оператором. Пусто = нет данных."),
-                     "Δ план/факт (мин)":  st.column_config.NumberColumn(
-                         format="%.1f мин", help="> 0 — перерасход; < 0 — опережение графика."),
-                 })
+    st.dataframe(
+        df_show[base_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Тип":             st.column_config.TextColumn(width="small"),
+            "Выпущено":        st.column_config.NumberColumn(format="%d шт"),
+            "План. время (ч)": st.column_config.NumberColumn(format="%.2f"),
+            "Факт. мин":       st.column_config.NumberColumn(
+                format="%.0f мин",
+                help="Фактическое время, введённое оператором. Пусто = нет данных."),
+            "Ремонт (ч)":      st.column_config.NumberColumn(
+                format="%.2f ч",
+                help="Длительность ремонта в часах."),
+            "Δ план/факт":     st.column_config.NumberColumn(
+                format="%.1f мин",
+                help="> 0 — перерасход; < 0 — опережение графика."),
+        }
+    )
 
     if role == "admin":
         st.divider()
@@ -754,10 +966,11 @@ def page_charts():
     require_admin()
     st.title("📊 Графики и аналитика")
 
-    col_ctrl1, col_ctrl2 = st.columns([1, 3])
+    col_ctrl1, _ = st.columns([1, 3])
     days  = col_ctrl1.slider("Период (дней)", 7, 90, 14)
     since = (date.today() - timedelta(days=days)).isoformat()
 
+    # ── Только записи типа "выпуск" для производственных графиков ─────
     data = q("""
         SELECT p.date, m.name AS machine, m.productivity,
                o.name AS operator,
@@ -766,14 +979,28 @@ def page_charts():
         LEFT JOIN machines  m ON m.id = p.machine_id
         LEFT JOIN operators o ON o.id = p.operator_id
         WHERE p.date >= ?
+          AND COALESCE(p.record_type, 'production') = 'production'
         ORDER BY p.date
     """, (since,))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    # ── Данные по ремонтам ─────────────────────────────────────────────
+    repair_data = q("""
+        SELECT p.date, m.name AS machine, o.name AS operator,
+               p.repair_duration_hours, p.notes
+        FROM production p
+        LEFT JOIN machines  m ON m.id = p.machine_id
+        LEFT JOIN operators o ON o.id = p.operator_id
+        WHERE p.date >= ?
+          AND p.record_type = 'repair'
+        ORDER BY p.date
+    """, (since,))
+
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📈 Загрузка по дням",
         "🏭 Выпуск по станкам",
         "👤 По операторам",
         "⚡ Производительность",
+        "🔧 Наладка",
         "🔄 Статусы станков",
     ])
 
@@ -784,7 +1011,6 @@ def page_charts():
         else:
             df = pd.DataFrame(data)
             df["date"] = pd.to_datetime(df["date"])
-            df["date_str"] = df["date"].dt.strftime("%d.%m")
 
             daily = df.groupby(["date", "machine"])["produced_qty"].sum().reset_index()
 
@@ -797,32 +1023,25 @@ def page_charts():
                          color_discrete_sequence=px.colors.qualitative.Bold)
             fig.update_layout(
                 plot_bgcolor="#1e2130", paper_bgcolor="#0f1117",
-                font_color="#e0e0f0", legend_title_text="Станок",
-                xaxis=dict(tickformat="%d.%m"),
+                font_color="#ffffff", legend_title_text="Станок",
+                xaxis=dict(tickformat="%d.%m", color="#ffffff"),
+                yaxis=dict(color="#ffffff"),
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # ── Тепловая карта (исправление ValueError) ──────────────────
-            # Используем pivot_table с именами колонок из daily, не из df другой длины
             if not daily.empty:
-                # Приводим дату к строке прямо в daily (одинаковая длина с daily)
                 daily_hm = daily.copy()
                 daily_hm["date_lbl"] = daily_hm["date"].dt.strftime("%d.%m")
                 try:
                     pivot2 = daily_hm.pivot_table(
-                        index="machine",
-                        columns="date_lbl",
-                        values="produced_qty",
-                        fill_value=0,
-                        aggfunc="sum"
-                    )
+                        index="machine", columns="date_lbl",
+                        values="produced_qty", fill_value=0, aggfunc="sum")
                     if not pivot2.empty:
-                        fig_hm = px.imshow(pivot2,
-                                           title="Тепловая карта загрузки",
+                        fig_hm = px.imshow(pivot2, title="Тепловая карта загрузки",
                                            template="plotly_dark",
                                            color_continuous_scale="Blues",
                                            labels=dict(color="Шт."))
-                        fig_hm.update_layout(paper_bgcolor="#0f1117", font_color="#e0e0f0")
+                        fig_hm.update_layout(paper_bgcolor="#0f1117", font_color="#ffffff")
                         st.plotly_chart(fig_hm, use_container_width=True)
                 except Exception as e:
                     st.info(f"Не удалось построить тепловую карту: {e}")
@@ -844,32 +1063,17 @@ def page_charts():
                 fig_bar = px.bar(by_machine, x="Станок", y="Выпущено",
                                  title="Суммарный выпуск",
                                  template="plotly_dark",
-                                 color="Выпущено",
-                                 color_continuous_scale="Viridis",
+                                 color="Выпущено", color_continuous_scale="Viridis",
                                  text="Выпущено")
                 fig_bar.update_traces(textposition="outside")
                 fig_bar.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-                                      font_color="#e0e0f0", showlegend=False)
+                                      font_color="#ffffff", showlegend=False)
                 st.plotly_chart(fig_bar, use_container_width=True)
             with c2:
                 fig_pie = px.pie(by_machine, names="Станок", values="Выпущено",
-                                 title="Доля выпуска",
-                                 template="plotly_dark",
-                                 hole=0.4)
-                fig_pie.update_layout(paper_bgcolor="#0f1117", font_color="#e0e0f0")
+                                 title="Доля выпуска", template="plotly_dark", hole=0.4)
+                fig_pie.update_layout(paper_bgcolor="#0f1117", font_color="#ffffff")
                 st.plotly_chart(fig_pie, use_container_width=True)
-
-            setup_total = df.groupby("machine")["setup_time"].sum().reset_index()
-            setup_total.columns = ["Станок", "Время наладки (ч)"]
-            fig_setup = px.bar(
-                setup_total.sort_values("Время наладки (ч)", ascending=False),
-                x="Станок", y="Время наладки (ч)",
-                title="Суммарное время наладки",
-                template="plotly_dark",
-                color_discrete_sequence=["#f9c74f"])
-            fig_setup.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-                                    font_color="#e0e0f0")
-            st.plotly_chart(fig_setup, use_container_width=True)
 
     # ── График 3: По операторам ────────────────────────────────────────
     with tab3:
@@ -886,15 +1090,13 @@ def page_charts():
                 by_op.columns = ["Оператор", "Выпущено"]
                 by_op = by_op.sort_values("Выпущено", ascending=True)
 
-                fig_op = px.bar(by_op, y="Оператор", x="Выпущено",
-                                orientation="h", title="Выпуск по операторам",
-                                template="plotly_dark",
-                                color="Выпущено",
-                                color_continuous_scale="Sunset",
+                fig_op = px.bar(by_op, y="Оператор", x="Выпущено", orientation="h",
+                                title="Выпуск по операторам", template="plotly_dark",
+                                color="Выпущено", color_continuous_scale="Sunset",
                                 text="Выпущено")
                 fig_op.update_traces(textposition="outside")
                 fig_op.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-                                     font_color="#e0e0f0", showlegend=False,
+                                     font_color="#ffffff", showlegend=False,
                                      height=max(300, len(by_op) * 60))
                 st.plotly_chart(fig_op, use_container_width=True)
 
@@ -903,11 +1105,9 @@ def page_charts():
                                   title="Динамика выпуска по операторам",
                                   template="plotly_dark",
                                   labels={"date": "Дата", "produced_qty": "Выпущено",
-                                          "operator": "Оператор"},
-                                  markers=True)
+                                          "operator": "Оператор"}, markers=True)
                 fig_op2.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-                                      font_color="#e0e0f0",
-                                      xaxis=dict(tickformat="%d.%m"))
+                                      font_color="#ffffff", xaxis=dict(tickformat="%d.%m"))
                 st.plotly_chart(fig_op2, use_container_width=True)
 
     # ── График 4: Производительность ──────────────────────────────────
@@ -938,24 +1138,145 @@ def page_charts():
                 marker_color="#43c59e", text=df_cmp["Факт д/ч"].round(1),
                 textposition="outside"))
             fig_cmp.update_layout(
-                title="Производительность: норма vs факт (ср. за период)",
+                title="Производительность: норма vs факт",
                 barmode="group", template="plotly_dark",
                 paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-                font_color="#e0e0f0", legend=dict(bgcolor="#1e2130"))
+                font_color="#ffffff", legend=dict(bgcolor="#1e2130"))
             st.plotly_chart(fig_cmp, use_container_width=True)
 
             df_cmp["Эффективность %"] = (
                 df_cmp["Факт д/ч"] / df_cmp["Норма д/ч"].replace(0, float("nan")) * 100
             ).round(1).fillna(0)
-            df_cmp_show = df_cmp[["Станок", "Норма д/ч", "Факт д/ч", "Эффективность %"]]
             st.dataframe(
-                df_cmp_show.style.background_gradient(
-                    subset=["Эффективность %"], cmap="RdYlGn", vmin=0, vmax=120),
+                df_cmp[["Станок", "Норма д/ч", "Факт д/ч", "Эффективность %"]]
+                .style.background_gradient(subset=["Эффективность %"],
+                                           cmap="RdYlGn", vmin=0, vmax=120),
                 use_container_width=True, hide_index=True)
 
-    # ── Вкладка 5: Статусы станков ─────────────────────────────────────
+    # ── Вкладка 5: Наладка ────────────────────────────────────────────
     with tab5:
+        _tab_setup_analytics(data, days)
+
+    # ── Вкладка 6: Статусы станков ─────────────────────────────────────
+    with tab6:
         _tab_status_analytics(days, since)
+
+
+def _tab_setup_analytics(data: list, days: int):
+    """Аналитика по времени наладки на основе записей выпуска."""
+    st.markdown("### 🔧 Аналитика по времени наладки")
+
+    if not data:
+        st.info("Нет данных для анализа наладки за выбранный период.")
+        return
+
+    df = pd.DataFrame(data)
+    df["date"] = pd.to_datetime(df["date"])
+
+    # Оставляем только строки с setup_time > 0
+    df["setup_time"] = pd.to_numeric(df["setup_time"], errors="coerce").fillna(0)
+    df_s = df[df["setup_time"] > 0].copy()
+
+    if df_s.empty:
+        st.info("Нет данных для анализа наладки — поле «Наладка (ч)» не заполнено ни в одной записи.")
+        return
+
+    # ── Сводная таблица по станкам ─────────────────────────────────────
+    st.markdown("#### 📋 Сводная таблица по станкам")
+    setup_agg = df_s.groupby("machine")["setup_time"].agg(
+        total="sum", mean="mean", count="count"
+    ).reset_index()
+    setup_agg.columns = ["Станок", "Суммарно (ч)", "Среднее (ч)", "Операций с наладкой"]
+    setup_agg["Суммарно (ч)"] = setup_agg["Суммарно (ч)"].round(2)
+    setup_agg["Среднее (ч)"]  = setup_agg["Среднее (ч)"].round(2)
+    setup_agg = setup_agg.sort_values("Суммарно (ч)", ascending=False)
+    st.dataframe(setup_agg, use_container_width=True, hide_index=True)
+
+    # ── По операторам ─────────────────────────────────────────────────
+    df_op_s = df_s[df_s["operator"].notna() & (df_s["operator"] != "")]
+    if not df_op_s.empty:
+        setup_op = df_op_s.groupby("operator")["setup_time"].agg(
+            total="sum", mean="mean", count="count"
+        ).reset_index()
+        setup_op.columns = ["Оператор", "Суммарно (ч)", "Среднее (ч)", "Операций"]
+        setup_op["Суммарно (ч)"] = setup_op["Суммарно (ч)"].round(2)
+        setup_op["Среднее (ч)"]  = setup_op["Среднее (ч)"].round(2)
+        with st.expander("👤 Сводная таблица по операторам"):
+            st.dataframe(setup_op.sort_values("Суммарно (ч)", ascending=False),
+                         use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+
+    # ── Bar chart: суммарное время наладки по станкам ─────────────────
+    with c1:
+        fig_bar = px.bar(
+            setup_agg,
+            x="Станок", y="Суммарно (ч)",
+            title="Суммарное время наладки по станкам",
+            template="plotly_dark",
+            color="Суммарно (ч)",
+            color_continuous_scale="YlOrRd",
+            text=setup_agg["Суммарно (ч)"].round(2),
+        )
+        fig_bar.update_traces(textposition="outside")
+        fig_bar.update_layout(
+            paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+            font_color="#ffffff", showlegend=False)
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    # ── Bar chart: среднее время наладки по станкам ───────────────────
+    with c2:
+        fig_avg = px.bar(
+            setup_agg.sort_values("Среднее (ч)", ascending=False),
+            x="Станок", y="Среднее (ч)",
+            title="Среднее время наладки за операцию",
+            template="plotly_dark",
+            color="Среднее (ч)",
+            color_continuous_scale="Purp",
+            text=setup_agg.sort_values("Среднее (ч)", ascending=False)["Среднее (ч)"].round(2),
+        )
+        fig_avg.update_traces(textposition="outside")
+        fig_avg.update_layout(
+            paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+            font_color="#ffffff", showlegend=False)
+        st.plotly_chart(fig_avg, use_container_width=True)
+
+    # ── Line/bar chart: динамика наладки по дням ──────────────────────
+    daily_setup = df_s.groupby("date")["setup_time"].sum().reset_index()
+    daily_setup.columns = ["Дата", "Суммарно (ч)"]
+
+    fig_line = px.bar(
+        daily_setup, x="Дата", y="Суммарно (ч)",
+        title=f"Динамика суммарной наладки по дням ({days} дней)",
+        template="plotly_dark",
+        color_discrete_sequence=["#f9c74f"],
+        text=daily_setup["Суммарно (ч)"].round(2),
+    )
+    fig_line.update_traces(textposition="outside")
+    fig_line.update_layout(
+        paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+        font_color="#ffffff",
+        xaxis=dict(tickformat="%d.%m", color="#ffffff"),
+        yaxis=dict(title="Часов наладки", color="#ffffff"),
+    )
+    st.plotly_chart(fig_line, use_container_width=True)
+
+    # ── Line chart: наладка по дням и станкам ─────────────────────────
+    if df_s["machine"].nunique() > 1:
+        daily_m = df_s.groupby(["date", "machine"])["setup_time"].sum().reset_index()
+        fig_line2 = px.line(
+            daily_m, x="date", y="setup_time", color="machine",
+            title="Динамика наладки по дням (по станкам)",
+            template="plotly_dark",
+            labels={"date": "Дата", "setup_time": "Наладка (ч)", "machine": "Станок"},
+            markers=True,
+        )
+        fig_line2.update_layout(
+            paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+            font_color="#ffffff",
+            xaxis=dict(tickformat="%d.%m"),
+        )
+        st.plotly_chart(fig_line2, use_container_width=True)
 
 
 def _tab_status_analytics(days: int, since: str):
@@ -1091,9 +1412,14 @@ def page_export():
     machines  = q("SELECT * FROM machines ORDER BY id")
     operators = q("SELECT * FROM operators ORDER BY id")
     production = q("""
-        SELECT p.id, p.date, m.name AS machine, o.name AS operator,
+        SELECT p.id,
+               COALESCE(p.record_type,'production') AS record_type,
+               p.date, m.name AS machine, o.name AS operator,
                p.batch, p.batch_number, p.setup_time,
-               p.produced_qty, p.actual_time, p.actual_duration_minutes, p.notes
+               p.produced_qty, p.actual_time,
+               p.actual_duration_minutes,
+               p.repair_duration_hours,
+               p.notes
         FROM production p
         LEFT JOIN machines  m ON m.id = p.machine_id
         LEFT JOIN operators o ON o.id = p.operator_id
@@ -1130,22 +1456,27 @@ def page_export():
     with c3:
         st.markdown(f"**📋 История ({len(production)} записей)**")
         csv_p = to_csv(production,
-                       ["id","date","machine","operator","batch","batch_number",
+                       ["id","record_type","date","machine","operator","batch","batch_number",
                         "setup_time","produced_qty","actual_time",
-                        "actual_duration_minutes","notes"])
+                        "actual_duration_minutes","repair_duration_hours","notes"])
         st.download_button("⬇ CSV: История", csv_p,
                            f"production_{date.today()}.csv", "text/csv",
                            use_container_width=True)
 
     st.divider()
-    st.markdown("### 📊 Сводный отчёт по станкам")
+    st.markdown("### 📊 Сводный отчёт по станкам (только выпуск)")
     summary = q("""
         SELECT m.name AS Станок,
-               COUNT(p.id)           AS Записей,
-               SUM(p.produced_qty)   AS "Итого выпущено",
-               ROUND(SUM(p.actual_time),2) AS "Факт. часов",
-               ROUND(AVG(p.produced_qty / NULLIF(p.actual_time,0)),1) AS "Ср. произв. д/ч",
-               ROUND(SUM(p.setup_time),2) AS "Суммарная наладка ч"
+               COUNT(CASE WHEN COALESCE(p.record_type,'production')='production' THEN 1 END) AS "Записей выпуска",
+               SUM(CASE WHEN COALESCE(p.record_type,'production')='production'
+                        THEN p.produced_qty ELSE 0 END)          AS "Итого выпущено",
+               ROUND(SUM(CASE WHEN COALESCE(p.record_type,'production')='production'
+                               THEN p.actual_time ELSE 0 END),2) AS "План. часов",
+               ROUND(SUM(CASE WHEN COALESCE(p.record_type,'production')='production'
+                               THEN p.setup_time ELSE 0 END),2)  AS "Наладка (ч)",
+               COUNT(CASE WHEN p.record_type='repair' THEN 1 END)          AS "Ремонтов",
+               ROUND(SUM(CASE WHEN p.record_type='repair'
+                               THEN COALESCE(p.repair_duration_hours,0) ELSE 0 END),2) AS "Ремонт (ч)"
         FROM machines m
         LEFT JOIN production p ON p.machine_id = m.id
         GROUP BY m.id
@@ -1207,7 +1538,7 @@ def main():
     with st.sidebar:
         st.markdown(f"""
 <div style="background:#2a2d40; border-radius:10px; padding:14px; margin-bottom:16px;">
-  <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">⚙️ НТАКонтроль</div>
+  <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">⚙️ НТА-Контроль</div>
   <div style="color:#8888aa; font-size:0.85rem; margin-top:4px;">
     👤 {st.session_state.get('name', username)}<br>
     🔑 {'Администратор' if role == 'admin' else 'Оператор'}
