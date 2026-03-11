@@ -35,149 +35,222 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── CSS — глобальная тёмная тема, весь текст белый ───────────────────────
+# ── CSS — тёмная тема, точечные правила без агрессивного перекрашивания ──
 st.markdown("""
 <style>
-    /* ═══ ФОНЫ ════════════════════════════════════════════════════════════ */
-    [data-testid="stAppViewContainer"],
-    [data-testid="stApp"],
-    .main .block-container          { background: #0f1117 !important; }
-    [data-testid="stSidebar"]       { background: #1a1d27 !important; }
-    [data-testid="stHeader"]        { background: #0f1117 !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   ФОНЫ
+═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="stAppViewContainer"],
+[data-testid="stApp"],
+.main .block-container    { background: #0f1117 !important; }
+[data-testid="stSidebar"] { background: #1a1d27 !important; }
+[data-testid="stHeader"]  { background: #0f1117 !important; }
 
-    /* ═══ ГЛОБАЛЬНЫЙ ЦВЕТ ТЕКСТА — БЕЛЫЙ ══════════════════════════════════ */
-    html, body, [data-testid="stAppViewContainer"],
-    .main, .block-container,
-    p, span, div, li, label, small,
-    .stMarkdown, .stText             { color: #ffffff !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   ОСНОВНОЙ ТЕКСТ — только на тёмном фоне страницы
+   (НЕ применяем * или div глобально — это ломает selectbox/dropdown)
+═══════════════════════════════════════════════════════════════════════════ */
+.main .block-container p,
+.main .block-container li,
+.main .block-container h1,
+.main .block-container h2,
+.main .block-container h3,
+.main .block-container h4,
+.main .block-container h5,
+.main .block-container h6,
+.main .stMarkdown p,
+.main .stMarkdown li     { color: #f0f0f0 !important; }
 
-    /* Сайдбар */
-    [data-testid="stSidebar"],
-    [data-testid="stSidebar"] *      { color: #e8e8f8 !important; }
+/* ── Заголовки ──────────────────────────────────────────────────────────── */
+h1, h2, h3, h4           { color: #ffffff !important; }
 
-    /* ═══ ЗАГОЛОВКИ ════════════════════════════════════════════════════════ */
-    h1, h2, h3, h4, h5, h6          { color: #ffffff !important; }
+/* ── Сайдбар ────────────────────────────────────────────────────────────── */
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] label { color: #e0e0f5 !important; }
 
-    /* ═══ ПОДПИСИ ПОЛЕЙ ФОРМ ══════════════════════════════════════════════ */
-    /* label в stForm, selectbox, text_input, number_input, date_input */
-    [data-testid="stForm"]   label,
-    [data-testid="stSelectbox"]  label,
-    [data-testid="stTextInput"]  label,
-    [data-testid="stNumberInput"] label,
-    [data-testid="stDateInput"]  label,
-    [data-testid="stCheckbox"]   label,
-    [data-testid="stRadio"]      label,
-    [data-testid="stSlider"]     label,
-    [data-testid="stExpander"]   summary,
-    .stFormLabel, .st-emotion-cache-label,
-    /* универсальный фолбэк через атрибут */
-    label[data-testid]              { color: #ffffff !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   ПОДПИСИ ПОЛЕЙ ФОРМ — только label внутри конкретных компонентов
+═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="stTextInput"]   > label,
+[data-testid="stNumberInput"] > label,
+[data-testid="stDateInput"]   > label,
+[data-testid="stSelectbox"]   > label,
+[data-testid="stMultiSelect"] > label,
+[data-testid="stCheckbox"]    > label,
+[data-testid="stRadio"]       > label,
+[data-testid="stSlider"]      > label,
+[data-testid="stTextArea"]    > label,
+[data-testid="stExpander"] summary,
+[data-testid="stForm"] > div > label  { color: #e0e0f5 !important; }
 
-    /* ═══ ПОЛЯ ВВОДА ═══════════════════════════════════════════════════════ */
-    input, textarea, select         { color: #ffffff !important;
-                                      background: #1e2130 !important;
-                                      border: 1px solid #3a3d5c !important; }
-    input::placeholder              { color: #8888aa !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   ПОЛЯ ВВОДА: тёмный фон, белый текст, видимый курсор
+═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="stTextInput"]   input,
+[data-testid="stNumberInput"] input,
+[data-testid="stDateInput"]   input,
+[data-testid="stTextArea"]    textarea {
+    color: #f0f0f0 !important;
+    background-color: #1e2130 !important;
+    border: 1px solid #3a3d5c !important;
+    caret-color: #a0a8ff !important;   /* яркий видимый курсор */
+}
+[data-testid="stTextInput"]   input::placeholder,
+[data-testid="stNumberInput"] input::placeholder,
+[data-testid="stTextArea"]    textarea::placeholder {
+    color: #7070a0 !important;
+}
 
-    /* ═══ SELECTBOX / DROPDOWN ════════════════════════════════════════════ */
-    [data-testid="stSelectbox"] > div > div,
-    [data-testid="stMultiSelect"] > div > div { color: #ffffff !important;
-                                                 background: #1e2130 !important; }
-    /* выпадающий список */
-    [data-baseweb="select"] *,
-    [data-baseweb="menu"]   *       { color: #ffffff !important;
-                                      background: #252840 !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   SELECTBOX — выбранное значение внутри поля (тёмный фон, светлый текст)
+   НЕ трогаем выпадающий список — BaseWeb сам управляет контрастом
+═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="stSelectbox"] [data-baseweb="select"] > div:first-child {
+    background-color: #1e2130 !important;
+    border-color: #3a3d5c !important;
+}
+[data-testid="stSelectbox"] [data-baseweb="select"] [data-baseweb="select-placeholder"],
+[data-testid="stSelectbox"] [data-baseweb="select"] [role="option"],
+[data-testid="stSelectbox"] [data-baseweb="select"] span {
+    color: #f0f0f0 !important;
+}
 
-    /* ═══ ВКЛАДКИ (tabs) ══════════════════════════════════════════════════ */
-    [data-testid="stTabs"] button,
-    .stTabs [role="tab"]            { color: #ccccee !important; }
-    .stTabs [role="tab"][aria-selected="true"]
-                                    { color: #ffffff !important;
-                                      border-bottom-color: #7c6af7 !important; }
+/* ── Выпадающий список BaseWeb — светлый фон, чёрный текст ─────────────── */
+[data-baseweb="popover"] [role="listbox"],
+[data-baseweb="menu"]    [role="option"],
+[data-baseweb="popover"] ul,
+[data-baseweb="popover"] li {
+    background-color: #ffffff !important;
+    color: #111111 !important;
+}
+[data-baseweb="menu"] [role="option"]:hover,
+[data-baseweb="popover"] li:hover {
+    background-color: #e8eaf0 !important;
+    color: #111111 !important;
+}
+/* выбранный пункт */
+[data-baseweb="menu"] [aria-selected="true"] {
+    background-color: #d8daff !important;
+    color: #111111 !important;
+}
 
-    /* ═══ КНОПКИ ══════════════════════════════════════════════════════════ */
-    .stButton > button              { color: #ffffff !important;
-                                      border-radius: 6px;
-                                      font-weight: 600; }
-    .stDownloadButton > button      { color: #ffffff !important; }
-    /* Основная кнопка (type=primary) */
-    .stButton > button[kind="primary"]       { background: #7c6af7 !important; }
-    .stButton > button[kind="secondary"]     { background: #252840 !important;
-                                               border: 1px solid #3a3d5c !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   ВКЛАДКИ (tabs)
+═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="stTabs"] [role="tab"]                { color: #b0b0d0 !important; }
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+    color: #ffffff !important;
+    border-bottom-color: #7c6af7 !important;
+}
 
-    /* ═══ МЕТРИКИ ═════════════════════════════════════════════════════════ */
-    [data-testid="metric-container"] {
-        background: #1e2130 !important;
-        border: 1px solid #2e3150;
-        border-radius: 10px;
-        padding: 12px 16px;
-    }
-    [data-testid="metric-container"] label   { color: #aaaacc !important; }
-    [data-testid="stMetricValue"]            { color: #7c6af7 !important;
-                                               font-size: 2rem !important; }
-    [data-testid="stMetricDelta"]            { color: #43c59e !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   КНОПКИ: разные режимы без принудительного белого на светлом фоне
+═══════════════════════════════════════════════════════════════════════════ */
+.stButton > button {
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+    color: #ffffff !important;          /* по умолчанию белый */
+}
+/* primary — фиолетовый фон → белый текст */
+.stButton > button[kind="primary"] {
+    background: #7c6af7 !important;
+    color: #ffffff !important;
+    border: none !important;
+}
+/* secondary — тёмный фон → белый текст */
+.stButton > button[kind="secondary"],
+.stButton > button:not([kind]) {
+    background: #252840 !important;
+    color: #e0e0f5 !important;
+    border: 1px solid #3a3d5c !important;
+}
+.stDownloadButton > button {
+    background: #252840 !important;
+    color: #e0e0f5 !important;
+    border: 1px solid #3a3d5c !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+}
 
-    /* ═══ ТАБЛИЦЫ (dataframe) ═════════════════════════════════════════════ */
-    .stDataFrame                    { border-radius: 8px; }
-    /* заголовки таблицы */
-    [data-testid="stDataFrame"] th,
-    .dvn-scroller th                { color: #56cfe1 !important;
-                                      background: #1e2130 !important; }
-    [data-testid="stDataFrame"] td,
-    .dvn-scroller td                { color: #e8e8f8 !important;
-                                      background: #141624 !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   МЕТРИКИ
+═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="metric-container"] {
+    background: #1e2130 !important;
+    border: 1px solid #2e3150;
+    border-radius: 10px;
+    padding: 12px 16px;
+}
+[data-testid="metric-container"] label    { color: #9090bb !important; }
+[data-testid="stMetricValue"]             { color: #7c6af7 !important; font-size: 2rem !important; }
+[data-testid="stMetricDelta"]             { color: #43c59e !important; }
 
-    /* ═══ EXPANDER ════════════════════════════════════════════════════════ */
-    [data-testid="stExpander"]      { background: #1a1d2e !important;
-                                      border: 1px solid #2e3150 !important;
-                                      border-radius: 8px; }
-    [data-testid="stExpander"] p,
-    [data-testid="stExpander"] span { color: #e8e8f8 !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   ТАБЛИЦЫ DATAFRAME
+═══════════════════════════════════════════════════════════════════════════ */
+.stDataFrame                { border-radius: 8px; }
+[data-testid="stDataFrame"] th,
+.dvn-scroller th            { color: #56cfe1 !important; background: #1e2130 !important; }
+[data-testid="stDataFrame"] td,
+.dvn-scroller td            { color: #e8e8f8 !important; background: #141624 !important; }
 
-    /* ═══ INFO / WARNING / ERROR ══════════════════════════════════════════ */
-    [data-testid="stAlert"]         { color: #ffffff !important; }
-    [data-testid="stAlert"] *       { color: #ffffff !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   EXPANDER
+═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="stExpander"] {
+    background: #1a1d2e !important;
+    border: 1px solid #2e3150 !important;
+    border-radius: 8px;
+}
+[data-testid="stExpander"] summary span { color: #c8c8e8 !important; }
 
-    /* ═══ RADIO (навигация в сайдбаре) ════════════════════════════════════ */
-    [data-testid="stRadio"] label   { color: #e8e8f8 !important; }
-    [data-testid="stRadio"] div[role="radiogroup"] > label > div > p
-                                    { color: #e8e8f8 !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   INFO / WARNING / ERROR / SUCCESS
+═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="stAlert"] p,
+[data-testid="stAlert"] span { color: #ffffff !important; }
 
-    /* ═══ DIVIDER ═════════════════════════════════════════════════════════ */
-    hr                              { border-color: #2e3150 !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   RADIO
+═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="stRadio"] > label                  { color: #e0e0f5 !important; }
+[data-testid="stRadio"] [role="radiogroup"] label { color: #e0e0f5 !important; }
 
-    /* ═══ SCROLLBAR ═══════════════════════════════════════════════════════ */
-    ::-webkit-scrollbar             { width: 6px; height: 6px; }
-    ::-webkit-scrollbar-track       { background: #1a1d27; }
-    ::-webkit-scrollbar-thumb       { background: #3a3d5c; border-radius: 3px; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   CHECKBOX
+═══════════════════════════════════════════════════════════════════════════ */
+[data-testid="stCheckbox"] label span { color: #e0e0f5 !important; }
 
-    /* ═══ СТАТУСНЫЕ БЕЙДЖИ ════════════════════════════════════════════════ */
-    .badge-busy  { background:#f94144; color:#fff !important; padding:3px 10px;
-                   border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-free  { background:#43c59e; color:#000 !important; padding:3px 10px;
-                   border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-setup { background:#f9c74f; color:#000 !important; padding:3px 10px;
-                   border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-idle  { background:#6c6c8a; color:#fff !important; padding:3px 10px;
-                   border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-repair{ background:#ff8c42; color:#fff !important; padding:3px 10px;
-                   border-radius:12px; font-size:12px; font-weight:600; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   DIVIDER / SCROLLBAR / CODE
+═══════════════════════════════════════════════════════════════════════════ */
+hr                     { border-color: #2e3150 !important; }
+::-webkit-scrollbar             { width: 6px; height: 6px; }
+::-webkit-scrollbar-track       { background: #1a1d27; }
+::-webkit-scrollbar-thumb       { background: #3a3d5c; border-radius: 3px; }
+code, pre              { color: #a8e6cf !important; background: #1a1d2e !important; }
 
-    /* ═══ КАРТОЧКИ ════════════════════════════════════════════════════════ */
-    .info-card {
-        background: #1e2130; border: 1px solid #2e3150;
-        border-radius: 10px; padding: 16px; margin-bottom: 12px;
-    }
-    .section-title { color: #56cfe1 !important; font-size: 1.1rem;
-                     font-weight: 700; margin-bottom: 8px; }
-
-    /* ═══ CODE / PRE ══════════════════════════════════════════════════════ */
-    code, pre                       { color: #a8e6cf !important;
-                                      background: #1a1d2e !important; }
-
-    /* ═══ REPAIR-тип записи (цветной бейдж в таблице истории) ════════════ */
-    .record-repair                  { color: #ff8c42 !important; font-weight: 600; }
-    .record-production              { color: #43c59e !important; }
+/* ═══════════════════════════════════════════════════════════════════════════
+   БЕЙДЖИ И КАРТОЧКИ
+═══════════════════════════════════════════════════════════════════════════ */
+.badge-busy  { background:#f94144; color:#fff; padding:3px 10px;
+               border-radius:12px; font-size:12px; font-weight:600; }
+.badge-free  { background:#43c59e; color:#000; padding:3px 10px;
+               border-radius:12px; font-size:12px; font-weight:600; }
+.badge-setup { background:#f9c74f; color:#000; padding:3px 10px;
+               border-radius:12px; font-size:12px; font-weight:600; }
+.badge-idle  { background:#6c6c8a; color:#fff; padding:3px 10px;
+               border-radius:12px; font-size:12px; font-weight:600; }
+.badge-repair{ background:#ff8c42; color:#fff; padding:3px 10px;
+               border-radius:12px; font-size:12px; font-weight:600; }
+.info-card {
+    background: #1e2130; border: 1px solid #2e3150;
+    border-radius: 10px; padding: 16px; margin-bottom: 12px;
+}
+.section-title { color: #56cfe1 !important; font-size: 1.1rem;
+                 font-weight: 700; margin-bottom: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -240,6 +313,9 @@ def init_db():
     # repair_duration_hours — длительность ремонта в часах (только для record_type='repair')
     if "repair_duration_hours" not in existing_cols:
         c.execute("ALTER TABLE production ADD COLUMN repair_duration_hours REAL DEFAULT NULL")
+    # is_final_release — финальный выпуск (готовое изделие): 1 = да, 0 = нет
+    if "is_final_release" not in existing_cols:
+        c.execute("ALTER TABLE production ADD COLUMN is_final_release INTEGER DEFAULT 0")
 
     # Журнал смены статусов станков
     c.execute("""
@@ -515,7 +591,8 @@ def page_machines(role):
                 options=[0] + [o["id"] for o in operators],
                 format_func=lambda x: op_map[x])
             prod_date    = r1c3.date_input("Дата*", value=date.today())
-            produced_qty = r1c4.number_input("Выпущено* (шт)", min_value=0, step=1)
+            produced_qty = r1c4.number_input("Выпущено (шт)", min_value=0, step=1,
+                                              help="0 = наладка без выпуска / тестовый прогон")
 
             r2c1, r2c2, r2c3, r2c4 = st.columns([3, 2, 2, 3])
             batch_name   = r2c1.text_input("Название партии")
@@ -524,32 +601,44 @@ def page_machines(role):
             actual_dur_min = r2c4.number_input(
                 "Факт. время выпуска (мин)",
                 min_value=0.0, step=1.0, value=0.0,
-                help="Реально потраченное время на выпуск партии в минутах. 0 — не заполнено.")
-            notes_prod = st.text_input("Примечание")
+                help="Реально потраченное время в минутах. 0 — не заполнено.")
+
+            fc1, fc2 = st.columns([5, 2])
+            notes_prod    = fc1.text_input("Примечание")
+            is_final      = fc2.checkbox(
+                "✅ Финальный выпуск",
+                help="Установите, если это последний установ и деталь готова к сдаче. "
+                     "Запись учитывается и как установ, и как финальный выпуск готовых изделий.")
 
             if st.form_submit_button("✔ Записать выпуск", type="primary",
                                      use_container_width=True):
-                if produced_qty <= 0:
-                    st.error("Укажите количество выпущенных деталей.")
+                sel_m  = next(m for m in machines if m["id"] == sel_machine)
+                # Плановое время: если qty > 0 — считаем; иначе 0
+                plan_h = round(produced_qty / sel_m["productivity"], 3) \
+                         if produced_qty > 0 else 0.0
+                fact_min = float(actual_dur_min) if actual_dur_min > 0 else None
+                exec_sql("""
+                    INSERT INTO production
+                    (date, machine_id, operator_id, batch, batch_number,
+                     setup_time, produced_qty, actual_time,
+                     actual_duration_minutes, record_type, is_final_release, notes)
+                    VALUES (?,?,?,?,?,?,?,?,?,'production',?,?)
+                """, (prod_date.isoformat(), sel_machine,
+                      sel_operator if sel_operator else None,
+                      batch_name, batch_no, setup_time,
+                      produced_qty, plan_h, fact_min,
+                      1 if is_final else 0,
+                      notes_prod))
+                if produced_qty == 0:
+                    msg = "✅ Установ записан: 0 шт (наладка / прогон без выпуска)"
                 else:
-                    sel_m  = next(m for m in machines if m["id"] == sel_machine)
-                    plan_h = round(produced_qty / sel_m["productivity"], 3)
-                    fact_min = float(actual_dur_min) if actual_dur_min > 0 else None
-                    exec_sql("""
-                        INSERT INTO production
-                        (date, machine_id, operator_id, batch, batch_number,
-                         setup_time, produced_qty, actual_time,
-                         actual_duration_minutes, record_type, notes)
-                        VALUES (?,?,?,?,?,?,?,?,?,'production',?)
-                    """, (prod_date.isoformat(), sel_machine,
-                          sel_operator if sel_operator else None,
-                          batch_name, batch_no, setup_time,
-                          produced_qty, plan_h, fact_min, notes_prod))
                     msg = f"✅ Выпуск записан: {produced_qty} шт | план {plan_h:.2f} ч"
+                    if is_final:
+                        msg += " | 🏁 Финальный выпуск"
                     if fact_min:
                         msg += f" | факт {fact_min:.0f} мин"
-                    st.success(msg)
-                    st.rerun()
+                st.success(msg)
+                st.rerun()
 
     else:  # repair
         with st.form("repair_form", clear_on_submit=True):
@@ -666,6 +755,7 @@ def page_history(role):
                p.actual_time,
                p.actual_duration_minutes,
                p.repair_duration_hours,
+               COALESCE(p.is_final_release, 0)       AS is_final_release,
                p.notes
         FROM production p
         LEFT JOIN machines  m ON m.id = p.machine_id
@@ -697,7 +787,8 @@ def page_history(role):
 
     df = pd.DataFrame(rows)
     # Нормализуем record_type: старые записи (NULL) → 'production'
-    df["record_type"] = df["record_type"].fillna("production")
+    df["record_type"]      = df["record_type"].fillna("production")
+    df["is_final_release"] = df["is_final_release"].fillna(0).astype(int)
 
     # ── Разделяем на выпуск и ремонты для метрик ──────────────────────
     df_prod   = df[df["record_type"] == "production"]
@@ -706,14 +797,17 @@ def page_history(role):
     total_qty      = df_prod["produced_qty"].sum()
     total_plan_h   = df_prod["actual_time"].sum()
     total_repair_h = df_repair["repair_duration_hours"].fillna(0).sum()
-    fact_filled    = df_prod["actual_duration_minutes"].dropna()
+    # Финальный выпуск = сумма produced_qty только по is_final_release=1
+    final_qty      = df_prod[df_prod["is_final_release"] == 1]["produced_qty"].sum()
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Всего записей",     len(df))
-    m2.metric("Выпусков",          len(df_prod))
-    m3.metric("Ремонтов",          len(df_repair))
-    m4.metric("Выпущено (шт)",     f"{int(total_qty):,}")
-    m5.metric("Ремонт (ч суммарно)", f"{total_repair_h:.1f}")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Всего записей",        len(df))
+    m2.metric("Выпусков (установов)", len(df_prod))
+    m3.metric("Ремонтов",             len(df_repair))
+    m4.metric("Установов (шт)",       f"{int(total_qty):,}")
+    m5.metric("🏁 Финальный выпуск",  f"{int(final_qty):,}",
+              help="Сумма шт по записям с галочкой «Финальный выпуск»")
+    m6.metric("Ремонт (ч)",           f"{total_repair_h:.1f}")
 
     st.divider()
 
@@ -724,6 +818,7 @@ def page_history(role):
             display_rows.append({
                 "ID":              r["id"],
                 "Тип":             "🔧 Ремонт",
+                "Фин. выпуск":     "—",
                 "Дата":            r["date"],
                 "Станок":          r["machine"] or "—",
                 "Оператор":        r["operator"] or "—",
@@ -745,6 +840,7 @@ def page_history(role):
             display_rows.append({
                 "ID":              r["id"],
                 "Тип":             "🟢 Выпуск",
+                "Фин. выпуск":     "✅ Да" if r["is_final_release"] else "—",
                 "Дата":            r["date"],
                 "Станок":          r["machine"] or "—",
                 "Оператор":        r["operator"] or "—",
@@ -761,7 +857,7 @@ def page_history(role):
 
     df_show = pd.DataFrame(display_rows)
 
-    base_cols = ["Тип", "Дата", "Станок", "Оператор", "Партия", "№ партии",
+    base_cols = ["Тип", "Фин. выпуск", "Дата", "Станок", "Оператор", "Партия", "№ партии",
                  "Наладка (ч)", "Выпущено", "План. время (ч)",
                  "Факт. мин", "Ремонт (ч)", "Δ план/факт", "Примечание"]
     if role == "admin":
@@ -774,6 +870,8 @@ def page_history(role):
         hide_index=True,
         column_config={
             "Тип":             st.column_config.TextColumn(width="small"),
+            "Фин. выпуск":     st.column_config.TextColumn(
+                width="small", help="✅ Да = финальный выпуск готовой детали"),
             "Выпущено":        st.column_config.NumberColumn(format="%d шт"),
             "План. время (ч)": st.column_config.NumberColumn(format="%.2f"),
             "Факт. мин":       st.column_config.NumberColumn(
@@ -974,7 +1072,8 @@ def page_charts():
     data = q("""
         SELECT p.date, m.name AS machine, m.productivity,
                o.name AS operator,
-               p.produced_qty, p.actual_time, p.setup_time
+               p.produced_qty, p.actual_time, p.setup_time,
+               COALESCE(p.is_final_release, 0) AS is_final_release
         FROM production p
         LEFT JOIN machines  m ON m.id = p.machine_id
         LEFT JOIN operators o ON o.id = p.operator_id
@@ -1011,13 +1110,21 @@ def page_charts():
         else:
             df = pd.DataFrame(data)
             df["date"] = pd.to_datetime(df["date"])
+            df["is_final_release"] = df["is_final_release"].fillna(0).astype(int)
+
+            # Метрики вверху
+            total_inst  = df["produced_qty"].sum()
+            total_final = df[df["is_final_release"] == 1]["produced_qty"].sum()
+            ma1, ma2 = st.columns(2)
+            ma1.metric("Установов (шт, всего)", f"{int(total_inst):,}")
+            ma2.metric("🏁 Финальный выпуск (шт)", f"{int(total_final):,}")
 
             daily = df.groupby(["date", "machine"])["produced_qty"].sum().reset_index()
 
             fig = px.bar(daily, x="date", y="produced_qty", color="machine",
                          barmode="group",
-                         title=f"Загрузка станков по дням ({days} дней)",
-                         labels={"date": "Дата", "produced_qty": "Выпущено (шт)",
+                         title=f"Установы по дням ({days} дней)",
+                         labels={"date": "Дата", "produced_qty": "Установов (шт)",
                                  "machine": "Станок"},
                          template="plotly_dark",
                          color_discrete_sequence=px.colors.qualitative.Bold)
@@ -1029,6 +1136,22 @@ def page_charts():
             )
             st.plotly_chart(fig, use_container_width=True)
 
+            # График финального выпуска по дням
+            df_fin = df[df["is_final_release"] == 1]
+            if not df_fin.empty:
+                daily_fin = df_fin.groupby("date")["produced_qty"].sum().reset_index()
+                fig_fin = px.bar(daily_fin, x="date", y="produced_qty",
+                                 title="Финальный выпуск по дням",
+                                 labels={"date": "Дата", "produced_qty": "Готовых деталей (шт)"},
+                                 template="plotly_dark",
+                                 color_discrete_sequence=["#43c59e"])
+                fig_fin.update_layout(plot_bgcolor="#1e2130", paper_bgcolor="#0f1117",
+                                      font_color="#ffffff",
+                                      xaxis=dict(tickformat="%d.%m"))
+                st.plotly_chart(fig_fin, use_container_width=True)
+            else:
+                st.info("Нет записей с галочкой «Финальный выпуск» за период.")
+
             if not daily.empty:
                 daily_hm = daily.copy()
                 daily_hm["date_lbl"] = daily_hm["date"].dt.strftime("%d.%m")
@@ -1037,7 +1160,7 @@ def page_charts():
                         index="machine", columns="date_lbl",
                         values="produced_qty", fill_value=0, aggfunc="sum")
                     if not pivot2.empty:
-                        fig_hm = px.imshow(pivot2, title="Тепловая карта загрузки",
+                        fig_hm = px.imshow(pivot2, title="Тепловая карта установов",
                                            template="plotly_dark",
                                            color_continuous_scale="Blues",
                                            labels=dict(color="Шт."))
@@ -1053,27 +1176,47 @@ def page_charts():
         else:
             df = pd.DataFrame(data)
             df["date"] = pd.to_datetime(df["date"])
+            df["is_final_release"] = df["is_final_release"].fillna(0).astype(int)
 
+            # Установы по станкам (все)
             by_machine = df.groupby("machine")["produced_qty"].sum().reset_index()
-            by_machine.columns = ["Станок", "Выпущено"]
-            by_machine = by_machine.sort_values("Выпущено", ascending=False)
+            by_machine.columns = ["Станок", "Установов (шт)"]
+            # Финальный выпуск по станкам
+            by_machine_fin = (df[df["is_final_release"] == 1]
+                              .groupby("machine")["produced_qty"].sum().reset_index())
+            by_machine_fin.columns = ["Станок", "Финальный выпуск (шт)"]
+            bm = by_machine.merge(by_machine_fin, on="Станок", how="left").fillna(0)
+            bm = bm.sort_values("Установов (шт)", ascending=False)
 
             c1, c2 = st.columns(2)
             with c1:
-                fig_bar = px.bar(by_machine, x="Станок", y="Выпущено",
-                                 title="Суммарный выпуск",
+                fig_bar = px.bar(bm, x="Станок", y="Установов (шт)",
+                                 title="Установов по станкам",
                                  template="plotly_dark",
-                                 color="Выпущено", color_continuous_scale="Viridis",
-                                 text="Выпущено")
+                                 color="Установов (шт)", color_continuous_scale="Viridis",
+                                 text="Установов (шт)")
                 fig_bar.update_traces(textposition="outside")
                 fig_bar.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
                                       font_color="#ffffff", showlegend=False)
                 st.plotly_chart(fig_bar, use_container_width=True)
             with c2:
-                fig_pie = px.pie(by_machine, names="Станок", values="Выпущено",
-                                 title="Доля выпуска", template="plotly_dark", hole=0.4)
-                fig_pie.update_layout(paper_bgcolor="#0f1117", font_color="#ffffff")
-                st.plotly_chart(fig_pie, use_container_width=True)
+                fig_fin = px.bar(bm, x="Станок", y="Финальный выпуск (шт)",
+                                 title="🏁 Финальный выпуск по станкам",
+                                 template="plotly_dark",
+                                 color="Финальный выпуск (шт)", color_continuous_scale="Teal",
+                                 text="Финальный выпуск (шт)")
+                fig_fin.update_traces(textposition="outside")
+                fig_fin.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                                      font_color="#ffffff", showlegend=False)
+                st.plotly_chart(fig_fin, use_container_width=True)
+
+            # Сводная таблица
+            st.markdown("#### Установы vs Финальный выпуск")
+            bm["% финальных"] = (
+                bm["Финальный выпуск (шт)"] / bm["Установов (шт)"].replace(0, float("nan")) * 100
+            ).round(1).fillna(0)
+            st.dataframe(bm[["Станок", "Установов (шт)", "Финальный выпуск (шт)", "% финальных"]],
+                         use_container_width=True, hide_index=True)
 
     # ── График 3: По операторам ────────────────────────────────────────
     with tab3:
@@ -1082,29 +1225,48 @@ def page_charts():
         else:
             df = pd.DataFrame(data)
             df["date"] = pd.to_datetime(df["date"])
+            df["is_final_release"] = df["is_final_release"].fillna(0).astype(int)
             df_op = df[df["operator"].notna() & (df["operator"] != "")]
             if df_op.empty:
                 st.info("Нет данных по операторам.")
             else:
+                # Установы по операторам
                 by_op = df_op.groupby("operator")["produced_qty"].sum().reset_index()
-                by_op.columns = ["Оператор", "Выпущено"]
-                by_op = by_op.sort_values("Выпущено", ascending=True)
+                by_op.columns = ["Оператор", "Установов (шт)"]
+                # Финальный выпуск по операторам
+                by_op_fin = (df_op[df_op["is_final_release"] == 1]
+                             .groupby("operator")["produced_qty"].sum().reset_index())
+                by_op_fin.columns = ["Оператор", "Финальный выпуск (шт)"]
+                by_op = by_op.merge(by_op_fin, on="Оператор", how="left").fillna(0)
+                by_op = by_op.sort_values("Установов (шт)", ascending=True)
 
-                fig_op = px.bar(by_op, y="Оператор", x="Выпущено", orientation="h",
-                                title="Выпуск по операторам", template="plotly_dark",
-                                color="Выпущено", color_continuous_scale="Sunset",
-                                text="Выпущено")
-                fig_op.update_traces(textposition="outside")
-                fig_op.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-                                     font_color="#ffffff", showlegend=False,
-                                     height=max(300, len(by_op) * 60))
+                # Grouped bar: установы + финальный выпуск
+                fig_op = go.Figure()
+                fig_op.add_trace(go.Bar(
+                    name="Установов (шт)", y=by_op["Оператор"],
+                    x=by_op["Установов (шт)"],
+                    orientation="h", marker_color="#7c6af7",
+                    text=by_op["Установов (шт)"], textposition="outside"))
+                fig_op.add_trace(go.Bar(
+                    name="Финальный выпуск", y=by_op["Оператор"],
+                    x=by_op["Финальный выпуск (шт)"],
+                    orientation="h", marker_color="#43c59e",
+                    text=by_op["Финальный выпуск (шт)"], textposition="outside"))
+                fig_op.update_layout(
+                    barmode="group",
+                    title="Установы и финальный выпуск по операторам",
+                    template="plotly_dark",
+                    paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                    font_color="#ffffff", showlegend=True,
+                    height=max(300, len(by_op) * 70),
+                    legend=dict(bgcolor="#1e2130"))
                 st.plotly_chart(fig_op, use_container_width=True)
 
                 op_daily = df_op.groupby(["date", "operator"])["produced_qty"].sum().reset_index()
                 fig_op2 = px.line(op_daily, x="date", y="produced_qty", color="operator",
-                                  title="Динамика выпуска по операторам",
+                                  title="Динамика установов по операторам",
                                   template="plotly_dark",
-                                  labels={"date": "Дата", "produced_qty": "Выпущено",
+                                  labels={"date": "Дата", "produced_qty": "Установов",
                                           "operator": "Оператор"}, markers=True)
                 fig_op2.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
                                       font_color="#ffffff", xaxis=dict(tickformat="%d.%m"))
@@ -1414,6 +1576,7 @@ def page_export():
     production = q("""
         SELECT p.id,
                COALESCE(p.record_type,'production') AS record_type,
+               COALESCE(p.is_final_release, 0)      AS is_final_release,
                p.date, m.name AS machine, o.name AS operator,
                p.batch, p.batch_number, p.setup_time,
                p.produced_qty, p.actual_time,
@@ -1456,8 +1619,8 @@ def page_export():
     with c3:
         st.markdown(f"**📋 История ({len(production)} записей)**")
         csv_p = to_csv(production,
-                       ["id","record_type","date","machine","operator","batch","batch_number",
-                        "setup_time","produced_qty","actual_time",
+                       ["id","record_type","is_final_release","date","machine","operator",
+                        "batch","batch_number","setup_time","produced_qty","actual_time",
                         "actual_duration_minutes","repair_duration_hours","notes"])
         st.download_button("⬇ CSV: История", csv_p,
                            f"production_{date.today()}.csv", "text/csv",
@@ -1467,9 +1630,13 @@ def page_export():
     st.markdown("### 📊 Сводный отчёт по станкам (только выпуск)")
     summary = q("""
         SELECT m.name AS Станок,
-               COUNT(CASE WHEN COALESCE(p.record_type,'production')='production' THEN 1 END) AS "Записей выпуска",
+               COUNT(CASE WHEN COALESCE(p.record_type,'production')='production' THEN 1 END)
+                   AS "Записей (установов)",
                SUM(CASE WHEN COALESCE(p.record_type,'production')='production'
-                        THEN p.produced_qty ELSE 0 END)          AS "Итого выпущено",
+                        THEN p.produced_qty ELSE 0 END)          AS "Установов (шт)",
+               SUM(CASE WHEN COALESCE(p.record_type,'production')='production'
+                         AND COALESCE(p.is_final_release,0)=1
+                        THEN p.produced_qty ELSE 0 END)          AS "Финальный выпуск (шт)",
                ROUND(SUM(CASE WHEN COALESCE(p.record_type,'production')='production'
                                THEN p.actual_time ELSE 0 END),2) AS "План. часов",
                ROUND(SUM(CASE WHEN COALESCE(p.record_type,'production')='production'
