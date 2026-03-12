@@ -329,19 +329,59 @@ def init_db():
     if "stage_name" not in existing_cols:
         c.execute("ALTER TABLE production ADD COLUMN stage_name TEXT DEFAULT NULL")
 
-    # ── Таблица партий: хранит общее количество деталей в партии ──────
-    # batch_number — уникальный номер партии (строка)
-    # part_name    — наименование детали
-    # total_qty    — общее плановое количество деталей в партии
-    # created_at   — дата создания записи
+    # ── Таблица партий (batches) ──────────────────────────────────────
+    # Полноценная управляемая сущность партий.
+    # batch_number — уникальный номер партии (строка, неизменяем при наличии выпуска)
+    # batch_name   — наименование детали / партии
+    # total_qty    — плановое общее количество деталей в партии
+    # notes        — примечание к партии
+    # created_at   — дата/время создания записи
     c.execute("""
-        CREATE TABLE IF NOT EXISTS batch_master (
-            batch_number TEXT PRIMARY KEY,
-            part_name    TEXT DEFAULT '',
+        CREATE TABLE IF NOT EXISTS batches (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_number TEXT UNIQUE NOT NULL,
+            batch_name   TEXT DEFAULT '',
             total_qty    INTEGER NOT NULL DEFAULT 0,
+            notes        TEXT DEFAULT '',
             created_at   TEXT NOT NULL
         )
     """)
+    # ── Миграция: переносим данные из batch_master → batches (если batch_master существует) ──
+    bm_exists = c.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='batch_master'"
+    ).fetchone()
+    if bm_exists:
+        old_rows = c.execute("SELECT * FROM batch_master").fetchall()
+        for row in old_rows:
+            try:
+                c.execute("""
+                    INSERT OR IGNORE INTO batches (batch_number, batch_name, total_qty, created_at)
+                    VALUES (?, ?, ?, ?)
+                """, (row["batch_number"], row["part_name"] or "", row["total_qty"], row["created_at"]))
+            except Exception:
+                pass
+        c.execute("DROP TABLE IF EXISTS batch_master")
+    # ── Миграция: добавляем недостающие колонки в batches ─────────────
+    batches_cols = [row[1] for row in c.execute("PRAGMA table_info(batches)").fetchall()]
+    if "notes" not in batches_cols:
+        c.execute("ALTER TABLE batches ADD COLUMN notes TEXT DEFAULT ''")
+    if "batch_name" not in batches_cols:
+        c.execute("ALTER TABLE batches ADD COLUMN batch_name TEXT DEFAULT ''")
+    # ── Перенос партий из production в batches (для записей без явной партии в batches) ─
+    orphan_batches = c.execute("""
+        SELECT DISTINCT p.batch_number, p.batch
+        FROM production p
+        WHERE p.batch_number IS NOT NULL AND p.batch_number != ''
+          AND NOT EXISTS (SELECT 1 FROM batches b WHERE b.batch_number = p.batch_number)
+    """).fetchall()
+    for ob in orphan_batches:
+        try:
+            c.execute("""
+                INSERT OR IGNORE INTO batches (batch_number, batch_name, total_qty, created_at)
+                VALUES (?, ?, 0, ?)
+            """, (ob["batch_number"], ob["batch"] or "", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        except Exception:
+            pass
 
     # Журнал смены статусов станков
     c.execute("""
@@ -487,34 +527,63 @@ def exec_sql(sql, params=()):
 
 # ── Хелперы партий ─────────────────────────────────────────────────────────
 
-def get_batch_master(batch_number: str):
-    """Возвращает запись batch_master по номеру партии или None."""
+def get_batch(batch_number: str):
+    """Возвращает запись batches по номеру партии или None."""
     if not batch_number or not batch_number.strip():
         return None
-    return q("SELECT * FROM batch_master WHERE batch_number=?",
+    return q("SELECT * FROM batches WHERE batch_number=?",
              (batch_number.strip(),), fetch="one")
 
-def upsert_batch_master(batch_number: str, part_name: str, total_qty: int):
-    """Создаёт новую запись партии; если она уже существует — не перезаписывает."""
-    existing = get_batch_master(batch_number)
-    if not existing:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        exec_sql("""
-            INSERT OR IGNORE INTO batch_master (batch_number, part_name, total_qty, created_at)
-            VALUES (?,?,?,?)
-        """, (batch_number.strip(), part_name.strip(), int(total_qty), now_str))
+def create_batch(batch_number: str, batch_name: str, total_qty: int, notes: str = ""):
+    """Создаёт новую партию. Возвращает True при успехе, False если дублируется номер."""
+    if get_batch(batch_number):
+        return False
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    exec_sql("""
+        INSERT OR IGNORE INTO batches (batch_number, batch_name, total_qty, notes, created_at)
+        VALUES (?,?,?,?,?)
+    """, (batch_number.strip(), batch_name.strip(), int(total_qty), notes.strip(), now_str))
+    return True
+
+def update_batch(batch_id: int, batch_name: str, total_qty: int, notes: str):
+    """Обновляет название, количество и примечание партии. Номер не меняется."""
+    exec_sql("""
+        UPDATE batches SET batch_name=?, total_qty=?, notes=? WHERE id=?
+    """, (batch_name.strip(), int(total_qty), notes.strip(), batch_id))
+
+def delete_batch_safe(batch_number: str):
+    """
+    Удаляет партию, если по ней нет записей выпуска.
+    Возвращает (True, '') при успехе или (False, причина) при ошибке.
+    """
+    cnt = q("SELECT COUNT(*) AS c FROM production WHERE batch_number=?",
+            (batch_number,), fetch="one")
+    if cnt and cnt["c"] > 0:
+        return False, f"Нельзя удалить партию: по ней существует {cnt['c']} записей выпуска."
+    exec_sql("DELETE FROM batches WHERE batch_number=?", (batch_number,))
+    return True, ""
 
 def all_batch_numbers():
-    """Возвращает все номера партий (из batch_master + уникальные из production)."""
-    from_master = {r["batch_number"] for r in
-                   q("SELECT batch_number FROM batch_master ORDER BY batch_number")}
-    from_prod   = {r["batch_number"] for r in
-                   q("SELECT DISTINCT batch_number FROM production "
-                     "WHERE batch_number IS NOT NULL AND batch_number != '' "
-                     "ORDER BY batch_number")
-                   if r["batch_number"]}
-    combined = sorted(from_master | from_prod)
-    return combined
+    """Возвращает все номера партий из таблицы batches, отсортированные."""
+    rows = q("SELECT batch_number FROM batches ORDER BY batch_number")
+    return [r["batch_number"] for r in rows]
+
+def all_batches():
+    """Возвращает все партии с краткой статистикой выпуска."""
+    return q("""
+        SELECT b.id, b.batch_number, b.batch_name, b.total_qty, b.notes, b.created_at,
+               COALESCE(SUM(CASE WHEN p.is_final_release=1 AND COALESCE(m.is_work_center,0)=0
+                                 THEN p.produced_qty ELSE 0 END), 0) AS final_lathe,
+               COALESCE(SUM(CASE WHEN p.is_final_release=1 AND COALESCE(m.is_work_center,0)=1
+                                 THEN p.produced_qty ELSE 0 END), 0) AS final_opta,
+               COUNT(p.id) AS record_count
+        FROM batches b
+        LEFT JOIN production p ON p.batch_number = b.batch_number
+                               AND COALESCE(p.record_type,'production') = 'production'
+        LEFT JOIN machines m ON m.id = p.machine_id
+        GROUP BY b.id, b.batch_number, b.batch_name, b.total_qty, b.notes, b.created_at
+        ORDER BY b.created_at DESC
+    """)
 
 STATUS_LABELS = {
     "busy":     "🔴 Занят",
@@ -672,48 +741,80 @@ def page_machines(role):
         return f"{prefix} {m['name']}"
 
     if rec_type == "production":
-        # ── Определение партии (вне формы — для динамики) ─────────────
+        # ── Выбор / поиск партии (вне формы — для реактивного отображения) ──
         st.markdown("##### 📦 Партия")
-        bc1, bc2, bc3 = st.columns([2, 3, 2])
-        batch_no_input = bc1.text_input(
-            "№ партии",
-            key="prod_batch_no",
-            help="Введите номер партии. Если партия новая, потребуется ввести общее количество.")
-        batch_no_stripped = batch_no_input.strip()
+        all_bns = all_batch_numbers()
 
-        # Ищем партию в batch_master
-        bm_record = get_batch_master(batch_no_stripped) if batch_no_stripped else None
+        bc1, bc2 = st.columns([2, 4])
+        # Выбор существующей партии ИЛИ ввод нового номера
+        if all_bns:
+            batch_no_input = bc1.selectbox(
+                "№ партии",
+                options=[""] + all_bns,
+                format_func=lambda x: "— выберите или введите —" if x == "" else x,
+                key="prod_batch_no_sel",
+            )
+            # Возможность набрать вручную (не из списка)
+            batch_no_manual = bc1.text_input(
+                "...или введите новый №",
+                key="prod_batch_no_manual",
+                placeholder="Новый номер партии",
+            )
+            batch_no_stripped = (batch_no_manual.strip()
+                                 if batch_no_manual.strip()
+                                 else batch_no_input.strip())
+        else:
+            batch_no_stripped = bc1.text_input(
+                "№ партии",
+                key="prod_batch_no",
+                placeholder="Введите номер партии",
+            ).strip()
+
+        bm_record  = get_batch(batch_no_stripped) if batch_no_stripped else None
         is_new_batch = (batch_no_stripped != "") and (bm_record is None)
 
-        if batch_no_stripped == "":
-            bc2.info("Введите № партии")
-            batch_total_qty_display = None
+        if not batch_no_stripped:
+            bc2.info("Введите или выберите № партии")
         elif bm_record:
-            bc2.success(f"✅ Существующая партия | {bm_record['part_name'] or '—'} "
-                        f"| Всего: **{bm_record['total_qty']:,} шт**")
-            batch_total_qty_display = bm_record["total_qty"]
+            bc2.success(
+                f"✅ **{bm_record['batch_number']}** | {bm_record['batch_name'] or '—'} "
+                f"| Всего: **{bm_record['total_qty']:,} шт**"
+                + (f" | 📝 {bm_record['notes']}" if bm_record['notes'] else "")
+            )
         else:
-            bc2.warning("🆕 Новая партия — укажите общее количество")
-            batch_total_qty_display = None
+            bc2.warning(
+                "🆕 Партия не найдена. Создайте партию заранее на странице «📋 Партии» "
+                "или введите данные новой партии ниже."
+            )
 
-        # Поля для новой партии (вне формы)
+        # Мини-форма создания новой партии прямо на месте
         new_batch_total_qty = 0
-        new_batch_part_name = ""
+        new_batch_name_val  = ""
+        new_batch_notes_val = ""
         if is_new_batch:
-            nb1, nb2 = st.columns([3, 2])
-            new_batch_part_name  = nb1.text_input("Наименование детали*", key="new_batch_pname",
-                                                   help="Название изделия / детали для новой партии")
-            new_batch_total_qty  = nb2.number_input(
-                "Общее кол-во в партии (шт)*",
-                min_value=1, step=1, key="new_batch_total",
-                help="Плановое суммарное количество деталей в этой партии")
+            with st.expander("➕ Создать новую партию", expanded=True):
+                nb1, nb2, nb3 = st.columns([3, 2, 3])
+                new_batch_name_val  = nb1.text_input("Название партии*", key="new_batch_pname")
+                new_batch_total_qty = nb2.number_input(
+                    "Всего в партии (шт)*", min_value=1, step=1, key="new_batch_total")
+                new_batch_notes_val = nb3.text_input("Примечание", key="new_batch_notes")
 
         st.markdown("---")
+
+        # Определяем тип выбранного станка ДО формы — нужно для условного отображения этапа
+        # (selectbox внутри формы ещё не выбран, поэтому берём первый станок как default)
+        first_machine_id = machines_full[0]["id"] if machines_full else None
+        # Используем session_state key если уже был выбор, иначе — первый
+        _sel_m_id_key  = st.session_state.get("_prod_machine_sel", first_machine_id)
+        _sel_m_preview = next((m for m in machines_full if m["id"] == _sel_m_id_key), None)
+        _preview_is_wc = _sel_m_preview["is_work_center"] if _sel_m_preview else False
+
         with st.form("production_form", clear_on_submit=True):
             r1c1, r1c2, r1c3, r1c4 = st.columns([3, 3, 2, 2])
             sel_machine  = r1c1.selectbox("Станок / РЦ*",
                 options=[m["id"] for m in machines_full],
-                format_func=machine_label)
+                format_func=machine_label,
+                key="_prod_machine_sel")
             sel_operator = r1c2.selectbox("Оператор",
                 options=[0] + [o["id"] for o in operators],
                 format_func=lambda x: op_map[x])
@@ -721,50 +822,76 @@ def page_machines(role):
             produced_qty = r1c4.number_input("Выпущено (шт)", min_value=0, step=1,
                                               help="0 = наладка без выпуска / тестовый прогон")
 
-            r2c1, r2c2, r2c3 = st.columns([3, 2, 3])
-            batch_name_f = r2c1.text_input(
-                "Название партии",
-                value=bm_record["part_name"] if bm_record else "",
-                help="Подставляется автоматически для существующих партий")
-            setup_time   = r2c2.number_input("Наладка (ч)", min_value=0.0, step=0.25)
-            actual_dur_min = r2c3.number_input(
+            r2c1, r2c2 = st.columns([2, 3])
+            setup_time     = r2c1.number_input("Наладка (ч)", min_value=0.0, step=0.25)
+            actual_dur_min = r2c2.number_input(
                 "Факт. время выпуска (мин)",
                 min_value=0.0, step=1.0, value=0.0,
                 help="Реально потраченное время в минутах. 0 — не заполнено.")
 
-            # Этап / операция
-            r3c1, r3c2 = st.columns([3, 4])
-            stage_name = r3c1.text_input(
-                "Этап / операция",
-                placeholder="1 установ, 2 установ, маркировка…",
-                help="Название текущего этапа обработки детали в партии")
+            # ── Логика поля «Этап» ─────────────────────────────────────
+            # Для ОПТА: этап = название рабочего центра (авто, поле скрыто)
+            # Для станка: этап обязателен, ввод вручную
+            sel_m_obj = next((m for m in machines_full if m["id"] == sel_machine), None)
+            is_wc_selected = sel_m_obj["is_work_center"] if sel_m_obj else False
+
+            if is_wc_selected:
+                # Этап = название РЦ, поле не показываем, но показываем информер
+                auto_stage = sel_m_obj["name"] if sel_m_obj else ""
+                st.info(f"🏭 Рабочий центр — этап установлен автоматически: **«{auto_stage}»**")
+                stage_name = auto_stage
+                # Пустой placeholder для выравнивания
+                stage_name_manual = ""
+            else:
+                # Станок — этап вручную (обязателен)
+                stage_col, _ = st.columns([3, 4])
+                stage_name_manual = stage_col.text_input(
+                    "Этап / операция *",
+                    placeholder="1 установ, 2 установ…",
+                    help="⚠️ Обязательно для обычных станков. Укажите номер установа или операцию.")
+                stage_name = stage_name_manual
+                auto_stage = ""
 
             fc1, fc2 = st.columns([5, 2])
             notes_prod = fc1.text_input("Примечание")
             is_final   = fc2.checkbox(
                 "✅ Финальный выпуск",
-                help="Установите, если деталь готова к сдаче. "
-                     "Для рабочих центров (🏭) идёт в «Финальный выпуск ОПТА».")
+                help="Для станков — финал станочного этапа. "
+                     "Для ОПТА — финал всей партии (учитывается в progress bar).")
 
             if st.form_submit_button("✔ Записать выпуск", type="primary",
                                      use_container_width=True):
                 require_not_viewer()
 
                 # ── Валидация партии ──────────────────────────────────
+                if not batch_no_stripped:
+                    st.error("Укажите № партии.")
+                    st.stop()
+
                 if is_new_batch:
                     if new_batch_total_qty < 1:
-                        st.error("Для новой партии необходимо указать общее количество (≥ 1 шт).")
+                        st.error("Для новой партии укажите общее количество (≥ 1 шт).")
                         st.stop()
-                    if not new_batch_part_name.strip():
-                        st.error("Укажите наименование детали для новой партии.")
+                    if not new_batch_name_val.strip():
+                        st.error("Укажите название для новой партии.")
                         st.stop()
-                    # Создаём запись в batch_master
-                    upsert_batch_master(batch_no_stripped, new_batch_part_name, new_batch_total_qty)
-                    used_batch_name = new_batch_part_name
+                    ok = create_batch(batch_no_stripped, new_batch_name_val,
+                                      new_batch_total_qty, new_batch_notes_val)
+                    if not ok:
+                        st.error(f"Партия «{batch_no_stripped}» уже существует.")
+                        st.stop()
+                    used_batch_name = new_batch_name_val
                 else:
-                    used_batch_name = batch_name_f or (bm_record["part_name"] if bm_record else "")
+                    used_batch_name = bm_record["batch_name"] if bm_record else ""
 
-                sel_m_full = next(m for m in machines_full if m["id"] == sel_machine)
+                # ── Валидация этапа для станков ────────────────────────
+                sel_m_obj2 = next((m for m in machines_full if m["id"] == sel_machine), None)
+                is_wc2 = sel_m_obj2["is_work_center"] if sel_m_obj2 else False
+                if not is_wc2 and not stage_name_manual.strip():
+                    st.error("Укажите этап / операцию для обычного станка.")
+                    st.stop()
+                final_stage = sel_m_obj2["name"] if is_wc2 else stage_name_manual.strip()
+
                 sel_m_prod = next(m for m in machines if m["id"] == sel_machine)
                 plan_h = round(produced_qty / sel_m_prod["productivity"], 3) \
                          if produced_qty > 0 else 0.0
@@ -778,24 +905,23 @@ def page_machines(role):
                     VALUES (?,?,?,?,?,?,?,?,?,'production',?,?,?)
                 """, (prod_date.isoformat(), sel_machine,
                       sel_operator if sel_operator else None,
-                      used_batch_name, batch_no_stripped or None,
+                      used_batch_name, batch_no_stripped,
                       setup_time, produced_qty, plan_h, fact_min,
                       1 if is_final else 0,
-                      stage_name.strip() or None,
+                      final_stage or None,
                       notes_prod))
 
-                is_wc = sel_m_full["is_work_center"]
-                stage_lbl = f" | этап «{stage_name.strip()}»" if stage_name.strip() else ""
+                stage_lbl = f" | этап «{final_stage}»" if final_stage else ""
                 if produced_qty == 0:
                     msg = f"✅ Установ записан: 0 шт (наладка / прогон){stage_lbl}"
-                elif is_wc:
+                elif is_wc2:
                     msg = f"✅ Выпуск ОПТА: {produced_qty} шт{stage_lbl}"
                     if is_final:
                         msg += " | 🏁 Финальный выпуск ОПТА"
                 else:
                     msg = f"✅ Выпуск: {produced_qty} шт | план {plan_h:.2f} ч{stage_lbl}"
                     if is_final:
-                        msg += " | 🏁 Финальный выпуск"
+                        msg += " | 🏁 Финальный выпуск (станок)"
                     if fact_min:
                         msg += f" | факт {fact_min:.0f} мин"
                 st.success(msg)
@@ -2150,27 +2276,154 @@ def page_export():
     st.download_button("⬇ CSV: Сводный отчёт", csv_s,
                        f"summary_{date.today()}.csv", "text/csv")
 
+def page_batches(role):
+    """
+    Страница «📋 Партии» — полноценное управление сущностью «партия».
+
+    Права:
+    - admin: создание, редактирование, удаление партий + просмотр
+    - user:  только просмотр списка (не может изменять партии)
+    - viewer: только просмотр
+    """
+    st.title("📋 Партии")
+
+    batches = all_batches()
+
+    # ── А) Список партий ──────────────────────────────────────────────
+    st.markdown("### Список партий")
+
+    if not batches:
+        st.info("Партий пока нет. Создайте первую партию с помощью формы ниже.")
+    else:
+        list_rows = []
+        for b in batches:
+            tq = b["total_qty"]
+            fl = b["final_lathe"]
+            fo = b["final_opta"]
+            pct_l = f"{fl/tq*100:.0f}%" if tq > 0 else "—"
+            pct_o = f"{fo/tq*100:.0f}%" if tq > 0 else "—"
+            list_rows.append({
+                "№ партии":       b["batch_number"],
+                "Название":       b["batch_name"] or "—",
+                "Всего (шт)":     tq or "—",
+                "Финал станки":   f"{fl:,} шт ({pct_l})",
+                "Финал ОПТА ★":   f"{fo:,} шт ({pct_o})",
+                "Записей":        b["record_count"],
+                "Создана":        (b["created_at"] or "")[:10],
+                "Примечание":     b["notes"] or "",
+            })
+        st.dataframe(pd.DataFrame(list_rows), use_container_width=True, hide_index=True)
+        st.caption("★ Финал ОПТА = общий прогресс завершения партии")
+
+    st.divider()
+
+    if role not in ("admin",):
+        st.info("👁 Создание, редактирование и удаление партий доступно только администратору.")
+        return
+
+    # ── Б) Создание новой партии ──────────────────────────────────────
+    with st.expander("➕ Создать новую партию", expanded=not batches):
+        with st.form("create_batch_form", clear_on_submit=True):
+            cb1, cb2, cb3 = st.columns([2, 3, 2])
+            new_bn    = cb1.text_input("№ партии *")
+            new_name  = cb2.text_input("Название партии *")
+            new_total = cb3.number_input("Всего в партии (шт) *", min_value=1, step=1)
+            new_notes = st.text_input("Примечание")
+            if st.form_submit_button("Создать партию", type="primary"):
+                require_not_viewer()
+                if not new_bn.strip():
+                    st.error("Укажите номер партии.")
+                elif not new_name.strip():
+                    st.error("Укажите название партии.")
+                else:
+                    ok = create_batch(new_bn.strip(), new_name, int(new_total), new_notes)
+                    if ok:
+                        st.success(f"✅ Партия «{new_bn.strip()}» создана.")
+                        st.rerun()
+                    else:
+                        st.error(f"Партия с номером «{new_bn.strip()}» уже существует.")
+
+    st.divider()
+
+    if not batches:
+        return
+
+    # ── В) Редактирование партии ──────────────────────────────────────
+    with st.expander("✏️ Редактировать партию"):
+        st.caption(
+            "Номер партии изменить нельзя (если по ней есть записи выпуска). "
+            "Можно изменить: название, количество, примечание."
+        )
+        bn_options = [b["batch_number"] for b in batches]
+        edit_bn = st.selectbox("Выберите партию для редактирования",
+                               options=bn_options, key="edit_batch_sel")
+        edit_b  = next((b for b in batches if b["batch_number"] == edit_bn), None)
+        if edit_b:
+            has_records = edit_b["record_count"] > 0
+            with st.form("edit_batch_form", clear_on_submit=False):
+                ec1, ec2, ec3 = st.columns([3, 2, 3])
+                e_name  = ec1.text_input("Название партии", value=edit_b["batch_name"] or "")
+                e_total = ec2.number_input("Всего (шт)", min_value=1, step=1,
+                                           value=max(1, edit_b["total_qty"] or 1))
+                e_notes = ec3.text_input("Примечание", value=edit_b["notes"] or "")
+                if has_records:
+                    st.info(f"ℹ️ По партии «{edit_bn}» есть {edit_b['record_count']} записей выпуска — "
+                            "номер партии изменить нельзя.")
+                if st.form_submit_button("💾 Сохранить изменения", type="primary"):
+                    require_not_viewer()
+                    update_batch(edit_b["id"], e_name, int(e_total), e_notes)
+                    st.success(f"✅ Партия «{edit_bn}» обновлена.")
+                    st.rerun()
+
+    st.divider()
+
+    # ── Г) Удаление партии ────────────────────────────────────────────
+    with st.expander("🗑 Удалить партию"):
+        st.caption("Удаление возможно только если по партии НЕТ записей выпуска.")
+        del_bn = st.selectbox("Выберите партию для удаления",
+                              options=bn_options, key="del_batch_sel")
+        del_b  = next((b for b in batches if b["batch_number"] == del_bn), None)
+        if del_b:
+            if del_b["record_count"] > 0:
+                st.error(
+                    f"❌ Нельзя удалить партию «{del_bn}»: "
+                    f"по ней существует {del_b['record_count']} записей выпуска. "
+                    "Сначала удалите все связанные записи в «📋 Истории»."
+                )
+            else:
+                with st.form("delete_batch_form", clear_on_submit=True):
+                    st.warning(f"⚠️ Удалить партию **«{del_bn}»**? Действие необратимо.")
+                    if st.form_submit_button("🗑 Подтвердить удаление", type="primary"):
+                        require_not_viewer()
+                        ok, msg = delete_batch_safe(del_bn)
+                        if ok:
+                            st.success(f"✅ Партия «{del_bn}» удалена.")
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+
 def page_batch_progress():
     """
     Страница «Прогресс партии».
-    Показывает карточку партии, аналитику по этапам, агрегаты и визуализации.
 
-    Логика расчётов:
-    - Каждая запись в production с record_type='production' и batch_number = X
-      является одним этапом обработки партии.
-    - is_work_center=0 → обычный станок (участвует в установах).
-    - is_work_center=1 → рабочий центр ОПТА.
-    - produced_qty — количество штук в этом этапе.
-    - is_final_release=1 → этот этап является финальным выпуском.
-    - Проценты считаются от total_qty из batch_master.
-    - Этапы НЕ суммируются как «готовые изделия» — каждый этап независим.
+    Бизнес-логика прогресса:
+    ─────────────────────────
+    Этапы партии идут ПОСЛЕДОВАТЕЛЬНО:
+      1. Выпуск на обычных станках (установы)
+      2. Финальный выпуск станков (завершение станочного этапа)
+      3. Выпуск через рабочие центры ОПТА
+      4. Финальный выпуск ОПТА — окончательное завершение партии
+
+    Поэтому НЕЛЬЗЯ суммировать финал станков + финал ОПТА в один прогресс.
+    Общий progress bar считается ТОЛЬКО по «финальный выпуск ОПТА» (is_work_center=1, is_final_release=1).
+    Финал станков показывается отдельно как промежуточный показатель.
     """
     st.title("📦 Прогресс партии")
 
-    # ── Выбор партии ───────────────────────────────────────────────────
     batch_numbers = all_batch_numbers()
     if not batch_numbers:
-        st.info("📭 Нет партий. Внесите первую запись выпуска с номером партии.")
+        st.info("📭 Нет партий. Создайте партию на странице «📋 Партии» или внесите выпуск с номером партии.")
         return
 
     sel_bn = st.selectbox(
@@ -2183,10 +2436,14 @@ def page_batch_progress():
         st.info("Выберите партию из списка для просмотра прогресса.")
         return
 
-    # ── Данные ─────────────────────────────────────────────────────────
-    bm = get_batch_master(sel_bn)
-    total_qty = bm["total_qty"] if bm else 0
+    # ── Данные партии из batches ───────────────────────────────────────
+    bm = get_batch(sel_bn)
+    total_qty  = bm["total_qty"]  if bm else 0
+    batch_name = bm["batch_name"] if bm else ""
+    batch_notes= bm["notes"]      if bm else ""
+    created    = bm["created_at"][:10] if bm and bm["created_at"] else "—"
 
+    # ── Записи выпуска по партии ───────────────────────────────────────
     rows = q("""
         SELECT p.id, p.date,
                COALESCE(p.stage_name, '—') AS stage_name,
@@ -2204,41 +2461,61 @@ def page_batch_progress():
         ORDER BY p.date, p.id
     """, (sel_bn,))
 
+    # ── Агрегаты (раздельно, не суммируются) ──────────────────────────
+    lathe_rows       = [r for r in rows if r["is_work_center"] == 0]
+    opta_rows        = [r for r in rows if r["is_work_center"] == 1]
+
+    lathe_total      = sum(r["produced_qty"] for r in lathe_rows)
+    lathe_final      = sum(r["produced_qty"] for r in lathe_rows if r["is_final_release"] == 1)
+    opta_total       = sum(r["produced_qty"] for r in opta_rows)
+    opta_final       = sum(r["produced_qty"] for r in opta_rows  if r["is_final_release"] == 1)
+
+    # Прогресс партии = только финальный ОПТА
+    progress_qty     = opta_final
+    remainder        = max(0, total_qty - progress_qty) if total_qty > 0 else None
+
     # ── А) Карточка партии ─────────────────────────────────────────────
-    part_name = bm["part_name"] if bm else ""
-    created   = bm["created_at"][:10] if bm else "—"
-
-    # Финальный выпуск: только записи с is_final_release=1
-    final_lathe = sum(r["produced_qty"] for r in rows
-                      if r["is_final_release"] == 1 and r["is_work_center"] == 0)
-    final_opta  = sum(r["produced_qty"] for r in rows
-                      if r["is_final_release"] == 1 and r["is_work_center"] == 1)
-    total_final = final_lathe + final_opta
-    remainder   = max(0, total_qty - total_final) if total_qty > 0 else "н/д"
-
     st.markdown(f"""
 <div style="background:#1e2130;border:1px solid #2e3150;border-radius:12px;padding:18px 22px;margin-bottom:16px;">
   <div style="color:#56cfe1;font-size:1.2rem;font-weight:700;margin-bottom:8px;">
-    📦 Партия: {sel_bn}
+    📦 Партия: <b>{sel_bn}</b>
   </div>
-  <div style="color:#e0e0f5;font-size:0.95rem;">
-    {'<b>Деталь:</b> ' + part_name + ' &nbsp;|&nbsp; ' if part_name else ''}
+  <div style="color:#e0e0f5;font-size:0.95rem;line-height:1.7;">
+    {'<b>Название:</b> ' + batch_name + ' &nbsp;|&nbsp; ' if batch_name else ''}
     <b>Всего в партии:</b> {f'{total_qty:,} шт' if total_qty else '—'} &nbsp;|&nbsp;
     <b>Создана:</b> {created}
+    {'<br><b>Примечание:</b> ' + batch_notes if batch_notes else ''}
   </div>
 </div>
 """, unsafe_allow_html=True)
 
+    # Метрики — четыре карточки
     ka, kb, kc, kd = st.columns(4)
-    ka.metric("Всего в партии",          f"{total_qty:,} шт" if total_qty else "—")
-    kb.metric("🏁 Финальный (станки)",   f"{final_lathe:,} шт")
-    kc.metric("🏁 Финальный ОПТА",       f"{final_opta:,} шт")
-    kd.metric("Остаток до завершения",   f"{remainder:,} шт" if isinstance(remainder, int) else remainder)
+    ka.metric("Всего в партии",              f"{total_qty:,} шт" if total_qty else "—")
+    kb.metric("🏁 Финал станков",
+              f"{lathe_final:,} шт",
+              f"{lathe_final/total_qty*100:.1f}%" if total_qty > 0 else None,
+              help="Выпуск с галочкой «Финальный» на обычных станках — завершение станочного этапа")
+    kc.metric("🏁 Финал ОПТА",
+              f"{opta_final:,} шт",
+              f"{opta_final/total_qty*100:.1f}%" if total_qty > 0 else None,
+              help="Выпуск с галочкой «Финальный» на рабочих центрах — окончательное завершение партии")
+    kd.metric("Остаток (по ОПТА)",
+              f"{remainder:,} шт" if remainder is not None else "н/д",
+              help="Остаток = Всего − Финал ОПТА")
 
-    if total_qty > 0 and total_final > 0:
-        pct_done = min(100.0, total_final / total_qty * 100)
-        st.markdown(f"**Общий прогресс финального выпуска: {pct_done:.1f}%**")
-        st.progress(pct_done / 100)
+    # Progress bar — ТОЛЬКО по финальному ОПТА
+    st.markdown("#### 🔄 Общий прогресс партии (по финальному выпуску ОПТА)")
+    if total_qty > 0:
+        pct_done = min(100.0, opta_final / total_qty * 100)
+        st.progress(pct_done / 100,
+                    text=f"Финал ОПТА: {opta_final:,} / {total_qty:,} шт = {pct_done:.1f}%")
+        if opta_final == 0 and lathe_final > 0:
+            st.info(
+                f"ℹ️ Станочный этап завершён ({lathe_final:,} шт), "
+                "но финальный выпуск ОПТА ещё не зафиксирован.")
+    else:
+        st.warning("Общее количество партии не задано — прогресс недоступен.")
 
     if not rows:
         st.info("По данной партии записей выпуска пока нет.")
@@ -2246,89 +2523,78 @@ def page_batch_progress():
 
     st.divider()
 
-    # ── Б) Аналитика по этапам ─────────────────────────────────────────
-    st.markdown("### 📊 Аналитика по этапам")
+    # ── Б) Таблица этапов ─────────────────────────────────────────────
+    st.markdown("### 📊 Этапы партии")
     st.caption(
-        "Каждая строка = одна запись выпуска (установ). "
-        "Один и тот же этап может встречаться несколько раз. "
+        "Каждая строка — одна запись выпуска. "
+        "Этапы идут последовательно: станки → ОПТА. "
         "Проценты считаются от общего количества партии."
     )
 
     stage_rows = []
     for r in rows:
         pct = round(r["produced_qty"] / total_qty * 100, 1) if total_qty > 0 else None
-        center_type = "🏭 Рабочий центр" if r["is_work_center"] else "⚙️ Станок"
-        fin_lbl     = "✅ Да" if r["is_final_release"] else "—"
+        fin_lbl = "✅ Финал" if r["is_final_release"] else "—"
+        ctype   = "🏭 ОПТА" if r["is_work_center"] else "⚙️ Станок"
         stage_rows.append({
-            "Дата":              r["date"],
-            "Этап / операция":   r["stage_name"] or "—",
-            "Выпущено (шт)":     r["produced_qty"],
-            "% от партии":       f"{pct}%" if pct is not None else "—",
-            "Тип центра":        center_type,
-            "Финальный выпуск":  fin_lbl,
-            "Станок / РЦ":       r["machine"] or "—",
-            "Оператор":          r["operator"] or "—",
-            "Примечание":        r["notes"] or "",
+            "Дата":             r["date"],
+            "Центр":            ctype,
+            "Этап / операция":  r["stage_name"] or "—",
+            "Станок / РЦ":      r["machine"] or "—",
+            "Выпущено (шт)":    r["produced_qty"],
+            "% от партии":      f"{pct}%" if pct is not None else "—",
+            "Финальный":        fin_lbl,
+            "Оператор":         r["operator"] or "—",
+            "Примечание":       r["notes"] or "",
         })
 
-    df_stages = pd.DataFrame(stage_rows)
-    st.dataframe(df_stages, use_container_width=True, hide_index=True,
+    st.dataframe(pd.DataFrame(stage_rows), use_container_width=True, hide_index=True,
                  column_config={
                      "Выпущено (шт)": st.column_config.NumberColumn(format="%d шт"),
                  })
 
     st.divider()
 
-    # ── В) Агрегаты ────────────────────────────────────────────────────
-    st.markdown("### 📋 Сводные показатели по партии")
-
-    # Обычные станки
-    lathe_rows = [r for r in rows if r["is_work_center"] == 0]
-    lathe_non_final = sum(r["produced_qty"] for r in lathe_rows if r["is_final_release"] == 0)
-    lathe_final     = sum(r["produced_qty"] for r in lathe_rows if r["is_final_release"] == 1)
-    # ОПТА
-    opta_rows = [r for r in rows if r["is_work_center"] == 1]
-    opta_non_final = sum(r["produced_qty"] for r in opta_rows if r["is_final_release"] == 0)
-    opta_final_qty = sum(r["produced_qty"] for r in opta_rows if r["is_final_release"] == 1)
+    # ── В) Сводные показатели (раздельно, без суммирования) ───────────
+    st.markdown("### 📋 Сводные показатели")
 
     def pct_lbl(qty):
         if total_qty > 0:
-            return f"{qty:,} шт ({qty/total_qty*100:.1f}%)"
+            return f"{qty:,} шт  ({qty/total_qty*100:.1f}%)"
         return f"{qty:,} шт"
 
     agg_data = [
-        {"Показатель": "Выпущено (без финального, станки)",     "Значение": pct_lbl(lathe_non_final)},
-        {"Показатель": "🏁 Финальный выпуск (станки)",          "Значение": pct_lbl(lathe_final)},
-        {"Показатель": "Выпущено ОПТА (без финального)",        "Значение": pct_lbl(opta_non_final)},
-        {"Показатель": "🏁 Финальный выпуск ОПТА",              "Значение": pct_lbl(opta_final_qty)},
-        {"Показатель": "Всего финальный (станки + ОПТА)",       "Значение": pct_lbl(lathe_final + opta_final_qty)},
+        {"Этап":     "⚙️ Станки — всего выпущено",        "Кол-во": pct_lbl(lathe_total)},
+        {"Этап":     "⚙️ Станки — 🏁 финальный выпуск",   "Кол-во": pct_lbl(lathe_final)},
+        {"Этап":     "🏭 ОПТА — всего выпущено",           "Кол-во": pct_lbl(opta_total)},
+        {"Этап":     "🏭 ОПТА — 🏁 финальный выпуск",      "Кол-во": pct_lbl(opta_final)},
     ]
+    st.caption("⚠️ Финал станков и финал ОПТА НЕ суммируются — это последовательные этапы одной партии.")
     st.dataframe(pd.DataFrame(agg_data), use_container_width=True, hide_index=True)
 
     st.divider()
 
-    # ── Г) Визуализации ────────────────────────────────────────────────
+    # ── Г) Графики по этапам ──────────────────────────────────────────
     st.markdown("### 📈 Графики по этапам")
 
-    # Агрегация по этапу + тип центра
     agg_map: dict = {}
     for r in rows:
-        key = (r["stage_name"] or "—",
-               "ОПТА" if r["is_work_center"] else "Станок",
-               bool(r["is_final_release"]))
+        key = (
+            r["stage_name"] or "—",
+            "ОПТА" if r["is_work_center"] else "Станок",
+            bool(r["is_final_release"]),
+        )
         agg_map[key] = agg_map.get(key, 0) + r["produced_qty"]
 
     chart_rows = []
-    for (stage, ctype, fin), qty in sorted(agg_map.items(), key=lambda x: x[1][0]):
-        fin_tag = " (фин.)" if fin else ""
-        label = f"{stage}{fin_tag} [{ctype}]"
-        pct   = round(qty / total_qty * 100, 1) if total_qty > 0 else 0
+    for (stage, ctype, fin), qty in sorted(agg_map.items(), key=lambda x: x[0][0]):
+        fin_tag = " ★фин." if fin else ""
         chart_rows.append({
-            "Этап": label,
-            "Штук": qty,
-            "% от партии": pct,
-            "Тип": ctype,
-            "Финальный": fin,
+            "Этап":        f"{stage}{fin_tag}",
+            "Штук":        qty,
+            "% от партии": round(qty / total_qty * 100, 1) if total_qty > 0 else 0,
+            "Тип":         ctype,
+            "Финальный":   fin,
         })
     df_chart = pd.DataFrame(chart_rows)
 
@@ -2337,45 +2603,26 @@ def page_batch_progress():
         return
 
     color_map = {"Станок": "#7c6af7", "ОПТА": "#56cfe1"}
-
     gc1, gc2 = st.columns(2)
     with gc1:
         fig1 = px.bar(df_chart, x="Этап", y="Штук", color="Тип",
                       title="Выпуск по этапам (штук)",
-                      template="plotly_dark",
-                      color_discrete_map=color_map,
+                      template="plotly_dark", color_discrete_map=color_map,
                       text="Штук", barmode="group")
         fig1.update_traces(textposition="outside")
-        fig1.update_layout(
-            paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-            font_color="#ffffff", legend_title_text="Тип",
-            xaxis=dict(tickangle=-30))
+        fig1.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                           font_color="#ffffff", xaxis=dict(tickangle=-30))
         st.plotly_chart(fig1, use_container_width=True)
-
     with gc2:
         fig2 = px.bar(df_chart, x="Этап", y="% от партии", color="Тип",
                       title="Выпуск по этапам (% от партии)",
-                      template="plotly_dark",
-                      color_discrete_map=color_map,
+                      template="plotly_dark", color_discrete_map=color_map,
                       text="% от партии", barmode="group")
         fig2.update_traces(textposition="outside", texttemplate="%{text}%")
-        fig2.update_layout(
-            paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
-            font_color="#ffffff", legend_title_text="Тип",
-            xaxis=dict(tickangle=-30),
-            yaxis=dict(ticksuffix="%"))
+        fig2.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                           font_color="#ffffff", xaxis=dict(tickangle=-30),
+                           yaxis=dict(ticksuffix="%"))
         st.plotly_chart(fig2, use_container_width=True)
-
-    # KPI-карточки финального прогресса
-    if total_qty > 0:
-        st.markdown("#### 🏁 Прогресс финального выпуска")
-        kpi1, kpi2, kpi3 = st.columns(3)
-        kpi1.metric("Финальный (станки)",  f"{lathe_final:,} шт",
-                    f"{lathe_final/total_qty*100:.1f}%")
-        kpi2.metric("Финальный (ОПТА)",    f"{opta_final_qty:,} шт",
-                    f"{opta_final_qty/total_qty*100:.1f}%")
-        kpi3.metric("Итого финальный",     f"{lathe_final+opta_final_qty:,} шт",
-                    f"{(lathe_final+opta_final_qty)/total_qty*100:.1f}%")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2440,6 +2687,7 @@ def main():
         pages_all = {
             "⚙️ Станки":            "machines",
             "📋 История":           "history",
+            "📋 Партии":            "batches",
             "📦 Прогресс партии":   "batch",
         }
         pages_admin = {
@@ -2480,6 +2728,8 @@ def main():
         page_machines(role)
     elif page_key == "history":
         page_history(role)
+    elif page_key == "batches":
+        page_batches(role)
     elif page_key == "batch":
         page_batch_progress()
     elif page_key == "crud":
