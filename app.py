@@ -1,7 +1,7 @@
 """
 =============================================================================
   СИСТЕМА КОНТРОЛЯ ТОКАРНЫХ СТАНКОВ — Streamlit Web App
-  Роли: admin (полный доступ), user (просмотр + ввод выпуска)
+  Роли: admin (полный доступ), user (ввод выпуска + статусы), viewer (только просмотр)
 =============================================================================
 """
 
@@ -426,8 +426,16 @@ def get_role(username: str) -> str:
         return "user"
 
 def require_admin():
+    """Останавливает выполнение, если роль не admin."""
     if st.session_state.get("role") != "admin":
         st.error("⛔ Доступ запрещён. Требуются права администратора.")
+        st.stop()
+
+def require_not_viewer():
+    """Останавливает выполнение, если роль viewer — запрет любых изменений данных."""
+    if st.session_state.get("role") == "viewer":
+        st.error("⛔ Недостаточно прав для изменения данных. "
+                 "Роль «Наблюдатель» предназначена только для просмотра.")
         st.stop()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -554,32 +562,40 @@ def page_machines(role):
 
     st.divider()
 
-    # ── Смена статуса (доступна и user, и admin) ───────────────────────
-    st.markdown("### 🔄 Изменить статус станка")
-    with st.form("status_form", clear_on_submit=True):
-        sc1, sc2, sc3 = st.columns([3, 2, 2])
-        ch_machine = sc1.selectbox("Станок",
-            options=[m["id"] for m in machines],
-            format_func=lambda x: next(m["name"] for m in machines if m["id"] == x))
-        ch_status  = sc2.selectbox("Новый статус",
-            options=MACHINE_STATUSES,
-            format_func=lambda x: STATUS_LABELS.get(x, x))
-        ch_notes   = sc3.text_input("Примечание")
-        if st.form_submit_button("Обновить статус", use_container_width=True):
-            now_str  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            username = st.session_state.get("username", "")
-            exec_sql("UPDATE machines SET status=?, notes=? WHERE id=?",
-                     (ch_status, ch_notes, ch_machine))
-            exec_sql("""
-                INSERT INTO machine_status_log (machine_id, status, changed_by, changed_at)
-                VALUES (?,?,?,?)
-            """, (ch_machine, ch_status, username, now_str))
-            st.success(f"✅ Статус обновлён на «{STATUS_LABELS.get(ch_status, ch_status)}»")
-            st.rerun()
+    # ── Смена статуса (доступна user и admin, не viewer) ───────────────
+    if st.session_state.get("role") == "viewer":
+        st.info("👁 Режим просмотра — изменение статусов недоступно.")
+    else:
+        st.markdown("### 🔄 Изменить статус станка")
+        with st.form("status_form", clear_on_submit=True):
+            sc1, sc2, sc3 = st.columns([3, 2, 2])
+            ch_machine = sc1.selectbox("Станок",
+                options=[m["id"] for m in machines],
+                format_func=lambda x: next(m["name"] for m in machines if m["id"] == x))
+            ch_status  = sc2.selectbox("Новый статус",
+                options=MACHINE_STATUSES,
+                format_func=lambda x: STATUS_LABELS.get(x, x))
+            ch_notes   = sc3.text_input("Примечание")
+            if st.form_submit_button("Обновить статус", use_container_width=True):
+                require_not_viewer()
+                now_str  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                username = st.session_state.get("username", "")
+                exec_sql("UPDATE machines SET status=?, notes=? WHERE id=?",
+                         (ch_status, ch_notes, ch_machine))
+                exec_sql("""
+                    INSERT INTO machine_status_log (machine_id, status, changed_by, changed_at)
+                    VALUES (?,?,?,?)
+                """, (ch_machine, ch_status, username, now_str))
+                st.success(f"✅ Статус обновлён на «{STATUS_LABELS.get(ch_status, ch_status)}»")
+                st.rerun()
 
     st.divider()
 
     # ── Внести запись (Выпуск или Ремонт) — User + Admin ──────────────
+    if st.session_state.get("role") == "viewer":
+        st.info("👁 Режим просмотра — внесение записей недоступно.")
+        return
+
     st.markdown("### ➕ Внести запись")
 
     # Тип записи выбирается ВНЕ формы, чтобы динамически менять поля
@@ -636,6 +652,7 @@ def page_machines(role):
 
             if st.form_submit_button("✔ Записать выпуск", type="primary",
                                      use_container_width=True):
+                require_not_viewer()
                 sel_m_full = next(m for m in machines_full if m["id"] == sel_machine)
                 sel_m_prod = next(m for m in machines if m["id"] == sel_machine)
                 plan_h = round(produced_qty / sel_m_prod["productivity"], 3) \
@@ -693,6 +710,7 @@ def page_machines(role):
 
             if st.form_submit_button("🔧 Записать ремонт", type="primary",
                                      use_container_width=True):
+                require_not_viewer()
                 if repair_hours <= 0:
                     st.error("Укажите длительность ремонта.")
                 elif not repair_notes.strip():
@@ -718,39 +736,8 @@ def page_machines(role):
 def page_history(role):
     st.title("📋 История выпуска и ремонтов")
 
-    # ── Кнопка «Очистить всю историю» — только для admin ──────────────
-    if role == "admin":
-        if "confirm_clear_history" not in st.session_state:
-            st.session_state["confirm_clear_history"] = False
-
-        total_count = q("SELECT COUNT(*) AS cnt FROM production", fetch="one")
-        total_cnt   = total_count["cnt"] if total_count else 0
-
-        col_title, col_btn = st.columns([8, 2])
-        with col_btn:
-            if not st.session_state["confirm_clear_history"]:
-                if st.button("🗑 Очистить всю историю", type="primary",
-                             use_container_width=True, disabled=(total_cnt == 0)):
-                    st.session_state["confirm_clear_history"] = True
-                    st.rerun()
-            else:
-                st.warning(
-                    "⚠️ **Вы уверены?**\n\n"
-                    "Вы хотите удалить **ВСЮ** историю "
-                    f"({total_cnt} записей). Это действие **невозможно отменить**."
-                )
-                yes_col, no_col = st.columns(2)
-                with yes_col:
-                    if st.button("✔ Да, удалить всё", type="primary",
-                                 use_container_width=True):
-                        exec_sql("DELETE FROM production")
-                        st.session_state["confirm_clear_history"] = False
-                        st.success("✅ Вся история удалена.")
-                        st.rerun()
-                with no_col:
-                    if st.button("✘ Отмена", use_container_width=True):
-                        st.session_state["confirm_clear_history"] = False
-                        st.rerun()
+    # Массовое удаление всей истории ОТКЛЮЧЕНО намеренно.
+    # Удаление отдельных записей по ID доступно только администратору (форма ниже).
 
     # ── Фильтры ────────────────────────────────────────────────────────
     with st.expander("🔍 Фильтры", expanded=True):
@@ -939,6 +926,7 @@ def page_history(role):
             with st.form("delete_prod", clear_on_submit=True):
                 del_id = st.number_input("ID записи для удаления", min_value=1, step=1)
                 if st.form_submit_button("🗑 Удалить запись", type="primary"):
+                    require_not_viewer()
                     exec_sql("DELETE FROM production WHERE id=?", (del_id,))
                     st.success(f"Запись #{del_id} удалена.")
                     st.rerun()
@@ -1073,6 +1061,7 @@ def page_history(role):
                 with conf_col:
                     if st.button("✔ Подтвердить изменение", type="primary",
                                  use_container_width=True, key="confirm_edit_btn"):
+                        require_not_viewer()
                         # Вычисляем plan_h
                         qty = draft["produced_qty"]
                         m_row = q("SELECT productivity FROM machines WHERE id=?",
@@ -1278,7 +1267,8 @@ docker exec -it lathe_app python manage_users.py add operator2 pass456 "Смир
             new_login = uu1.text_input("Логин*")
             new_pass  = uu2.text_input("Пароль*", type="password")
             new_name  = uu3.text_input("Полное имя*")
-            new_role  = uu4.selectbox("Роль", ["user", "admin"])
+            new_role  = uu4.selectbox("Роль", ["user", "viewer", "admin"],
+                                       help="user = ввод данных; viewer = только просмотр; admin = полный доступ")
             if st.form_submit_button("Создать пользователя", type="primary"):
                 if not all([new_login, new_pass, new_name]):
                     st.error("Заполните все обязательные поля.")
@@ -1305,7 +1295,10 @@ docker exec -it lathe_app python manage_users.py add operator2 pass456 "Смир
 
 
 def page_charts():
-    require_admin()
+    role = st.session_state.get("role", "user")
+    if role not in ("admin", "viewer"):
+        st.error("⛔ Доступ запрещён. Требуются права администратора или наблюдателя.")
+        st.stop()
     st.title("📊 Графики и аналитика")
 
     col_ctrl1, _ = st.columns([1, 3])
@@ -1939,7 +1932,10 @@ def _tab_status_analytics(days: int, since: str):
 
 
 def page_export():
-    require_admin()
+    role = st.session_state.get("role", "user")
+    if role not in ("admin", "viewer"):
+        st.error("⛔ Доступ запрещён.")
+        st.stop()
     st.title("💾 Экспорт данных")
 
     machines  = q("SELECT * FROM machines ORDER BY id")
@@ -2076,12 +2072,13 @@ def main():
 
     # ── Sidebar ───────────────────────────────────────────────────────
     with st.sidebar:
+        role_label = {"admin": "Администратор", "user": "Оператор", "viewer": "Наблюдатель"}.get(role, role)
         st.markdown(f"""
 <div style="background:#2a2d40; border-radius:10px; padding:14px; margin-bottom:16px;">
   <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">⚙️ НТА-Контроль</div>
   <div style="color:#8888aa; font-size:0.85rem; margin-top:4px;">
     👤 {st.session_state.get('name', username)}<br>
-    🔑 {'Администратор' if role == 'admin' else 'Оператор'}
+    🔑 {role_label}
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -2095,16 +2092,22 @@ def main():
             "📊 Графики":           "charts",
             "💾 Экспорт CSV":       "export",
         }
+        pages_viewer = {
+            "📊 Графики":           "charts",
+            "💾 Экспорт CSV":       "export",
+        }
 
         all_pages = dict(pages_all)
         if role == "admin":
             all_pages.update(pages_admin)
+        elif role == "viewer":
+            all_pages.update(pages_viewer)
 
         page = st.radio("Навигация", list(all_pages.keys()),
                         label_visibility="collapsed")
 
         st.divider()
-        if role == "admin":
+        if role in ("admin", "viewer"):
             st.markdown("**Быстрая статистика**")
             stats = q("""
                 SELECT status, COUNT(*) as cnt FROM machines GROUP BY status
