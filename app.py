@@ -317,6 +317,13 @@ def init_db():
     if "is_final_release" not in existing_cols:
         c.execute("ALTER TABLE production ADD COLUMN is_final_release INTEGER DEFAULT 0")
 
+    # ── Миграция таблицы machines ──────────────────────────────────────
+    # is_work_center — признак «Рабочий центр» (например, ОПТА); обычные станки = 0
+    existing_m_cols = [row[1] for row in
+                       c.execute("PRAGMA table_info(machines)").fetchall()]
+    if "is_work_center" not in existing_m_cols:
+        c.execute("ALTER TABLE machines ADD COLUMN is_work_center INTEGER DEFAULT 0")
+
     # Журнал смены статусов станков
     c.execute("""
         CREATE TABLE IF NOT EXISTS machine_status_log (
@@ -477,10 +484,11 @@ MACHINE_STATUSES = list(STATUS_LABELS.keys())
 # ═══════════════════════════════════════════════════════════════════════════
 
 def page_machines(role):
-    st.title("⚙️ Станки — текущее состояние")
+    st.title("⚙️ Станки и рабочие центры — текущее состояние")
 
     machines = q("""
-        SELECT m.id, m.name, m.model, m.productivity, m.status, m.notes
+        SELECT m.id, m.name, m.model, m.productivity, m.status, m.notes,
+               COALESCE(m.is_work_center, 0) AS is_work_center
         FROM machines m ORDER BY m.id
     """)
 
@@ -522,24 +530,26 @@ def page_machines(role):
     for m in machines:
         lp = last_map.get(m["id"], {})
         df_rows.append({
-            "ID":           m["id"],
-            "Станок":       m["name"],
-            "Модель":       m["model"],
-            "Статус":       STATUS_LABELS.get(m["status"], m["status"]),
-            "Партия":       lp.get("batch", "—"),
-            "№ партии":     lp.get("batch_number", "—"),
-            "Оператор":     lp.get("operator", "—"),
-            "Наладка (ч)":  lp.get("setup_time", "—"),
-            "Произв.д/ч":   m["productivity"],
-            "Посл. дата":   lp.get("date", "—"),
-            "Примечание":   m["notes"],
+            "ID":            m["id"],
+            "Станок / РЦ":   m["name"],
+            "Тип":           "🏭 Рабочий центр" if m["is_work_center"] else "⚙️ Станок",
+            "Модель":        m["model"],
+            "Статус":        STATUS_LABELS.get(m["status"], m["status"]),
+            "Партия":        lp.get("batch", "—"),
+            "№ партии":      lp.get("batch_number", "—"),
+            "Оператор":      lp.get("operator", "—"),
+            "Наладка (ч)":   lp.get("setup_time", "—"),
+            "Произв.д/ч":    m["productivity"],
+            "Посл. дата":    lp.get("date", "—"),
+            "Примечание":    m["notes"],
         })
 
     df = pd.DataFrame(df_rows)
     st.dataframe(df, use_container_width=True, hide_index=True,
                  column_config={
-                     "Статус": st.column_config.TextColumn(width="small"),
-                     "Произв.д/ч": st.column_config.NumberColumn(format="%.1f"),
+                     "Тип":         st.column_config.TextColumn(width="small"),
+                     "Статус":      st.column_config.TextColumn(width="small"),
+                     "Произв.д/ч":  st.column_config.NumberColumn(format="%.1f"),
                  })
 
     st.divider()
@@ -576,17 +586,31 @@ def page_machines(role):
     rec_type = st.radio(
         "Тип записи",
         options=["production", "repair"],
-        format_func=lambda x: "🟢 Выпуск" if x == "production" else "🔧 Ремонт",
+        format_func=lambda x: "🟢 Выпуск / Установ" if x == "production" else "🔧 Ремонт",
         horizontal=True,
         key="rec_type_radio",
     )
 
+    # Машины с признаком is_work_center
+    machines_full = q("""
+        SELECT id, name, COALESCE(is_work_center,0) AS is_work_center
+        FROM machines ORDER BY is_work_center, name
+    """)
+    wc_ids = {m["id"] for m in machines_full if m["is_work_center"]}
+
+    def machine_label(mid):
+        m = next((x for x in machines_full if x["id"] == mid), None)
+        if not m:
+            return str(mid)
+        prefix = "🏭" if m["is_work_center"] else "⚙️"
+        return f"{prefix} {m['name']}"
+
     if rec_type == "production":
         with st.form("production_form", clear_on_submit=True):
             r1c1, r1c2, r1c3, r1c4 = st.columns([3, 3, 2, 2])
-            sel_machine  = r1c1.selectbox("Станок*",
-                options=[m["id"] for m in machines],
-                format_func=lambda x: next(m["name"] for m in machines if m["id"] == x))
+            sel_machine  = r1c1.selectbox("Станок / РЦ*",
+                options=[m["id"] for m in machines_full],
+                format_func=machine_label)
             sel_operator = r1c2.selectbox("Оператор",
                 options=[0] + [o["id"] for o in operators],
                 format_func=lambda x: op_map[x])
@@ -607,14 +631,14 @@ def page_machines(role):
             notes_prod    = fc1.text_input("Примечание")
             is_final      = fc2.checkbox(
                 "✅ Финальный выпуск",
-                help="Установите, если это последний установ и деталь готова к сдаче. "
-                     "Запись учитывается и как установ, и как финальный выпуск готовых изделий.")
+                help="Установите, если деталь готова к сдаче. "
+                     "Для рабочих центров (🏭) идёт в «Финальный выпуск ОПТА».")
 
             if st.form_submit_button("✔ Записать выпуск", type="primary",
                                      use_container_width=True):
-                sel_m  = next(m for m in machines if m["id"] == sel_machine)
-                # Плановое время: если qty > 0 — считаем; иначе 0
-                plan_h = round(produced_qty / sel_m["productivity"], 3) \
+                sel_m_full = next(m for m in machines_full if m["id"] == sel_machine)
+                sel_m_prod = next(m for m in machines if m["id"] == sel_machine)
+                plan_h = round(produced_qty / sel_m_prod["productivity"], 3) \
                          if produced_qty > 0 else 0.0
                 fact_min = float(actual_dur_min) if actual_dur_min > 0 else None
                 exec_sql("""
@@ -629,8 +653,13 @@ def page_machines(role):
                       produced_qty, plan_h, fact_min,
                       1 if is_final else 0,
                       notes_prod))
+                is_wc = sel_m_full["is_work_center"]
                 if produced_qty == 0:
                     msg = "✅ Установ записан: 0 шт (наладка / прогон без выпуска)"
+                elif is_wc:
+                    msg = f"✅ Выпуск ОПТА записан: {produced_qty} шт"
+                    if is_final:
+                        msg += " | 🏁 Финальный выпуск ОПТА"
                 else:
                     msg = f"✅ Выпуск записан: {produced_qty} шт | план {plan_h:.2f} ч"
                     if is_final:
@@ -643,9 +672,9 @@ def page_machines(role):
     else:  # repair
         with st.form("repair_form", clear_on_submit=True):
             rr1, rr2, rr3 = st.columns([3, 3, 2])
-            sel_machine_r  = rr1.selectbox("Станок*",
-                options=[m["id"] for m in machines],
-                format_func=lambda x: next(m["name"] for m in machines if m["id"] == x),
+            sel_machine_r  = rr1.selectbox("Станок / РЦ*",
+                options=[m["id"] for m in machines_full],
+                format_func=machine_label,
                 key="repair_machine")
             sel_operator_r = rr2.selectbox("Ответственный",
                 options=[0] + [o["id"] for o in operators],
@@ -748,6 +777,7 @@ def page_history(role):
                COALESCE(p.record_type, 'production') AS record_type,
                p.date,
                m.name  AS machine,
+               COALESCE(m.is_work_center, 0)         AS is_work_center,
                o.name  AS operator,
                p.batch, p.batch_number,
                p.setup_time,
@@ -786,41 +816,54 @@ def page_history(role):
         return
 
     df = pd.DataFrame(rows)
-    # Нормализуем record_type: старые записи (NULL) → 'production'
     df["record_type"]      = df["record_type"].fillna("production")
     df["is_final_release"] = df["is_final_release"].fillna(0).astype(int)
+    df["is_work_center"]   = df["is_work_center"].fillna(0).astype(int)
 
-    # ── Разделяем на выпуск и ремонты для метрик ──────────────────────
+    # ── Разбивка данных ────────────────────────────────────────────────
     df_prod   = df[df["record_type"] == "production"]
     df_repair = df[df["record_type"] == "repair"]
+    # Обычные станки
+    df_lathes = df_prod[df_prod["is_work_center"] == 0]
+    # Рабочие центры (ОПТА)
+    df_wc     = df_prod[df_prod["is_work_center"] == 1]
 
-    total_qty      = df_prod["produced_qty"].sum()
-    total_plan_h   = df_prod["actual_time"].sum()
     total_repair_h = df_repair["repair_duration_hours"].fillna(0).sum()
-    # Финальный выпуск = сумма produced_qty только по is_final_release=1
-    final_qty      = df_prod[df_prod["is_final_release"] == 1]["produced_qty"].sum()
+    installs_qty   = df_lathes["produced_qty"].sum()
+    final_qty      = df_lathes[df_lathes["is_final_release"] == 1]["produced_qty"].sum()
+    opta_qty       = df_wc["produced_qty"].sum()
+    opta_final_qty = df_wc[df_wc["is_final_release"] == 1]["produced_qty"].sum()
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Всего записей",        len(df))
-    m2.metric("Выпусков (установов)", len(df_prod))
-    m3.metric("Ремонтов",             len(df_repair))
-    m4.metric("Установов (шт)",       f"{int(total_qty):,}")
-    m5.metric("🏁 Финальный выпуск",  f"{int(final_qty):,}",
-              help="Сумма шт по записям с галочкой «Финальный выпуск»")
-    m6.metric("Ремонт (ч)",           f"{total_repair_h:.1f}")
+    # ── Метрики ────────────────────────────────────────────────────────
+    st.markdown("**⚙️ Станки**")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Записей выпуска",      len(df_lathes))
+    m2.metric("Установов (шт)",       f"{int(installs_qty):,}")
+    m3.metric("🏁 Финальный выпуск",  f"{int(final_qty):,}",
+              help="Шт по записям «Финальный выпуск» для обычных станков")
+    m4.metric("Ремонтов",             len(df_repair))
+    m5.metric("Ремонт (ч)",           f"{total_repair_h:.1f}")
+
+    st.markdown("**🏭 Рабочие центры (ОПТА)**")
+    o1, o2, o3, _ = st.columns(4)
+    o1.metric("Записей ОПТА",         len(df_wc))
+    o2.metric("Выпуск ОПТА (шт)",     f"{int(opta_qty):,}")
+    o3.metric("🏁 Финальный ОПТА",    f"{int(opta_final_qty):,}",
+              help="Шт по записям «Финальный выпуск» для рабочих центров")
 
     st.divider()
 
     # ── Формируем отображаемый DataFrame ─────────────────────────────
     display_rows = []
     for _, r in df.iterrows():
+        wc_tag = " 🏭" if r["is_work_center"] else ""
         if r["record_type"] == "repair":
             display_rows.append({
                 "ID":              r["id"],
                 "Тип":             "🔧 Ремонт",
+                "Объект":          (r["machine"] or "—") + wc_tag,
                 "Фин. выпуск":     "—",
                 "Дата":            r["date"],
-                "Станок":          r["machine"] or "—",
                 "Оператор":        r["operator"] or "—",
                 "Партия":          "—",
                 "№ партии":        "—",
@@ -837,12 +880,13 @@ def page_history(role):
             fact_min = r["actual_duration_minutes"]
             delta    = round(float(fact_min) - float(plan_h) * 60, 1) \
                        if pd.notna(fact_min) and fact_min and float(fact_min) > 0 else None
+            tип = "🏭 Выпуск ОПТА" if r["is_work_center"] else "🟢 Выпуск"
             display_rows.append({
                 "ID":              r["id"],
-                "Тип":             "🟢 Выпуск",
+                "Тип":             tип,
+                "Объект":          (r["machine"] or "—") + wc_tag,
                 "Фин. выпуск":     "✅ Да" if r["is_final_release"] else "—",
                 "Дата":            r["date"],
-                "Станок":          r["machine"] or "—",
                 "Оператор":        r["operator"] or "—",
                 "Партия":          r["batch"] or "—",
                 "№ партии":        r["batch_number"] or "—",
@@ -856,13 +900,12 @@ def page_history(role):
             })
 
     df_show = pd.DataFrame(display_rows)
-
-    base_cols = ["Тип", "Фин. выпуск", "Дата", "Станок", "Оператор", "Партия", "№ партии",
-                 "Наладка (ч)", "Выпущено", "План. время (ч)",
-                 "Факт. мин", "Ремонт (ч)", "Δ план/факт", "Примечание"]
+    base_cols = ["Тип", "Объект", "Фин. выпуск", "Дата", "Оператор",
+                 "Партия", "№ партии", "Наладка (ч)", "Выпущено",
+                 "План. время (ч)", "Факт. мин", "Ремонт (ч)", "Δ план/факт", "Примечание"]
     if role == "admin":
         base_cols = ["ID"] + base_cols
-        st.markdown("*Для удаления одной записи — введите её ID в форме ниже*")
+        st.markdown("*Для удаления или редактирования — укажите ID записи в формах ниже*")
 
     st.dataframe(
         df_show[base_cols],
@@ -870,6 +913,7 @@ def page_history(role):
         hide_index=True,
         column_config={
             "Тип":             st.column_config.TextColumn(width="small"),
+            "Объект":          st.column_config.TextColumn(width="medium"),
             "Фин. выпуск":     st.column_config.TextColumn(
                 width="small", help="✅ Да = финальный выпуск готовой детали"),
             "Выпущено":        st.column_config.NumberColumn(format="%d шт"),
@@ -888,12 +932,196 @@ def page_history(role):
 
     if role == "admin":
         st.divider()
-        with st.form("delete_prod", clear_on_submit=True):
-            del_id = st.number_input("ID записи для удаления", min_value=1, step=1)
-            if st.form_submit_button("🗑 Удалить запись", type="primary"):
-                exec_sql("DELETE FROM production WHERE id=?", (del_id,))
-                st.success(f"Запись #{del_id} удалена.")
-                st.rerun()
+        # ══════════════════════════════════════════════════════════════
+        # ФОРМА УДАЛЕНИЯ ЗАПИСИ
+        # ══════════════════════════════════════════════════════════════
+        with st.expander("🗑 Удалить запись"):
+            with st.form("delete_prod", clear_on_submit=True):
+                del_id = st.number_input("ID записи для удаления", min_value=1, step=1)
+                if st.form_submit_button("🗑 Удалить запись", type="primary"):
+                    exec_sql("DELETE FROM production WHERE id=?", (del_id,))
+                    st.success(f"Запись #{del_id} удалена.")
+                    st.rerun()
+
+        # ══════════════════════════════════════════════════════════════
+        # ФОРМА РЕДАКТИРОВАНИЯ ЗАПИСИ
+        # ══════════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("#### ✏️ Редактировать запись")
+
+        # Шаг 1: выбор ID
+        edit_id_input = st.number_input("ID записи для редактирования",
+                                        min_value=1, step=1, key="edit_id_input")
+        if st.button("🔍 Загрузить запись", key="load_edit_btn"):
+            rec = q("SELECT * FROM production WHERE id=?", (edit_id_input,), fetch="one")
+            if rec is None:
+                st.error(f"Запись с ID {edit_id_input} не найдена.")
+            else:
+                st.session_state["edit_record"]  = dict(rec)
+                st.session_state["edit_pending"] = False
+
+        # Шаг 2: показываем форму редактирования
+        if "edit_record" in st.session_state and st.session_state["edit_record"]:
+            rec = st.session_state["edit_record"]
+            st.info(f"Редактируется запись **ID {rec['id']}** "
+                    f"| Дата: {rec['date']} "
+                    f"| Тип: {rec.get('record_type','production')}")
+
+            all_machines = q("""
+                SELECT id, name, COALESCE(is_work_center,0) AS is_work_center
+                FROM machines ORDER BY is_work_center, name
+            """)
+            all_operators = q("SELECT id, name FROM operators ORDER BY name")
+            op_map_e = {0: "—"} | {o["id"]: o["name"] for o in all_operators}
+
+            def mach_lbl_e(mid):
+                m = next((x for x in all_machines if x["id"] == mid), None)
+                if not m: return str(mid)
+                return ("🏭 " if m["is_work_center"] else "⚙️ ") + m["name"]
+
+            with st.form("edit_record_form"):
+                ec1, ec2, ec3 = st.columns([2, 3, 3])
+
+                # Тип записи
+                cur_rtype = rec.get("record_type") or "production"
+                e_rtype = ec1.selectbox(
+                    "Тип записи",
+                    options=["production", "repair"],
+                    index=0 if cur_rtype == "production" else 1,
+                    format_func=lambda x: "🟢 Выпуск" if x == "production" else "🔧 Ремонт")
+
+                # Машина
+                mach_ids = [m["id"] for m in all_machines]
+                cur_mid  = rec.get("machine_id") or (mach_ids[0] if mach_ids else 1)
+                e_mid = ec2.selectbox(
+                    "Станок / РЦ*",
+                    options=mach_ids,
+                    index=mach_ids.index(cur_mid) if cur_mid in mach_ids else 0,
+                    format_func=mach_lbl_e)
+
+                # Оператор
+                op_ids  = [0] + [o["id"] for o in all_operators]
+                cur_oid = rec.get("operator_id") or 0
+                if cur_oid not in op_ids: cur_oid = 0
+                e_oid = ec3.selectbox(
+                    "Оператор",
+                    options=op_ids,
+                    index=op_ids.index(cur_oid),
+                    format_func=lambda x: op_map_e[x] if x in op_map_e else str(x))
+
+                ec4, ec5, ec6 = st.columns([2, 3, 3])
+                try:
+                    cur_date = date.fromisoformat(rec["date"])
+                except Exception:
+                    cur_date = date.today()
+                e_date     = ec4.date_input("Дата*", value=cur_date)
+                e_batch    = ec5.text_input("Партия",    value=rec.get("batch") or "")
+                e_batch_no = ec6.text_input("№ партии",  value=rec.get("batch_number") or "")
+
+                ec7, ec8, ec9, ec10 = st.columns([2, 2, 2, 3])
+                e_setup = ec7.number_input(
+                    "Наладка (ч)", min_value=0.0, step=0.25,
+                    value=float(rec.get("setup_time") or 0.0))
+                e_qty   = ec8.number_input(
+                    "Выпущено (шт)", min_value=0, step=1,
+                    value=int(rec.get("produced_qty") or 0))
+                e_fact  = ec9.number_input(
+                    "Факт. время (мин)", min_value=0.0, step=1.0,
+                    value=float(rec.get("actual_duration_minutes") or 0.0))
+                e_repair_h = ec10.number_input(
+                    "Длит. ремонта (ч)", min_value=0.0, step=0.5,
+                    value=float(rec.get("repair_duration_hours") or 0.0))
+
+                ef1, ef2 = st.columns([5, 2])
+                e_notes  = ef1.text_input("Примечание", value=rec.get("notes") or "")
+                e_final  = ef2.checkbox(
+                    "✅ Финальный выпуск",
+                    value=bool(rec.get("is_final_release") or False))
+
+                submitted = st.form_submit_button("📋 Подготовить изменение", type="primary",
+                                                   use_container_width=True)
+                if submitted:
+                    # Сохраняем черновик изменений в session_state
+                    st.session_state["edit_pending"] = True
+                    st.session_state["edit_draft"] = {
+                        "id":                       rec["id"],
+                        "record_type":              e_rtype,
+                        "machine_id":               e_mid,
+                        "operator_id":              e_oid if e_oid else None,
+                        "date":                     e_date.isoformat(),
+                        "batch":                    e_batch,
+                        "batch_number":             e_batch_no,
+                        "setup_time":               e_setup,
+                        "produced_qty":             e_qty,
+                        "actual_duration_minutes":  e_fact if e_fact > 0 else None,
+                        "repair_duration_hours":    e_repair_h if e_repair_h > 0 else None,
+                        "notes":                    e_notes,
+                        "is_final_release":         1 if e_final else 0,
+                    }
+
+            # Шаг 3: подтверждение
+            if st.session_state.get("edit_pending") and "edit_draft" in st.session_state:
+                draft = st.session_state["edit_draft"]
+                st.warning(
+                    f"⚠️ **Вы уверены, что хотите изменить запись ID {draft['id']}?**\n\n"
+                    f"Тип: `{draft['record_type']}` | Дата: `{draft['date']}` | "
+                    f"Выпущено: `{draft['produced_qty']} шт` | "
+                    f"Наладка: `{draft['setup_time']} ч`\n\n"
+                    "Изменения будут сохранены в базе данных."
+                )
+                conf_col, cancel_col = st.columns(2)
+                with conf_col:
+                    if st.button("✔ Подтвердить изменение", type="primary",
+                                 use_container_width=True, key="confirm_edit_btn"):
+                        # Вычисляем plan_h
+                        qty = draft["produced_qty"]
+                        m_row = q("SELECT productivity FROM machines WHERE id=?",
+                                  (draft["machine_id"],), fetch="one")
+                        prod_val = m_row["productivity"] if m_row else 1.0
+                        plan_h = round(qty / prod_val, 3) if qty > 0 else 0.0
+                        exec_sql("""
+                            UPDATE production SET
+                                record_type              = ?,
+                                machine_id               = ?,
+                                operator_id              = ?,
+                                date                     = ?,
+                                batch                    = ?,
+                                batch_number             = ?,
+                                setup_time               = ?,
+                                produced_qty             = ?,
+                                actual_time              = ?,
+                                actual_duration_minutes  = ?,
+                                repair_duration_hours    = ?,
+                                notes                    = ?,
+                                is_final_release         = ?
+                            WHERE id = ?
+                        """, (
+                            draft["record_type"],
+                            draft["machine_id"],
+                            draft["operator_id"],
+                            draft["date"],
+                            draft["batch"],
+                            draft["batch_number"],
+                            draft["setup_time"],
+                            draft["produced_qty"],
+                            plan_h,
+                            draft["actual_duration_minutes"],
+                            draft["repair_duration_hours"],
+                            draft["notes"],
+                            draft["is_final_release"],
+                            draft["id"],
+                        ))
+                        st.success(f"✅ Запись ID {draft['id']} успешно обновлена.")
+                        # Сбрасываем состояние редактирования
+                        del st.session_state["edit_record"]
+                        del st.session_state["edit_draft"]
+                        st.session_state["edit_pending"] = False
+                        st.rerun()
+                with cancel_col:
+                    if st.button("✘ Отмена", use_container_width=True,
+                                 key="cancel_edit_btn"):
+                        st.session_state["edit_pending"] = False
+                        st.rerun()
 
 
 def page_admin_crud():
@@ -907,34 +1135,47 @@ def page_admin_crud():
         machines = q("SELECT * FROM machines ORDER BY id")
         df_m = pd.DataFrame(machines)
         if not df_m.empty:
-            df_m.columns = ["ID", "Название", "Модель", "Произв.д/ч",
-                             "Статус", "Примечание"]
-            df_m["Статус"] = df_m["Статус"].map(STATUS_LABELS)
-            st.dataframe(df_m, use_container_width=True, hide_index=True)
+            # Подстраиваем столбцы в зависимости от того, есть ли поле is_work_center
+            if "is_work_center" in df_m.columns:
+                df_m["Тип"] = df_m["is_work_center"].apply(
+                    lambda x: "🏭 Рабочий центр" if x else "⚙️ Станок")
+                show_cols = ["id","name","model","productivity","status","notes","Тип"]
+                df_show_m = df_m[show_cols].copy()
+                df_show_m.columns = ["ID","Название","Модель","Произв.д/ч","Статус","Примечание","Тип"]
+            else:
+                df_show_m = df_m.copy()
+                df_show_m.columns = ["ID","Название","Модель","Произв.д/ч","Статус","Примечание"]
+            df_show_m["Статус"] = df_show_m["Статус"].map(STATUS_LABELS)
+            st.dataframe(df_show_m, use_container_width=True, hide_index=True)
 
-        st.markdown("#### ➕ Добавить станок")
+        st.markdown("#### ➕ Добавить станок / рабочий центр")
         with st.form("add_machine", clear_on_submit=True):
             mc1, mc2, mc3, mc4 = st.columns([3, 2, 1, 2])
-            m_name  = mc1.text_input("Название*")
-            m_model = mc2.text_input("Модель")
-            m_prod  = mc3.number_input("Произв.д/ч", min_value=0.1, value=10.0, step=0.5)
-            m_notes = mc4.text_input("Примечание")
+            m_name    = mc1.text_input("Название*")
+            m_model   = mc2.text_input("Модель")
+            m_prod    = mc3.number_input("Произв.д/ч", min_value=0.1, value=10.0, step=0.5)
+            m_notes   = mc4.text_input("Примечание")
+            m_is_wc   = st.checkbox("🏭 Рабочий центр (ОПТА)",
+                                    help="Установите, если это рабочий центр. "
+                                         "Его выпуск будет отражаться в статистике ОПТА, "
+                                         "а не в установах станков.")
             if st.form_submit_button("Добавить", type="primary"):
                 if not m_name:
                     st.error("Укажите название станка.")
                 else:
-                    exec_sql("INSERT INTO machines (name,model,productivity,notes) VALUES (?,?,?,?)",
-                             (m_name, m_model, m_prod, m_notes))
-                    st.success(f"Станок «{m_name}» добавлен.")
+                    exec_sql("INSERT INTO machines (name,model,productivity,notes,is_work_center) VALUES (?,?,?,?,?)",
+                             (m_name, m_model, m_prod, m_notes, 1 if m_is_wc else 0))
+                    kind = "Рабочий центр" if m_is_wc else "Станок"
+                    st.success(f"{kind} «{m_name}» добавлен.")
                     st.rerun()
 
-        st.markdown("#### ✏️ Редактировать станок")
+        st.markdown("#### ✏️ Редактировать станок / рабочий центр")
         with st.form("edit_machine", clear_on_submit=True):
-            machines_now = q("SELECT id, name FROM machines ORDER BY id")
+            machines_now = q("SELECT id, name, COALESCE(is_work_center,0) AS is_work_center FROM machines ORDER BY id")
             em1, em2, em3, em4, em5 = st.columns([2, 3, 2, 1, 2])
-            e_id    = em1.selectbox("Станок",
+            e_id    = em1.selectbox("Станок / РЦ",
                 options=[m["id"] for m in machines_now],
-                format_func=lambda x: f"#{x} {next(m['name'] for m in machines_now if m['id']==x)}")
+                format_func=lambda x: f"{'🏭' if next(m['is_work_center'] for m in machines_now if m['id']==x) else '⚙️'} #{x} {next(m['name'] for m in machines_now if m['id']==x)}")
             e_name  = em2.text_input("Новое название")
             e_model = em3.text_input("Модель")
             e_prod  = em4.number_input("Произв.", min_value=0.1, value=10.0, step=0.5)
@@ -942,6 +1183,8 @@ def page_admin_crud():
             e_status = st.selectbox("Статус",
                 options=list(STATUS_LABELS.keys()),
                 format_func=lambda x: STATUS_LABELS[x])
+            e_is_wc = st.checkbox("🏭 Рабочий центр (ОПТА)",
+                                  help="Включите, чтобы перевести этот объект в категорию ОПТА.")
             if st.form_submit_button("Сохранить изменения"):
                 updates, vals = [], []
                 if e_name:  updates.append("name=?");         vals.append(e_name)
@@ -949,9 +1192,10 @@ def page_admin_crud():
                 updates.append("productivity=?"); vals.append(e_prod)
                 updates.append("status=?");       vals.append(e_status)
                 updates.append("notes=?");        vals.append(e_notes)
+                updates.append("is_work_center=?"); vals.append(1 if e_is_wc else 0)
                 vals.append(e_id)
                 exec_sql(f"UPDATE machines SET {', '.join(updates)} WHERE id=?", vals)
-                st.success("✅ Станок обновлён.")
+                st.success("✅ Станок / рабочий центр обновлён.")
                 st.rerun()
 
         st.markdown("#### 🗑 Удалить станок")
@@ -1068,9 +1312,10 @@ def page_charts():
     days  = col_ctrl1.slider("Период (дней)", 7, 90, 14)
     since = (date.today() - timedelta(days=days)).isoformat()
 
-    # ── Только записи типа "выпуск" для производственных графиков ─────
-    data = q("""
+    # ── Все записи типа "выпуск" с признаком рабочего центра ──────────
+    data_all = q("""
         SELECT p.date, m.name AS machine, m.productivity,
+               COALESCE(m.is_work_center, 0) AS is_work_center,
                o.name AS operator,
                p.produced_qty, p.actual_time, p.setup_time,
                COALESCE(p.is_final_release, 0) AS is_final_release
@@ -1081,6 +1326,10 @@ def page_charts():
           AND COALESCE(p.record_type, 'production') = 'production'
         ORDER BY p.date
     """, (since,))
+
+    # Разделяем
+    data      = [r for r in data_all if not r["is_work_center"]]   # обычные станки
+    data_opta = [r for r in data_all if r["is_work_center"]]        # рабочие центры
 
     # ── Данные по ремонтам ─────────────────────────────────────────────
     repair_data = q("""
@@ -1094,13 +1343,14 @@ def page_charts():
         ORDER BY p.date
     """, (since,))
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab_opta = st.tabs([
         "📈 Загрузка по дням",
         "🏭 Выпуск по станкам",
         "👤 По операторам",
         "⚡ Производительность",
         "🔧 Наладка",
         "🔄 Статусы станков",
+        "🏭 ОПТА",
     ])
 
     # ── График 1: Загрузка по дням ─────────────────────────────────────
@@ -1274,7 +1524,7 @@ def page_charts():
 
     # ── График 4: Производительность ──────────────────────────────────
     with tab4:
-        machines_all = q("SELECT id, name, productivity FROM machines ORDER BY id")
+        machines_all = q("SELECT id, name, productivity FROM machines WHERE COALESCE(is_work_center,0)=0 ORDER BY id")
         if not machines_all or not data:
             st.info("Нет данных для сравнения производительности.")
         else:
@@ -1322,6 +1572,10 @@ def page_charts():
     # ── Вкладка 6: Статусы станков ─────────────────────────────────────
     with tab6:
         _tab_status_analytics(days, since)
+
+    # ── Вкладка 7: ОПТА (рабочие центры) ─────────────────────────────
+    with tab_opta:
+        _tab_opta_analytics(data_opta, days)
 
 
 def _tab_setup_analytics(data: list, days: int):
@@ -1439,6 +1693,123 @@ def _tab_setup_analytics(data: list, days: int):
             xaxis=dict(tickformat="%d.%m"),
         )
         st.plotly_chart(fig_line2, use_container_width=True)
+
+
+def _tab_opta_analytics(data_opta: list, days: int):
+    """Аналитика по рабочим центрам (ОПТА)."""
+    st.markdown("### 🏭 Аналитика рабочих центров (ОПТА)")
+
+    if not data_opta:
+        st.info("📭 Нет данных по рабочим центрам за выбранный период. "
+                "Добавьте объект с признаком «Рабочий центр» и внесите записи выпуска.")
+        return
+
+    df = pd.DataFrame(data_opta)
+    df["date"]             = pd.to_datetime(df["date"])
+    df["is_final_release"] = df["is_final_release"].fillna(0).astype(int)
+
+    # ── Метрики ────────────────────────────────────────────────────────
+    total_opta  = df["produced_qty"].sum()
+    final_opta  = df[df["is_final_release"] == 1]["produced_qty"].sum()
+    oa1, oa2, oa3 = st.columns(3)
+    oa1.metric("Выпуск ОПТА (шт)",        f"{int(total_opta):,}")
+    oa2.metric("🏁 Финальный выпуск ОПТА", f"{int(final_opta):,}")
+    oa3.metric("Записей ОПТА",             len(df))
+
+    st.divider()
+
+    # ── Выпуск по рабочим центрам ──────────────────────────────────────
+    by_wc = df.groupby("machine")["produced_qty"].sum().reset_index()
+    by_wc.columns = ["Рабочий центр", "Выпуск ОПТА (шт)"]
+    by_wc_fin = (df[df["is_final_release"] == 1]
+                 .groupby("machine")["produced_qty"].sum().reset_index())
+    by_wc_fin.columns = ["Рабочий центр", "Финальный выпуск ОПТА (шт)"]
+    bwc = by_wc.merge(by_wc_fin, on="Рабочий центр", how="left").fillna(0)
+    bwc = bwc.sort_values("Выпуск ОПТА (шт)", ascending=False)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig_o1 = px.bar(bwc, x="Рабочий центр", y="Выпуск ОПТА (шт)",
+                        title="Выпуск ОПТА по рабочим центрам",
+                        template="plotly_dark",
+                        color="Выпуск ОПТА (шт)", color_continuous_scale="Teal",
+                        text="Выпуск ОПТА (шт)")
+        fig_o1.update_traces(textposition="outside")
+        fig_o1.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                             font_color="#ffffff", showlegend=False)
+        st.plotly_chart(fig_o1, use_container_width=True)
+    with c2:
+        fig_o2 = px.bar(bwc, x="Рабочий центр", y="Финальный выпуск ОПТА (шт)",
+                        title="🏁 Финальный выпуск ОПТА",
+                        template="plotly_dark",
+                        color="Финальный выпуск ОПТА (шт)", color_continuous_scale="Purp",
+                        text="Финальный выпуск ОПТА (шт)")
+        fig_o2.update_traces(textposition="outside")
+        fig_o2.update_layout(paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+                             font_color="#ffffff", showlegend=False)
+        st.plotly_chart(fig_o2, use_container_width=True)
+
+    # ── Динамика выпуска ОПТА по дням ─────────────────────────────────
+    daily_opta = df.groupby(["date", "machine"])["produced_qty"].sum().reset_index()
+    if not daily_opta.empty:
+        fig_dyn = px.bar(daily_opta, x="date", y="produced_qty", color="machine",
+                         barmode="group",
+                         title=f"Выпуск ОПТА по дням ({days} дней)",
+                         labels={"date": "Дата", "produced_qty": "Выпуск (шт)",
+                                 "machine": "Рабочий центр"},
+                         template="plotly_dark",
+                         color_discrete_sequence=px.colors.qualitative.Pastel)
+        fig_dyn.update_layout(plot_bgcolor="#1e2130", paper_bgcolor="#0f1117",
+                              font_color="#ffffff",
+                              xaxis=dict(tickformat="%d.%m"))
+        st.plotly_chart(fig_dyn, use_container_width=True)
+
+    # ── Операторы ОПТА ────────────────────────────────────────────────
+    st.markdown("#### 👤 Операторы ОПТА")
+    df_op = df[df["operator"].notna() & (df["operator"] != "")]
+    if df_op.empty:
+        st.info("Нет данных по операторам ОПТА.")
+    else:
+        by_op_o = df_op.groupby("operator")["produced_qty"].sum().reset_index()
+        by_op_o.columns = ["Оператор ОПТА", "Выпуск ОПТА (шт)"]
+        by_op_o_fin = (df_op[df_op["is_final_release"] == 1]
+                       .groupby("operator")["produced_qty"].sum().reset_index())
+        by_op_o_fin.columns = ["Оператор ОПТА", "Финальный ОПТА (шт)"]
+        by_op_o = by_op_o.merge(by_op_o_fin, on="Оператор ОПТА", how="left").fillna(0)
+        by_op_o = by_op_o.sort_values("Выпуск ОПТА (шт)", ascending=True)
+
+        fig_op_o = go.Figure()
+        fig_op_o.add_trace(go.Bar(
+            name="Выпуск ОПТА", y=by_op_o["Оператор ОПТА"],
+            x=by_op_o["Выпуск ОПТА (шт)"],
+            orientation="h", marker_color="#56cfe1",
+            text=by_op_o["Выпуск ОПТА (шт)"], textposition="outside"))
+        fig_op_o.add_trace(go.Bar(
+            name="Финальный ОПТА", y=by_op_o["Оператор ОПТА"],
+            x=by_op_o["Финальный ОПТА (шт)"],
+            orientation="h", marker_color="#f9c74f",
+            text=by_op_o["Финальный ОПТА (шт)"], textposition="outside"))
+        fig_op_o.update_layout(
+            barmode="group",
+            title="Выпуск и финальный выпуск ОПТА по операторам",
+            template="plotly_dark",
+            paper_bgcolor="#0f1117", plot_bgcolor="#1e2130",
+            font_color="#ffffff", showlegend=True,
+            height=max(300, len(by_op_o) * 70),
+            legend=dict(bgcolor="#1e2130"))
+        st.plotly_chart(fig_op_o, use_container_width=True)
+
+        st.markdown("#### Сводная таблица операторов ОПТА")
+        st.dataframe(by_op_o.sort_values("Выпуск ОПТА (шт)", ascending=False),
+                     use_container_width=True, hide_index=True)
+
+    # ── Итоговая таблица по РЦ ────────────────────────────────────────
+    st.markdown("#### Сводная таблица по рабочим центрам")
+    bwc["% финальных"] = (
+        bwc["Финальный выпуск ОПТА (шт)"] /
+        bwc["Выпуск ОПТА (шт)"].replace(0, float("nan")) * 100
+    ).round(1).fillna(0)
+    st.dataframe(bwc, use_container_width=True, hide_index=True)
 
 
 def _tab_status_analytics(days: int, since: str):
@@ -1630,10 +2001,12 @@ def page_export():
     st.markdown("### 📊 Сводный отчёт по станкам (только выпуск)")
     summary = q("""
         SELECT m.name AS Станок,
+               CASE WHEN COALESCE(m.is_work_center,0)=1 THEN '🏭 Рабочий центр'
+                    ELSE '⚙️ Станок' END AS Тип,
                COUNT(CASE WHEN COALESCE(p.record_type,'production')='production' THEN 1 END)
-                   AS "Записей (установов)",
+                   AS "Записей (установов/ОПТА)",
                SUM(CASE WHEN COALESCE(p.record_type,'production')='production'
-                        THEN p.produced_qty ELSE 0 END)          AS "Установов (шт)",
+                        THEN p.produced_qty ELSE 0 END)          AS "Выпущено (шт)",
                SUM(CASE WHEN COALESCE(p.record_type,'production')='production'
                          AND COALESCE(p.is_final_release,0)=1
                         THEN p.produced_qty ELSE 0 END)          AS "Финальный выпуск (шт)",
@@ -1647,7 +2020,7 @@ def page_export():
         FROM machines m
         LEFT JOIN production p ON p.machine_id = m.id
         GROUP BY m.id
-        ORDER BY m.id
+        ORDER BY COALESCE(m.is_work_center,0), m.id
     """)
     df_sum = pd.DataFrame(summary)
     st.dataframe(df_sum, use_container_width=True, hide_index=True)
