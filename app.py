@@ -851,17 +851,40 @@ def page_machines(role):
 
         # ── Поле «Этап» — полностью реактивное, ДО кнопки сохранения ──
         #
-        #  Станок (is_wc=False):
-        #    → ручной обязательный text_input, без вопросов
+        #  Ключи session_state для поля этапа инициализируются ОДИН РАЗ:
+        #  - при первом рендере формы (ключа нет в session_state);
+        #  - при смене станка (is_wc изменился или изменилось machine_nm).
+        #  После этого значение живёт в session_state и НЕ перезаписывается
+        #  при rerun, вызванных чекбоксом «Финальный выпуск» или другими виджетами.
         #
-        #  ОПТА (is_wc=True):
-        #    По умолчанию: авто-этап = machine.name (отображается как info)
-        #    Чекбокс «Изменить этап вручную»:
-        #      □ выключен  → авто-этап, кнопка «Записать» активна
-        #      ☑ включён   → text_input предзаполнен именем РЦ
-        #          ├ значение == авто → кнопка «Записать» активна
-        #          └ значение ≠ авто → показываем предупреждение + два radio-варианта
-        #                              кнопка «Записать» активна только после выбора варианта
+        #  Почему раньше был баг:
+        #  text_input без явного key опирался на позицию виджета в дереве.
+        #  При клике на чекбокс Streamlit делал rerun, и если браузер не успел
+        #  зафиксировать буферизованное значение поля — оно читалось как пустое.
+        #  Теперь значение зеркалируется в session_state через key, и rerun
+        #  не может его потерять: виджет восстанавливает значение из session_state.
+
+        _stage_lathe_key  = f"{PF}stage_lathe"
+        _stage_opta_key   = f"{PF}stage_opta"
+        _machine_prev_key = f"{PF}machine_prev"
+
+        # Определяем, сменился ли станок (нужно сбросить этап)
+        _machine_prev = st.session_state.get(_machine_prev_key)
+        _machine_changed = (_machine_prev is not None) and (_machine_prev != sel_machine)
+        st.session_state[_machine_prev_key] = sel_machine
+
+        if _machine_changed:
+            # Станок сменился — сбрасываем поля этапа и флаги
+            st.session_state.pop(_stage_lathe_key, None)
+            st.session_state.pop(_stage_opta_key,  None)
+            st.session_state.pop(f"{PF}stage_override", None)
+            st.session_state.pop(f"{PF}stage_choice",   None)
+
+        # Инициализируем значение поля для ОПТА только если ключ ещё не существует
+        # (первый рендер или только что сменился станок).
+        # Это гарантирует, что ввод пользователя не затирается при rerun чекбокса.
+        if is_wc and _stage_opta_key not in st.session_state:
+            st.session_state[_stage_opta_key] = machine_nm
 
         stage_confirmed = True    # разрешает/блокирует кнопку «Записать»
         confirmed_stage = ""      # итоговое значение этапа для INSERT
@@ -872,7 +895,7 @@ def page_machines(role):
             stage_input = sc1.text_input(
                 "Этап / операция *",
                 placeholder="1 установ, 2 установ…",
-                key=f"{PF}stage_lathe",
+                key=_stage_lathe_key,
                 help="⚠️ Обязательно для обычных станков.",
             )
             confirmed_stage = normalize_stage(stage_input)
@@ -895,11 +918,14 @@ def page_machines(role):
                 stage_confirmed = True
                 st.session_state.pop(f"{PF}stage_choice", None)
             else:
-                # Ручной режим: text_input предзаполнен именем РЦ
+                # Ручной режим: text_input с key=_stage_opta_key.
+                # Значение уже инициализировано выше (machine_nm) при первом входе.
+                # При последующих rerun Streamlit восстанавливает значение из session_state
+                # — ввод пользователя не теряется при клике на «Финальный выпуск».
                 oc1, _ = st.columns([3, 4])
                 stage_input = oc1.text_input(
                     "Этап / операция (ручной)",
-                    key=f"{PF}stage_opta",
+                    key=_stage_opta_key,
                     help="Изменено вручную. По умолчанию = название РЦ.",
                 )
                 # Если поле пустое — берём авто
