@@ -2295,25 +2295,34 @@ def page_batches(role):
     if not batches:
         st.info("Партий пока нет. Создайте первую партию с помощью формы ниже.")
     else:
-        list_rows = []
+        # Заголовок таблицы
+        hc = st.columns([2, 3, 2, 2, 2, 2, 1])
+        for col, lbl in zip(hc, ["№ партии", "Название", "Всего (шт)",
+                                  "Финал станки", "Финал ОПТА ★", "Создана", ""]):
+            col.markdown(f"**{lbl}**")
+        st.divider()
+
         for b in batches:
-            tq = b["total_qty"]
-            fl = b["final_lathe"]
-            fo = b["final_opta"]
+            tq  = b["total_qty"]
+            fl  = b["final_lathe"]
+            fo  = b["final_opta"]
             pct_l = f"{fl/tq*100:.0f}%" if tq > 0 else "—"
             pct_o = f"{fo/tq*100:.0f}%" if tq > 0 else "—"
-            list_rows.append({
-                "№ партии":       b["batch_number"],
-                "Название":       b["batch_name"] or "—",
-                "Всего (шт)":     tq or "—",
-                "Финал станки":   f"{fl:,} шт ({pct_l})",
-                "Финал ОПТА ★":   f"{fo:,} шт ({pct_o})",
-                "Записей":        b["record_count"],
-                "Создана":        (b["created_at"] or "")[:10],
-                "Примечание":     b["notes"] or "",
-            })
-        st.dataframe(pd.DataFrame(list_rows), use_container_width=True, hide_index=True)
-        st.caption("★ Финал ОПТА = общий прогресс завершения партии")
+            rc = st.columns([2, 3, 2, 2, 2, 2, 1])
+            rc[0].markdown(f"`{b['batch_number']}`")
+            rc[1].markdown(b["batch_name"] or "—")
+            rc[2].markdown(f"{tq:,}" if tq else "—")
+            rc[3].markdown(f"{fl:,} шт ({pct_l})")
+            rc[4].markdown(f"{fo:,} шт ({pct_o})")
+            rc[5].markdown((b["created_at"] or "")[:10])
+            # Кнопка перехода к прогрессу
+            if rc[6].button("📦", key=f"goto_bp_{b['batch_number']}",
+                            help=f"Открыть прогресс партии «{b['batch_number']}»"):
+                st.session_state["batch_progress_select"] = b["batch_number"]
+                st.session_state["nav_goto"] = "batch"
+                st.rerun()
+
+        st.caption("★ Финал ОПТА = общий прогресс завершения партии  |  📦 = открыть прогресс партии")
 
     st.divider()
 
@@ -2426,9 +2435,28 @@ def page_batch_progress():
         st.info("📭 Нет партий. Создайте партию на странице «📋 Партии» или внесите выпуск с номером партии.")
         return
 
+    # Кнопка возврата к списку партий
+    if st.button("← К списку партий", key="back_to_batches"):
+        st.session_state["nav_goto"] = "batches"
+        st.rerun()
+
+    # ── Автовыбор партии из session_state (переход с кнопки «📦» в «Партиях») ──
+    # session_state["batch_progress_select"] устанавливается кнопкой на стр. «Партии».
+    # st.selectbox с этим key подхватывает значение автоматически.
+    preselect = st.session_state.get("batch_progress_select", "")
+    # Проверяем валидность — партия может быть удалена после перехода
+    if preselect and preselect not in batch_numbers:
+        st.warning(f"⚠️ Партия «{preselect}» не найдена или была удалена.")
+        st.session_state["batch_progress_select"] = ""
+        preselect = ""
+
+    options    = [""] + batch_numbers
+    sel_index  = options.index(preselect) if preselect in options else 0
+
     sel_bn = st.selectbox(
         "Выберите номер партии",
-        options=[""] + batch_numbers,
+        options=options,
+        index=sel_index,
         format_func=lambda x: "— выберите партию —" if x == "" else x,
         key="batch_progress_select",
     )
@@ -2706,8 +2734,33 @@ def main():
         elif role == "viewer":
             all_pages.update(pages_viewer)
 
-        page = st.radio("Навигация", list(all_pages.keys()),
-                        label_visibility="collapsed")
+        # ── Навигация через session_state (поддерживает программный переход) ──
+        # При нажатии «Открыть прогресс» на странице «Партии» устанавливается
+        # st.session_state["nav_goto"] = "batch"  и вызывается st.rerun().
+        # Здесь мы синхронизируем st.radio с этим флагом.
+        page_keys  = list(all_pages.keys())
+        page_vals  = list(all_pages.values())
+
+        # Если был программный переход — применяем его
+        _goto = st.session_state.pop("nav_goto", None)
+        if _goto and _goto in page_vals:
+            target_label = page_keys[page_vals.index(_goto)]
+            st.session_state["_sidebar_page"] = target_label
+
+        # Гарантируем, что текущее значение radio валидно
+        _default_page = st.session_state.get("_sidebar_page", page_keys[0])
+        if _default_page not in page_keys:
+            _default_page = page_keys[0]
+
+        page = st.radio(
+            "Навигация",
+            page_keys,
+            index=page_keys.index(_default_page),
+            label_visibility="collapsed",
+            key="_sidebar_radio",
+        )
+        # Сохраняем выбор пользователя
+        st.session_state["_sidebar_page"] = page
 
         st.divider()
         if role in ("admin", "viewer"):
