@@ -2874,33 +2874,44 @@ def main():
         elif role == "viewer":
             all_pages.update(pages_viewer)
 
-        # ── Навигация через session_state (поддерживает программный переход) ──
-        # При нажатии «Открыть прогресс» на странице «Партии» устанавливается
-        # st.session_state["nav_goto"] = "batch"  и вызывается st.rerun().
-        # Здесь мы синхронизируем st.radio с этим флагом.
-        page_keys  = list(all_pages.keys())
-        page_vals  = list(all_pages.values())
+        page_keys = list(all_pages.keys())
+        page_vals = list(all_pages.values())
 
-        # Если был программный переход — применяем его
+        # ── Инициализация текущей страницы ─────────────────────────────
+        # Единственный источник истины — session_state["_nav_page"].
+        # st.radio управляется через этот ключ напрямую (key=).
+        # Программные переходы (кнопки внутри страниц) пишут в тот же ключ
+        # и вызывают st.rerun() — radio само встаёт на нужный пункт.
+        #
+        # Почему раньше был баг двойного клика:
+        #   st.radio получал key="_sidebar_radio" И index=page_keys.index(_default_page).
+        #   При ручном клике Streamlit записывал новый выбор в session_state["_sidebar_radio"],
+        #   но код ниже сразу перезаписывал session_state["_sidebar_page"] и передавал
+        #   старое значение в index= при следующем rerun — radio «возвращалось» назад.
+        #   Со второго клика _sidebar_page уже успевал обновиться, поэтому переход срабатывал.
+
+        if "_nav_page" not in st.session_state:
+            st.session_state["_nav_page"] = page_keys[0]
+
+        # Программный переход (nav_goto): пишем сразу в ключ radio
         _goto = st.session_state.pop("nav_goto", None)
         if _goto and _goto in page_vals:
-            target_label = page_keys[page_vals.index(_goto)]
-            st.session_state["_sidebar_page"] = target_label
+            st.session_state["_nav_page"] = page_keys[page_vals.index(_goto)]
 
-        # Гарантируем, что текущее значение radio валидно
-        _default_page = st.session_state.get("_sidebar_page", page_keys[0])
-        if _default_page not in page_keys:
-            _default_page = page_keys[0]
+        # Если сохранённая страница недоступна для текущей роли — сбрасываем
+        if st.session_state["_nav_page"] not in page_keys:
+            st.session_state["_nav_page"] = page_keys[0]
 
-        page = st.radio(
+        # st.radio читает и пишет session_state["_nav_page"] через key=.
+        # index= НЕ используется — это исключает конфликт с ручным выбором.
+        st.radio(
             "Навигация",
             page_keys,
-            index=page_keys.index(_default_page),
             label_visibility="collapsed",
-            key="_sidebar_radio",
+            key="_nav_page",
         )
-        # Сохраняем выбор пользователя
-        st.session_state["_sidebar_page"] = page
+        # Текущая страница — прямо из session_state (то, что выбрал radio или программный переход)
+        page = st.session_state["_nav_page"]
 
         st.divider()
         if role in ("admin", "viewer"):
