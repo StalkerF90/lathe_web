@@ -801,13 +801,35 @@ def page_machines(role):
 
         st.markdown("---")
 
-        # Определяем тип выбранного станка ДО формы — нужно для условного отображения этапа
-        # (selectbox внутри формы ещё не выбран, поэтому берём первый станок как default)
+        # ── Тип выбранного станка (preview ДО формы, по session_state) ──
+        # Нужен для условного рендера поля «Этап» вне формы (чекбокс ОПТА).
         first_machine_id = machines_full[0]["id"] if machines_full else None
-        # Используем session_state key если уже был выбор, иначе — первый
-        _sel_m_id_key  = st.session_state.get("_prod_machine_sel", first_machine_id)
-        _sel_m_preview = next((m for m in machines_full if m["id"] == _sel_m_id_key), None)
-        _preview_is_wc = _sel_m_preview["is_work_center"] if _sel_m_preview else False
+        _prev_mid  = st.session_state.get("_prod_machine_sel", first_machine_id)
+        _prev_m    = next((m for m in machines_full if m["id"] == _prev_mid), None)
+        _prev_is_wc = bool(_prev_m["is_work_center"]) if _prev_m else False
+        _prev_name  = _prev_m["name"] if _prev_m else ""
+
+        # ── Чекбокс «Изменить этап вручную» (только для ОПТА, вне формы) ──
+        # Держим его вне st.form — иначе не можем реагировать на него динамически.
+        opta_manual_override = False
+        if _prev_is_wc:
+            opta_manual_override = st.checkbox(
+                "✏️ Изменить этап вручную (ОПТА)",
+                key="opta_stage_override",
+                help="По умолчанию этап берётся из названия рабочего центра. "
+                     "Включите, чтобы задать другой этап вручную.",
+            )
+            if not opta_manual_override:
+                st.info(
+                    f"🏭 Рабочий центр **«{_prev_name}»** — "
+                    f"этап будет установлен автоматически: **«{_prev_name}»**"
+                )
+            else:
+                st.warning(
+                    "⚠️ Ручное изменение этапа ОПТА. "
+                    "После сохранения потребуется подтверждение, "
+                    "если введённое значение отличается от названия рабочего центра."
+                )
 
         with st.form("production_form", clear_on_submit=True):
             r1c1, r1c2, r1c3, r1c4 = st.columns([3, 3, 2, 2])
@@ -829,28 +851,31 @@ def page_machines(role):
                 min_value=0.0, step=1.0, value=0.0,
                 help="Реально потраченное время в минутах. 0 — не заполнено.")
 
-            # ── Логика поля «Этап» ─────────────────────────────────────
-            # Для ОПТА: этап = название рабочего центра (авто, поле скрыто)
-            # Для станка: этап обязателен, ввод вручную
-            sel_m_obj = next((m for m in machines_full if m["id"] == sel_machine), None)
-            is_wc_selected = sel_m_obj["is_work_center"] if sel_m_obj else False
+            # ── Поле «Этап» внутри формы ──────────────────────────────
+            # Получаем актуальный объект выбранного станка (уже внутри формы)
+            sel_m_obj   = next((m for m in machines_full if m["id"] == sel_machine), None)
+            is_wc_sel   = bool(sel_m_obj["is_work_center"]) if sel_m_obj else False
+            auto_stage_name = sel_m_obj["name"].strip() if sel_m_obj else ""
 
-            if is_wc_selected:
-                # Этап = название РЦ, поле не показываем, но показываем информер
-                auto_stage = sel_m_obj["name"] if sel_m_obj else ""
-                st.info(f"🏭 Рабочий центр — этап установлен автоматически: **«{auto_stage}»**")
-                stage_name = auto_stage
-                # Пустой placeholder для выравнивания
-                stage_name_manual = ""
+            if is_wc_sel:
+                if opta_manual_override:
+                    # Ручной ввод для ОПТА — с auto_stage как значением по умолчанию
+                    stage_col, _ = st.columns([3, 4])
+                    stage_name_input = stage_col.text_input(
+                        "Этап / операция (ОПТА — ручной)",
+                        value=auto_stage_name,
+                        help="Значение по умолчанию = название рабочего центра. "
+                             "Измените только если нужен нестандартный этап.")
+                else:
+                    # Автоподстановка: скрытое поле, значение из названия РЦ
+                    stage_name_input = ""   # не используется — берём auto_stage_name
             else:
-                # Станок — этап вручную (обязателен)
+                # Обычный станок — ручной обязательный ввод
                 stage_col, _ = st.columns([3, 4])
-                stage_name_manual = stage_col.text_input(
+                stage_name_input = stage_col.text_input(
                     "Этап / операция *",
                     placeholder="1 установ, 2 установ…",
-                    help="⚠️ Обязательно для обычных станков. Укажите номер установа или операцию.")
-                stage_name = stage_name_manual
-                auto_stage = ""
+                    help="⚠️ Обязательно. Укажите номер установа или операцию.")
 
             fc1, fc2 = st.columns([5, 2])
             notes_prod = fc1.text_input("Примечание")
@@ -884,14 +909,62 @@ def page_machines(role):
                 else:
                     used_batch_name = bm_record["batch_name"] if bm_record else ""
 
-                # ── Валидация этапа для станков ────────────────────────
-                sel_m_obj2 = next((m for m in machines_full if m["id"] == sel_machine), None)
-                is_wc2 = sel_m_obj2["is_work_center"] if sel_m_obj2 else False
-                if not is_wc2 and not stage_name_manual.strip():
-                    st.error("Укажите этап / операцию для обычного станка.")
-                    st.stop()
-                final_stage = sel_m_obj2["name"] if is_wc2 else stage_name_manual.strip()
+                # ── Определение и нормализация этапа ─────────────────
+                # Стратегия нормализации:
+                #   ОПТА (авто): берём machine.name.strip() — точное название РЦ из БД.
+                #   ОПТА (ручной): берём ввод пользователя, нормализуем пробелы
+                #                  (strip + сжатие внутренних пробелов).
+                #   Станок: берём ввод пользователя, нормализуем пробелы.
+                # Регистр НЕ приводим принудительно — сохраняем как есть из БД (для ОПТА)
+                # или как ввёл пользователь (для станка).
 
+                sel_m_obj2   = next((m for m in machines_full if m["id"] == sel_machine), None)
+                is_wc2       = bool(sel_m_obj2["is_work_center"]) if sel_m_obj2 else False
+                auto_s2      = sel_m_obj2["name"].strip() if sel_m_obj2 else ""
+
+                def normalize_stage(s: str) -> str:
+                    """Нормализует строку этапа: strip + сжатие внутренних пробелов."""
+                    import re as _re
+                    return _re.sub(r"\s+", " ", s.strip())
+
+                if is_wc2:
+                    if opta_manual_override and stage_name_input.strip():
+                        candidate = normalize_stage(stage_name_input)
+                        # Если ввод отличается от авто — требуем подтверждения
+                        if candidate != auto_s2:
+                            # Сохраняем pending-данные в session_state
+                            st.session_state["_pending_stage_confirm"] = True
+                            st.session_state["_pending_stage_auto"]    = auto_s2
+                            st.session_state["_pending_stage_manual"]  = candidate
+                            # Остальные поля тоже сохраняем чтобы не потерять при rerun
+                            st.session_state["_pf"] = dict(
+                                date=prod_date.isoformat(),
+                                machine_id=sel_machine,
+                                operator_id=sel_operator if sel_operator else None,
+                                batch=used_batch_name, batch_number=batch_no_stripped,
+                                setup_time=setup_time, produced_qty=produced_qty,
+                                plan_h=round(produced_qty / next(
+                                    m["productivity"] for m in machines
+                                    if m["id"] == sel_machine), 3) if produced_qty > 0 else 0.0,
+                                fact_min=float(actual_dur_min) if actual_dur_min > 0 else None,
+                                is_final=1 if is_final else 0,
+                                notes=notes_prod,
+                                is_wc=True,
+                            )
+                            st.rerun()
+                        else:
+                            final_stage = auto_s2   # ввод совпал с авто — принимаем без вопросов
+                    else:
+                        # Авторежим: берём точное название РЦ из БД
+                        final_stage = auto_s2
+                else:
+                    # Станок — ручной ввод, обязателен
+                    if not stage_name_input.strip():
+                        st.error("Укажите этап / операцию для обычного станка.")
+                        st.stop()
+                    final_stage = normalize_stage(stage_name_input)
+
+                # ── Сохранение записи ─────────────────────────────────
                 sel_m_prod = next(m for m in machines if m["id"] == sel_machine)
                 plan_h = round(produced_qty / sel_m_prod["productivity"], 3) \
                          if produced_qty > 0 else 0.0
@@ -925,7 +998,74 @@ def page_machines(role):
                     if fact_min:
                         msg += f" | факт {fact_min:.0f} мин"
                 st.success(msg)
+                # Сбрасываем флаги override и pending
+                st.session_state.pop("opta_stage_override", None)
+                st.session_state.pop("_pending_stage_confirm", None)
+                st.session_state.pop("_pf", None)
                 st.rerun()
+
+        # ── Диалог подтверждения ручного этапа ОПТА ──────────────────
+        # Показывается ПОСЛЕ формы, если pending-флаг установлен.
+        if st.session_state.get("_pending_stage_confirm"):
+            pf       = st.session_state.get("_pf", {})
+            auto_sv  = st.session_state.get("_pending_stage_auto", "")
+            manual_sv= st.session_state.get("_pending_stage_manual", "")
+
+            st.warning(
+                f"⚠️ **Подтверждение ручного изменения этапа ОПТА**\n\n"
+                f"Автоматический этап: **«{auto_sv}»**  \n"
+                f"Ваш вариант:         **«{manual_sv}»**  \n\n"
+                "Сохранить запись с **ручным** этапом?"
+            )
+            confirm_col, cancel_col = st.columns(2)
+
+            with confirm_col:
+                if st.button("✔ Да, сохранить с ручным этапом",
+                             type="primary", use_container_width=True,
+                             key="confirm_manual_stage"):
+                    # Сохраняем с ручным этапом
+                    exec_sql("""
+                        INSERT INTO production
+                        (date, machine_id, operator_id, batch, batch_number,
+                         setup_time, produced_qty, actual_time,
+                         actual_duration_minutes, record_type, is_final_release,
+                         stage_name, notes)
+                        VALUES (?,?,?,?,?,?,?,?,?,'production',?,?,?)
+                    """, (pf["date"], pf["machine_id"], pf["operator_id"],
+                          pf["batch"], pf["batch_number"],
+                          pf["setup_time"], pf["produced_qty"], pf["plan_h"],
+                          pf["fact_min"], pf["is_final"], manual_sv, pf["notes"]))
+                    st.success(f"✅ Выпуск сохранён с этапом «{manual_sv}»")
+                    st.session_state.pop("_pending_stage_confirm", None)
+                    st.session_state.pop("_pf", None)
+                    st.session_state.pop("_pending_stage_auto", None)
+                    st.session_state.pop("_pending_stage_manual", None)
+                    st.session_state.pop("opta_stage_override", None)
+                    st.rerun()
+
+            with cancel_col:
+                if st.button("✘ Нет, сохранить с авто-этапом «{}»".format(auto_sv),
+                             use_container_width=True,
+                             key="cancel_manual_stage"):
+                    # Сохраняем с авто-этапом
+                    exec_sql("""
+                        INSERT INTO production
+                        (date, machine_id, operator_id, batch, batch_number,
+                         setup_time, produced_qty, actual_time,
+                         actual_duration_minutes, record_type, is_final_release,
+                         stage_name, notes)
+                        VALUES (?,?,?,?,?,?,?,?,?,'production',?,?,?)
+                    """, (pf["date"], pf["machine_id"], pf["operator_id"],
+                          pf["batch"], pf["batch_number"],
+                          pf["setup_time"], pf["produced_qty"], pf["plan_h"],
+                          pf["fact_min"], pf["is_final"], auto_sv, pf["notes"]))
+                    st.success(f"✅ Выпуск сохранён с авто-этапом «{auto_sv}»")
+                    st.session_state.pop("_pending_stage_confirm", None)
+                    st.session_state.pop("_pf", None)
+                    st.session_state.pop("_pending_stage_auto", None)
+                    st.session_state.pop("_pending_stage_manual", None)
+                    st.session_state.pop("opta_stage_override", None)
+                    st.rerun()
 
     else:  # repair
         with st.form("repair_form", clear_on_submit=True):
