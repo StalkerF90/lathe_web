@@ -1,6 +1,7 @@
 """
 =============================================================================
-  СИСТЕМА КОНТРОЛЯ ТОКАРНЫХ СТАНКОВ — Streamlit Web App
+  НТА-Контроль — система производственного учёта
+  Streamlit Web App
   Роли: admin (полный доступ), user (ввод выпуска + статусы), viewer (только просмотр)
 =============================================================================
 """
@@ -29,8 +30,8 @@ DB_PATH     = os.environ.get("DB_PATH", "app.db")
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.yml")
 
 st.set_page_config(
-    page_title="Контроль станков",
-    page_icon="⚙️",
+    page_title="НТА-Контроль",
+    page_icon="🏭",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -392,6 +393,52 @@ def init_db():
             changed_by  TEXT    DEFAULT '',
             changed_at  TEXT    NOT NULL,
             FOREIGN KEY (machine_id) REFERENCES machines(id)
+        )
+    """)
+
+    # ── Динамические журналы ──────────────────────────────────────────
+    # journals          — метаданные журнала
+    # journal_columns   — описание колонок (тип, порядок, настройки)
+    # journal_entries   — строки записей
+    # journal_entry_values — значения по колонкам (EAV-схема)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS journals (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            created_by  TEXT DEFAULT '',
+            created_at  TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS journal_columns (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            journal_id   INTEGER NOT NULL,
+            col_order    INTEGER NOT NULL DEFAULT 0,
+            col_name     TEXT NOT NULL,
+            col_type     TEXT NOT NULL,
+            col_options  TEXT DEFAULT '',
+            col_unit     TEXT DEFAULT '',
+            FOREIGN KEY (journal_id) REFERENCES journals(id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS journal_entries (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            journal_id  INTEGER NOT NULL,
+            created_by  TEXT DEFAULT '',
+            created_at  TEXT NOT NULL,
+            FOREIGN KEY (journal_id) REFERENCES journals(id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS journal_entry_values (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id   INTEGER NOT NULL,
+            column_id  INTEGER NOT NULL,
+            value_text TEXT DEFAULT '',
+            FOREIGN KEY (entry_id)  REFERENCES journal_entries(id),
+            FOREIGN KEY (column_id) REFERENCES journal_columns(id)
         )
     """)
 
@@ -2414,12 +2461,38 @@ def page_batches(role):
     st.title("📋 Партии")
 
     batches = all_batches()
+    bn_options = [b["batch_number"] for b in batches]
 
-    # ── А) Список партий ──────────────────────────────────────────────
+    # ── А) Создание новой партии — СВЕРХУ для удобного доступа ──────────
+    if role == "admin":
+        with st.expander("➕ Создать новую партию", expanded=not batches):
+            with st.form("create_batch_form", clear_on_submit=True):
+                cb1, cb2, cb3 = st.columns([2, 3, 2])
+                new_bn    = cb1.text_input("№ партии *")
+                new_name  = cb2.text_input("Название партии *")
+                new_total = cb3.number_input("Всего в партии (шт) *", min_value=1, step=1)
+                new_notes = st.text_input("Примечание")
+                if st.form_submit_button("Создать партию", type="primary"):
+                    require_not_viewer()
+                    if not new_bn.strip():
+                        st.error("Укажите номер партии.")
+                    elif not new_name.strip():
+                        st.error("Укажите название партии.")
+                    else:
+                        ok = create_batch(new_bn.strip(), new_name, int(new_total), new_notes)
+                        if ok:
+                            st.success(f"✅ Партия «{new_bn.strip()}» создана.")
+                            st.rerun()
+                        else:
+                            st.error(f"Партия с номером «{new_bn.strip()}» уже существует.")
+
+        st.divider()
+
+    # ── Б) Список партий ──────────────────────────────────────────────
     st.markdown("### Список партий")
 
     if not batches:
-        st.info("Партий пока нет. Создайте первую партию с помощью формы ниже.")
+        st.info("Партий пока нет. Создайте первую партию с помощью формы выше.")
     else:
         # Заголовок таблицы
         hc = st.columns([2, 3, 2, 2, 2, 2, 1])
@@ -2441,7 +2514,6 @@ def page_batches(role):
             rc[3].markdown(f"{fl:,} шт ({pct_l})")
             rc[4].markdown(f"{fo:,} шт ({pct_o})")
             rc[5].markdown((b["created_at"] or "")[:10])
-            # Кнопка перехода к прогрессу
             if rc[6].button("📦", key=f"goto_bp_{b['batch_number']}",
                             help=f"Открыть прогресс партии «{b['batch_number']}»"):
                 st.session_state["batch_progress_select"] = b["batch_number"]
@@ -2450,38 +2522,14 @@ def page_batches(role):
 
         st.caption("★ Финал ОПТА = общий прогресс завершения партии  |  📦 = открыть прогресс партии")
 
-    st.divider()
-
     if role not in ("admin",):
         st.info("👁 Создание, редактирование и удаление партий доступно только администратору.")
         return
 
-    # ── Б) Создание новой партии ──────────────────────────────────────
-    with st.expander("➕ Создать новую партию", expanded=not batches):
-        with st.form("create_batch_form", clear_on_submit=True):
-            cb1, cb2, cb3 = st.columns([2, 3, 2])
-            new_bn    = cb1.text_input("№ партии *")
-            new_name  = cb2.text_input("Название партии *")
-            new_total = cb3.number_input("Всего в партии (шт) *", min_value=1, step=1)
-            new_notes = st.text_input("Примечание")
-            if st.form_submit_button("Создать партию", type="primary"):
-                require_not_viewer()
-                if not new_bn.strip():
-                    st.error("Укажите номер партии.")
-                elif not new_name.strip():
-                    st.error("Укажите название партии.")
-                else:
-                    ok = create_batch(new_bn.strip(), new_name, int(new_total), new_notes)
-                    if ok:
-                        st.success(f"✅ Партия «{new_bn.strip()}» создана.")
-                        st.rerun()
-                    else:
-                        st.error(f"Партия с номером «{new_bn.strip()}» уже существует.")
-
-    st.divider()
-
     if not batches:
         return
+
+    st.divider()
 
     # ── В) Редактирование партии ──────────────────────────────────────
     with st.expander("✏️ Редактировать партию"):
@@ -2489,7 +2537,6 @@ def page_batches(role):
             "Номер партии изменить нельзя (если по ней есть записи выпуска). "
             "Можно изменить: название, количество, примечание."
         )
-        bn_options = [b["batch_number"] for b in batches]
         edit_bn = st.selectbox("Выберите партию для редактирования",
                                options=bn_options, key="edit_batch_sel")
         edit_b  = next((b for b in batches if b["batch_number"] == edit_bn), None)
@@ -2728,7 +2775,117 @@ def page_batch_progress():
 
     st.divider()
 
-    # ── Г) Графики по этапам ──────────────────────────────────────────
+    # ── Д) Фактическое время по центрам ───────────────────────────────
+    st.markdown("### ⏱ Фактическое время по станкам и рабочим центрам")
+    st.caption(
+        "Учитывается: фактическое время выпуска (мин) + наладка (ч → мин). "
+        "Записи с некорректными данными пропускаются без ошибки."
+    )
+
+    # Запрашиваем все записи с временными полями
+    time_rows = q("""
+        SELECT
+            COALESCE(m.is_work_center, 0) AS is_work_center,
+            m.name                        AS center_name,
+            p.actual_duration_minutes     AS fact_min,
+            p.setup_time                  AS setup_h
+        FROM production p
+        LEFT JOIN machines m ON m.id = p.machine_id
+        WHERE p.batch_number = ?
+          AND COALESCE(p.record_type, 'production') = 'production'
+    """, (sel_bn,))
+
+    time_lathe, time_opta = {}, {}
+    skipped = 0
+    for tr in time_rows:
+        try:
+            mins = 0.0
+            if tr["fact_min"] is not None:
+                v = float(tr["fact_min"])
+                if v > 0:
+                    mins += v
+            if tr["setup_h"] is not None:
+                v = float(tr["setup_h"])
+                if v > 0:
+                    mins += v * 60.0
+            # Пропускаем нулевые строки (наладка=0, время=0)
+            if mins <= 0:
+                continue
+            cname = (tr["center_name"] or "—").strip()
+            if tr["is_work_center"] == 1:
+                time_opta[cname]  = time_opta.get(cname, 0.0)  + mins
+            else:
+                time_lathe[cname] = time_lathe.get(cname, 0.0) + mins
+        except Exception:
+            skipped += 1
+
+    if skipped:
+        st.caption(f"⚠️ Пропущено записей с некорректными данными времени: {skipped}")
+
+    has_time_data = bool(time_lathe or time_opta)
+
+    if not has_time_data:
+        st.info("Данные по фактическому времени для этой партии отсутствуют.")
+    else:
+        tc1, tc2 = st.columns(2)
+
+        with tc1:
+            st.markdown("**⚙️ Блок ЦМО / Станки**")
+            if time_lathe:
+                df_tl = pd.DataFrame([
+                    {"Станок": k, "Итого (мин)": round(v), "Итого (ч)": round(v/60, 2)}
+                    for k, v in sorted(time_lathe.items())
+                ])
+                st.dataframe(df_tl, use_container_width=True, hide_index=True)
+                st.caption(f"Итого по блоку: **{round(sum(time_lathe.values())):,} мин "
+                           f"({round(sum(time_lathe.values())/60, 1)} ч)**")
+            else:
+                st.info("Нет данных по станкам.")
+
+        with tc2:
+            st.markdown("**🏭 Блок ОПТА / Рабочие центры**")
+            if time_opta:
+                df_to = pd.DataFrame([
+                    {"Рабочий центр": k, "Итого (мин)": round(v), "Итого (ч)": round(v/60, 2)}
+                    for k, v in sorted(time_opta.items())
+                ])
+                st.dataframe(df_to, use_container_width=True, hide_index=True)
+                st.caption(f"Итого по блоку: **{round(sum(time_opta.values())):,} мин "
+                           f"({round(sum(time_opta.values())/60, 1)} ч)**")
+            else:
+                st.info("Нет данных по ОПТА.")
+
+        # ── CSV выгрузка таблицы времени ──────────────────────────────
+        time_csv_rows = []
+        for cname, mins in sorted(time_lathe.items()):
+            time_csv_rows.append({
+                "batch_number":  sel_bn,
+                "center_group":  "Станки",
+                "center_name":   cname,
+                "total_minutes": round(mins),
+                "total_hours":   round(mins / 60, 2),
+            })
+        for cname, mins in sorted(time_opta.items()):
+            time_csv_rows.append({
+                "batch_number":  sel_bn,
+                "center_group":  "ОПТА",
+                "center_name":   cname,
+                "total_minutes": round(mins),
+                "total_hours":   round(mins / 60, 2),
+            })
+        if time_csv_rows:
+            csv_bytes = pd.DataFrame(time_csv_rows).to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="💾 Скачать таблицу времени (CSV)",
+                data=csv_bytes,
+                file_name=f"time_{sel_bn}.csv",
+                mime="text/csv",
+                key="dl_time_csv",
+            )
+
+    st.divider()
+
+    # ── Е) Графики по этапам ──────────────────────────────────────────
     st.markdown("### 📈 Графики по этапам")
 
     agg_map: dict = {}
@@ -2777,6 +2934,387 @@ def page_batch_progress():
                            font_color="#ffffff", xaxis=dict(tickangle=-30),
                            yaxis=dict(ticksuffix="%"))
         st.plotly_chart(fig2, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ЖУРНАЛЫ
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Поддерживаемые типы колонок журнала и их метки для UI
+JOURNAL_COL_TYPES = {
+    "text":      "Текст (строка)",
+    "textarea":  "Большое текстовое поле",
+    "number":    "Число",
+    "date":      "Дата",
+    "datetime":  "Дата и время",
+    "operator":  "Оператор (из справочника)",
+    "machine":   "Станок / РЦ (из справочника)",
+    "select":    "Список значений (select)",
+    "bool":      "Флаг / чекбокс",
+}
+
+
+def _j_get_journals():
+    return q("SELECT * FROM journals ORDER BY created_at DESC")
+
+def _j_get_columns(journal_id: int):
+    return q("SELECT * FROM journal_columns WHERE journal_id=? ORDER BY col_order",
+             (journal_id,))
+
+def _j_get_entries(journal_id: int):
+    return q("""
+        SELECT je.id, je.created_by, je.created_at
+        FROM journal_entries je
+        WHERE je.journal_id=?
+        ORDER BY je.created_at DESC
+    """, (journal_id,))
+
+def _j_get_entry_values(entry_id: int):
+    """Возвращает dict {column_id: value_text}."""
+    rows = q("SELECT column_id, value_text FROM journal_entry_values WHERE entry_id=?",
+             (entry_id,))
+    return {r["column_id"]: r["value_text"] for r in rows}
+
+def _j_create_journal(name: str, desc: str, username: str) -> int:
+    exec_sql("""
+        INSERT INTO journals (name, description, created_by, created_at)
+        VALUES (?,?,?,?)
+    """, (name.strip(), desc.strip(), username,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    row = q("SELECT id FROM journals WHERE name=? ORDER BY id DESC LIMIT 1",
+            (name.strip(),), fetch="one")
+    return row["id"] if row else 0
+
+def _j_save_columns(journal_id: int, cols: list):
+    """Полностью заменяет колонки журнала (без затрагивания данных)."""
+    exec_sql("DELETE FROM journal_columns WHERE journal_id=?", (journal_id,))
+    for i, c in enumerate(cols):
+        exec_sql("""
+            INSERT INTO journal_columns
+            (journal_id, col_order, col_name, col_type, col_options, col_unit)
+            VALUES (?,?,?,?,?,?)
+        """, (journal_id, i, c["col_name"], c["col_type"],
+              c.get("col_options", ""), c.get("col_unit", "")))
+
+def _j_delete_journal(journal_id: int):
+    """Каскадное удаление журнала и всех его данных."""
+    entry_ids = [r["id"] for r in
+                 q("SELECT id FROM journal_entries WHERE journal_id=?", (journal_id,))]
+    for eid in entry_ids:
+        exec_sql("DELETE FROM journal_entry_values WHERE entry_id=?", (eid,))
+    exec_sql("DELETE FROM journal_entries WHERE journal_id=?", (journal_id,))
+    exec_sql("DELETE FROM journal_columns WHERE journal_id=?", (journal_id,))
+    exec_sql("DELETE FROM journals WHERE id=?", (journal_id,))
+
+def _j_save_entry(journal_id: int, col_values: dict, username: str):
+    """Сохраняет запись: INSERT journal_entries + journal_entry_values."""
+    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    exec_sql("""
+        INSERT INTO journal_entries (journal_id, created_by, created_at)
+        VALUES (?,?,?)
+    """, (journal_id, username, now_s))
+    entry_row = q("""
+        SELECT id FROM journal_entries
+        WHERE journal_id=? AND created_by=? AND created_at=?
+        ORDER BY id DESC LIMIT 1
+    """, (journal_id, username, now_s), fetch="one")
+    entry_id = entry_row["id"]
+    for col_id, val in col_values.items():
+        exec_sql("""
+            INSERT INTO journal_entry_values (entry_id, column_id, value_text)
+            VALUES (?,?,?)
+        """, (entry_id, col_id, str(val) if val is not None else ""))
+
+def _j_delete_entry(entry_id: int):
+    exec_sql("DELETE FROM journal_entry_values WHERE entry_id=?", (entry_id,))
+    exec_sql("DELETE FROM journal_entries WHERE id=?", (entry_id,))
+
+
+def _j_render_input(col, key_prefix: str, operators_list, machines_list):
+    """
+    Рендерит один виджет ввода по типу колонки.
+    Возвращает строковое значение для сохранения.
+    """
+    ctype   = col["col_type"]
+    cname   = col["col_name"]
+    cunit   = col["col_unit"] or ""
+    copts   = col["col_options"] or ""
+    widget_key = f"{key_prefix}_{col['id']}"
+    label   = f"{cname}" + (f" ({cunit})" if cunit else "")
+
+    if ctype == "text":
+        return st.text_input(label, key=widget_key)
+    elif ctype == "textarea":
+        return st.text_area(label, key=widget_key, height=80)
+    elif ctype == "number":
+        val = st.number_input(label, step=0.01, key=widget_key)
+        return str(val)
+    elif ctype == "date":
+        d = st.date_input(label, value=date.today(), key=widget_key)
+        return d.isoformat() if d else ""
+    elif ctype == "datetime":
+        d = st.date_input(label + " (дата)", value=date.today(), key=widget_key + "_d")
+        t = st.time_input(label + " (время)", key=widget_key + "_t")
+        return f"{d.isoformat()} {t}" if d else ""
+    elif ctype == "operator":
+        opts_list = [f"{o['id']}:{o['name']}" for o in operators_list]
+        labels    = ["—"] + [o["name"] for o in operators_list]
+        ids       = [0]   + [o["id"]   for o in operators_list]
+        chosen = st.selectbox(label, options=ids,
+                              format_func=lambda x: next(
+                                  (o["name"] for o in operators_list if o["id"] == x), "—"
+                              ) if x else "—",
+                              key=widget_key)
+        return str(chosen) if chosen else ""
+    elif ctype == "machine":
+        all_m = machines_list
+        ids   = [0] + [m["id"] for m in all_m]
+        chosen = st.selectbox(label, options=ids,
+                              format_func=lambda x: next(
+                                  (m["name"] for m in all_m if m["id"] == x), "—"
+                              ) if x else "—",
+                              key=widget_key)
+        return str(chosen) if chosen else ""
+    elif ctype == "select":
+        options_list = [o.strip() for o in copts.split(",") if o.strip()]
+        if not options_list:
+            return st.text_input(label + " (нет вариантов)", key=widget_key)
+        chosen = st.selectbox(label, options=[""] + options_list, key=widget_key)
+        return chosen
+    elif ctype == "bool":
+        checked = st.checkbox(label, key=widget_key)
+        return "1" if checked else "0"
+    else:
+        return st.text_input(label, key=widget_key)
+
+
+def _j_format_value(col, raw_val: str, operators_list, machines_list) -> str:
+    """Форматирует сохранённое строковое значение для отображения в таблице."""
+    if raw_val is None:
+        return ""
+    ctype = col["col_type"]
+    try:
+        if ctype == "bool":
+            return "✅" if raw_val == "1" else "☐"
+        elif ctype == "operator":
+            oid = int(raw_val) if raw_val else 0
+            op  = next((o for o in operators_list if o["id"] == oid), None)
+            return op["name"] if op else raw_val
+        elif ctype == "machine":
+            mid = int(raw_val) if raw_val else 0
+            m   = next((m for m in machines_list if m["id"] == mid), None)
+            return m["name"] if m else raw_val
+        else:
+            return raw_val
+    except Exception:
+        return raw_val
+
+
+def page_journals(role, username):
+    """
+    Страница «📓 Журналы» — динамические журналы с настраиваемыми колонками.
+
+    Права:
+    - admin:  создание/редактирование/удаление журналов, просмотр и удаление записей
+    - user:   добавление записей в журналы, просмотр
+    - viewer: только просмотр
+    """
+    st.title("📓 Журналы")
+
+    journals = _j_get_journals()
+    operators_list = q("SELECT id, name FROM operators ORDER BY name")
+    machines_list  = q("SELECT id, name, is_work_center FROM machines ORDER BY name")
+
+    # ── А) Список журналов ────────────────────────────────────────────
+    jcol_left, jcol_right = st.columns([3, 2])
+
+    with jcol_left:
+        st.markdown("### Доступные журналы")
+        if not journals:
+            st.info("Журналов пока нет. Администратор может создать журнал.")
+        else:
+            for j in journals:
+                cols = _j_get_columns(j["id"])
+                entries = _j_get_entries(j["id"])
+                badge = f"**{j['name']}**  ({len(entries)} записей)"
+                if j["description"]:
+                    badge += f"  \n_{j['description']}_"
+                st.markdown(badge)
+
+    with jcol_right:
+        if role == "admin":
+            with st.expander("➕ Создать новый журнал"):
+                with st.form("create_journal_form", clear_on_submit=True):
+                    jname = st.text_input("Название журнала *")
+                    jdesc = st.text_area("Описание", height=60)
+                    if st.form_submit_button("Создать", type="primary"):
+                        if not jname.strip():
+                            st.error("Укажите название журнала.")
+                        else:
+                            _j_create_journal(jname, jdesc, username)
+                            st.success(f"✅ Журнал «{jname}» создан.")
+                            st.rerun()
+
+    if not journals:
+        return
+
+    st.divider()
+
+    # ── Б) Выбор журнала ──────────────────────────────────────────────
+    j_opts   = {j["name"]: j for j in journals}
+    sel_jname = st.selectbox("Открыть журнал", options=list(j_opts.keys()),
+                             key="journals_sel")
+    sel_j    = j_opts[sel_jname]
+    j_id     = sel_j["id"]
+    j_cols   = _j_get_columns(j_id)
+
+    tab_entries, tab_add, tab_cfg = st.tabs(
+        ["📋 Записи", "➕ Добавить запись", "⚙️ Структура журнала"]
+        if role in ("admin", "user") else
+        ["📋 Записи", "➕ Добавить запись (нет доступа)", "⚙️ Структура журнала"]
+    )
+
+    # ── В) Просмотр записей ───────────────────────────────────────────
+    with tab_entries:
+        entries = _j_get_entries(j_id)
+        if not entries:
+            st.info("Записей пока нет.")
+        else:
+            if not j_cols:
+                st.warning("Структура журнала не настроена.")
+            else:
+                # Собираем таблицу
+                table_rows = []
+                for e in entries:
+                    ev = _j_get_entry_values(e["id"])
+                    row = {"Дата записи": e["created_at"][:16], "Внёс": e["created_by"]}
+                    for col in j_cols:
+                        raw = ev.get(col["id"], "")
+                        row[col["col_name"]] = _j_format_value(
+                            col, raw, operators_list, machines_list)
+                    table_rows.append(row)
+                df_j = pd.DataFrame(table_rows)
+                st.dataframe(df_j, use_container_width=True, hide_index=True)
+
+                # CSV экспорт
+                csv_bytes = df_j.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "💾 Скачать журнал (CSV)", csv_bytes,
+                    file_name=f"journal_{sel_jname.replace(' ','_')}.csv",
+                    mime="text/csv", key="dl_journal_csv")
+
+                # Удаление записей (только admin)
+                if role == "admin":
+                    with st.expander("🗑 Удалить запись"):
+                        del_entry_id = st.selectbox(
+                            "Запись (ID — Дата)",
+                            options=[e["id"] for e in entries],
+                            format_func=lambda x: f"#{x} — " + next(
+                                e["created_at"][:16] for e in entries if e["id"] == x),
+                            key="del_journal_entry_sel")
+                        if st.button("🗑 Удалить", key="del_journal_entry_btn", type="primary"):
+                            _j_delete_entry(del_entry_id)
+                            st.success("Запись удалена.")
+                            st.rerun()
+
+    # ── Г) Добавление записи ─────────────────────────────────────────
+    with tab_add:
+        if role == "viewer":
+            st.info("👁 Добавление записей доступно только операторам и администраторам.")
+        elif not j_cols:
+            st.warning("Структура журнала не настроена. Попросите администратора добавить колонки.")
+        else:
+            st.markdown(f"#### Новая запись в журнал «{sel_jname}»")
+            entry_vals = {}
+            # Рендерим виджеты для каждой колонки
+            for col in j_cols:
+                val = _j_render_input(col,
+                                      key_prefix=f"jentry_{j_id}",
+                                      operators_list=operators_list,
+                                      machines_list=machines_list)
+                entry_vals[col["id"]] = val
+
+            if st.button("💾 Сохранить запись", type="primary", key="save_journal_entry"):
+                _j_save_entry(j_id, entry_vals, username)
+                # Очищаем ключи виджетов этого журнала
+                for col in j_cols:
+                    st.session_state.pop(f"jentry_{j_id}_{col['id']}", None)
+                    st.session_state.pop(f"jentry_{j_id}_{col['id']}_d", None)
+                    st.session_state.pop(f"jentry_{j_id}_{col['id']}_t", None)
+                st.success("✅ Запись сохранена.")
+                st.rerun()
+
+    # ── Д) Управление структурой (только admin) ──────────────────────
+    with tab_cfg:
+        if role != "admin":
+            st.info("👁 Настройка структуры журнала доступна только администраторам.")
+        else:
+            st.markdown(f"#### Структура журнала «{sel_jname}»")
+
+            # Текущие колонки
+            if j_cols:
+                cur_df = pd.DataFrame([{
+                    "Порядок": c["col_order"],
+                    "Название": c["col_name"],
+                    "Тип": JOURNAL_COL_TYPES.get(c["col_type"], c["col_type"]),
+                    "Варианты (для select)": c["col_options"],
+                    "Единица": c["col_unit"],
+                } for c in j_cols])
+                st.dataframe(cur_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("Колонки ещё не заданы.")
+
+            st.markdown("---")
+            st.markdown("**Добавить / переопределить колонки**")
+            st.caption(
+                "⚠️ При сохранении список колонок заменяется полностью. "
+                "Значения существующих записей не удаляются (привязаны к ID колонок)."
+            )
+
+            # Число колонок
+            n_cols = st.number_input(
+                "Количество колонок", min_value=1, max_value=20, step=1,
+                value=max(1, len(j_cols)), key=f"jcfg_ncols_{j_id}")
+
+            new_cols = []
+            for i in range(int(n_cols)):
+                existing = j_cols[i] if i < len(j_cols) else None
+                st.markdown(f"**Колонка {i+1}**")
+                cc1, cc2, cc3, cc4 = st.columns([3, 2, 3, 2])
+                cname = cc1.text_input("Название",
+                    value=existing["col_name"] if existing else "",
+                    key=f"jcfg_name_{j_id}_{i}")
+                ctype = cc2.selectbox("Тип",
+                    options=list(JOURNAL_COL_TYPES.keys()),
+                    format_func=lambda x: JOURNAL_COL_TYPES[x],
+                    index=list(JOURNAL_COL_TYPES.keys()).index(existing["col_type"])
+                          if existing and existing["col_type"] in JOURNAL_COL_TYPES else 0,
+                    key=f"jcfg_type_{j_id}_{i}")
+                copts = cc3.text_input("Варианты (через запятую, для select)",
+                    value=existing["col_options"] if existing else "",
+                    key=f"jcfg_opts_{j_id}_{i}")
+                cunit = cc4.text_input("Единица",
+                    value=existing["col_unit"] if existing else "",
+                    key=f"jcfg_unit_{j_id}_{i}")
+                new_cols.append({"col_name": cname, "col_type": ctype,
+                                  "col_options": copts, "col_unit": cunit})
+
+            if st.button("💾 Сохранить структуру", type="primary", key=f"jcfg_save_{j_id}"):
+                if any(not c["col_name"].strip() for c in new_cols):
+                    st.error("Все колонки должны иметь название.")
+                else:
+                    _j_save_columns(j_id, new_cols)
+                    st.success("✅ Структура журнала сохранена.")
+                    st.rerun()
+
+            st.divider()
+            with st.expander("🗑 Удалить этот журнал"):
+                st.warning(f"Удалить журнал **«{sel_jname}»** и все его записи? Действие необратимо.")
+                if st.button("🗑 Подтвердить удаление журнала", type="primary",
+                             key=f"del_journal_{j_id}"):
+                    _j_delete_journal(j_id)
+                    st.success(f"✅ Журнал «{sel_jname}» удалён.")
+                    st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2830,7 +3368,7 @@ def main():
         role_label = {"admin": "Администратор", "user": "Оператор", "viewer": "Наблюдатель"}.get(role, role)
         st.markdown(f"""
 <div style="background:#2a2d40; border-radius:10px; padding:14px; margin-bottom:16px;">
-  <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">⚙️ НТА-Контроль</div>
+  <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">🏭 НТА-Контроль</div>
   <div style="color:#8888aa; font-size:0.85rem; margin-top:4px;">
     👤 {st.session_state.get('name', username)}<br>
     🔑 {role_label}
@@ -2843,6 +3381,7 @@ def main():
             "📋 История":           "history",
             "📋 Партии":            "batches",
             "📦 Прогресс партии":   "batch",
+            "📓 Журналы":           "journals",
         }
         pages_admin = {
             "👥 Персонал / Станки": "crud",
@@ -2922,6 +3461,8 @@ def main():
         page_batches(role)
     elif page_key == "batch":
         page_batch_progress()
+    elif page_key == "journals":
+        page_journals(role, username)
     elif page_key == "crud":
         page_admin_crud()
     elif page_key == "charts":
