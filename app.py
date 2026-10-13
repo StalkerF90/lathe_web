@@ -394,6 +394,9 @@ def init_db():
         c.execute("ALTER TABLE batches ADD COLUMN notes TEXT DEFAULT ''")
     if "batch_name" not in batches_cols:
         c.execute("ALTER TABLE batches ADD COLUMN batch_name TEXT DEFAULT ''")
+    # archive_state — ручная отметка архива: NULL = авто, 'archived' / 'active' = вручную
+    if "archive_state" not in batches_cols:
+        c.execute("ALTER TABLE batches ADD COLUMN archive_state TEXT DEFAULT NULL")
     # ── Перенос партий из production в batches (для записей без явной партии в batches) ─
     orphan_batches = c.execute("""
         SELECT DISTINCT p.batch_number, p.batch
@@ -675,6 +678,7 @@ def all_batches():
     """Возвращает все партии с краткой статистикой выпуска."""
     return q("""
         SELECT b.id, b.batch_number, b.batch_name, b.total_qty, b.notes, b.created_at,
+               b.archive_state,
                COALESCE(SUM(CASE WHEN p.is_final_release=1 AND COALESCE(m.is_work_center,0)=0
                                  THEN p.produced_qty ELSE 0 END), 0) AS final_lathe,
                COALESCE(SUM(CASE WHEN p.is_final_release=1 AND COALESCE(m.is_work_center,0)=1
@@ -684,9 +688,42 @@ def all_batches():
         LEFT JOIN production p ON p.batch_number = b.batch_number
                                AND COALESCE(p.record_type,'production') = 'production'
         LEFT JOIN machines m ON m.id = p.machine_id
-        GROUP BY b.id, b.batch_number, b.batch_name, b.total_qty, b.notes, b.created_at
+        GROUP BY b.id, b.batch_number, b.batch_name, b.total_qty, b.notes, b.created_at,
+                 b.archive_state
         ORDER BY b.created_at DESC
     """)
+
+# ── Архив партий ───────────────────────────────────────────────────────────
+# Автоправило: партия закрыта, когда финальный выпуск ОПТА достиг плана.
+# batches.archive_state хранит только ручное отклонение от автоправила:
+#   NULL — авто, 'archived' — в архиве вручную (например, партия без ОПТА),
+#   'active' — в работе вручную, хотя по автоправилу закрыта.
+
+def batch_auto_closed(total_qty, final_opta) -> bool:
+    return (total_qty or 0) > 0 and (final_opta or 0) >= total_qty
+
+def batch_is_archived(archive_state, total_qty, final_opta) -> bool:
+    if archive_state == "archived":
+        return True
+    if archive_state == "active":
+        return False
+    return batch_auto_closed(total_qty, final_opta)
+
+def set_batch_archived(batch_number: str, archived: bool, auto_closed: bool):
+    """Архивирует / возвращает партию. Если желаемое совпадает с автоправилом,
+    ручная отметка снимается (NULL), чтобы партия снова следовала правилу."""
+    if archived:
+        state = None if auto_closed else "archived"
+    else:
+        state = "active" if auto_closed else None
+    with tx() as conn:
+        old = conn.execute("SELECT id, archive_state FROM batches WHERE batch_number=?",
+                           (batch_number,)).fetchone()
+        conn.execute("UPDATE batches SET archive_state=? WHERE batch_number=?",
+                     (state, batch_number))
+        if old:
+            audit(conn, "archive" if archived else "unarchive", "batches", old["id"],
+                  {"archive_state": old["archive_state"]}, {"archive_state": state})
 
 STATUS_LABELS = {
     "busy":     "🔴 Занят",
@@ -2662,10 +2699,10 @@ def page_batches(role):
     # ── Б) Список партий ──────────────────────────────────────────────
     st.markdown("### Список партий")
 
-    # Закрытая партия = финальный выпуск ОПТА достиг планового количества
-    # (то же правило, что у progress bar). Статус вычисляется, в БД не хранится.
+    # В архиве: финал ОПТА достиг плана (автоматически) или партия архивирована вручную
+    # на странице «Прогресс партии».
     def is_closed(b):
-        return b["total_qty"] > 0 and b["final_opta"] >= b["total_qty"]
+        return batch_is_archived(b["archive_state"], b["total_qty"], b["final_opta"])
 
     active   = [b for b in batches if not is_closed(b)]
     archived = [b for b in batches if is_closed(b)]
@@ -2674,7 +2711,7 @@ def page_batches(role):
         st.info("Партий пока нет. Создайте первую партию с помощью формы выше.")
     else:
         if not active:
-            st.info("Активных партий нет — все партии выполнены на 100% и находятся в архиве.")
+            st.info("Активных партий нет — все партии находятся в архиве.")
         else:
             # Заголовок таблицы
             hc = st.columns([2, 3, 2, 2, 2, 2, 1])
@@ -2702,12 +2739,13 @@ def page_batches(role):
                 st.session_state["nav_goto"] = "batch"
                 st.rerun()
 
-        st.caption("★ Финал ОПТА = общий прогресс завершения партии  |  📦 = открыть прогресс партии")
+        st.caption("★ Финал ОПТА = общий прогресс завершения партии  |  📦 = открыть прогресс партии"
+                   "  |  архивировать вручную — на странице прогресса партии")
 
-        # ── Архив: партии, выполненные на 100% — рисуются только по запросу ──
+        # ── Архив: закрытые партии — рисуются только по запросу ─────────
         if archived:
             st.divider()
-            if st.toggle(f"🗄 Показать архив — выполненные партии ({len(archived)})",
+            if st.toggle(f"🗄 Показать архив — закрытые партии ({len(archived)})",
                          key="show_batch_archive"):
                 df_arch = pd.DataFrame([{
                     "№ партии":      b["batch_number"],
@@ -2715,6 +2753,7 @@ def page_batches(role):
                     "Всего (шт)":    b["total_qty"],
                     "Финал станки":  b["final_lathe"],
                     "Финал ОПТА ★":  b["final_opta"],
+                    "В архиве":      "вручную" if b["archive_state"] == "archived" else "100% ОПТА",
                     "Создана":       (b["created_at"] or "")[:10],
                 } for b in archived])
                 st.dataframe(df_arch, use_container_width=True, hide_index=True)
@@ -2831,12 +2870,12 @@ def page_batch_progress():
         preselect = ""
 
     options    = [""] + batch_numbers
-    sel_index  = options.index(preselect) if preselect in options else 0
 
+    # Значение берётся из session_state по key; index= не передаём — иначе
+    # Streamlit выводит предупреждение о конфликте и меняет id виджета.
     sel_bn = st.selectbox(
         "Выберите номер партии",
         options=options,
-        index=sel_index,
         format_func=lambda x: "— выберите партию —" if x == "" else x,
         key="batch_progress_select",
     )
@@ -2924,6 +2963,28 @@ def page_batch_progress():
                 "но финальный выпуск ОПТА ещё не зафиксирован.")
     else:
         st.warning("Общее количество партии не задано — прогресс недоступен.")
+
+    # ── Архив: состояние и ручное управление ──────────────────────────
+    _flash = st.session_state.pop("bp_archive_flash", None)
+    if _flash:
+        st.success(_flash)
+    if bm:
+        state       = bm.get("archive_state")
+        auto_closed = batch_auto_closed(total_qty, opta_final)
+        archived    = batch_is_archived(state, total_qty, opta_final)
+        if archived:
+            why = "вручную" if state == "archived" else "финал ОПТА достиг плана"
+            st.info(f"🗄 Партия в архиве ({why}) — в списке активных партий не показывается.")
+        elif state == "active" and auto_closed:
+            st.info("📤 Партия вручную оставлена в работе, хотя финал ОПТА достиг плана.")
+        if st.session_state.get("role") == "admin":
+            label = "📤 Вернуть в работу" if archived else "🗄 Отправить в архив"
+            if st.button(label, key=f"bp_archive_toggle_{sel_bn}"):
+                set_batch_archived(sel_bn, not archived, auto_closed)
+                st.session_state["bp_archive_flash"] = (
+                    f"✅ Партия «{sel_bn}» возвращена в работу." if archived
+                    else f"✅ Партия «{sel_bn}» отправлена в архив.")
+                st.rerun()
 
     if not rows:
         st.info("По данной партии записей выпуска пока нет.")
