@@ -821,6 +821,11 @@ def page_machines(role):
 
     st.markdown("### ➕ Внести запись")
 
+    # Сообщение об успешной записи переживает st.rerun() после сохранения
+    _flash = st.session_state.pop("pf_flash", None)
+    if _flash:
+        st.success(_flash)
+
     # Тип записи выбирается ВНЕ формы, чтобы динамически менять поля
     rec_type = st.radio(
         "Тип записи",
@@ -910,10 +915,12 @@ def page_machines(role):
         #  (без st.form), что позволяет реактивно менять поле «Этап»
         #  и показывать подтверждение ДО нажатия кнопки сохранения.
         #
-        #  Ключи session_state используют префикс PF = "pf_"
-        #  и сбрасываются после успешного INSERT.
+        #  Ключи session_state используют префикс PF = "pf<поколение>_".
+        #  После успешного INSERT поколение увеличивается: виджеты получают
+        #  новые ключи и создаются пустыми. (Простое удаление ключей из
+        #  session_state в Streamlit 1.35 не очищает значения в браузере.)
         # ═══════════════════════════════════════════════════════════════
-        PF = "pf_"
+        PF = f"pf{st.session_state.setdefault('pf_gen', 0)}_"
 
         def normalize_stage(s: str) -> str:
             import re as _re
@@ -1150,11 +1157,11 @@ def page_machines(role):
                     msg += " | 🏁 Финальный выпуск (станок)"
                 if fact_min:
                     msg += f" | факт {fact_min:.0f} мин"
-            st.success(msg)
-
-            # ── Сброс полей формы ───────────────────────────────────────
+            # ── Сброс полей формы: новое поколение ключей ───────────────
+            st.session_state["pf_flash"] = msg
             for _k in [k for k in st.session_state if k.startswith(PF)]:
                 del st.session_state[_k]
+            st.session_state["pf_gen"] += 1
             st.rerun()
 
     else:  # repair

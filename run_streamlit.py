@@ -8,6 +8,13 @@ Streamlit 1.35 задаёт ping каждую 1 с с таймаутом 30 с, 
 и так по кругу: бесконечный «Running» и сброс введённых данных.
 
 Здесь ping отправляется раз в 10 с, и на ответ даётся 10 с.
+
+runner.fastReruns=false: при fastReruns новое событие (например, клик по
+чекбоксу сразу после ввода в поле) прерывает текущий прогон скрипта, и
+Streamlit 1.35 считает прерванный прогон завершённым — состояние всех
+виджетов, до которых он не дошёл, удаляется (форма выпуска сбрасывалась).
+Без fastReruns события ждут окончания прогона, и значения не теряются.
+
 Остальные параметры запуска — те же, что в docker-entrypoint.sh.
 """
 import os
@@ -27,7 +34,7 @@ from streamlit.web import cli
 
 port = os.environ.get("STREAMLIT_SERVER_PORT", "8501")
 address = os.environ.get("STREAMLIT_SERVER_ADDRESS", "0.0.0.0")
-print(f"📊 Запуск Streamlit на порту {port} (ws ping 10s/10s)...", flush=True)
+print(f"📊 Запуск Streamlit на порту {port} (ws ping 10s/10s, fastReruns off)...", flush=True)
 sys.argv = [
     "streamlit", "run", "app.py",
     f"--server.port={port}",
@@ -36,5 +43,6 @@ sys.argv = [
     "--browser.gatherUsageStats=false",
     "--server.enableCORS=false",
     "--server.enableXsrfProtection=true",
+    "--runner.fastReruns=false",
 ]
 sys.exit(cli.main())
