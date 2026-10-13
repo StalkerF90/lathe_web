@@ -709,6 +709,66 @@ STATUS_COLORS = {
 # Полный упорядоченный список — пополняйте здесь при необходимости
 MACHINE_STATUSES = list(STATUS_LABELS.keys())
 
+# ── Фильтр «гайки» ─────────────────────────────────────────────────────────
+# Партия считается гайками, если её название начинается с одного из префиксов
+# (FNN-12M-S, DN-8-S, …). Пополняйте список здесь.
+NUT_PREFIXES = ("FNN", "DN")
+NUT_MODES = {"all": "Все", "no_nuts": "Без гаек", "only_nuts": "Только гайки"}
+
+# 1, если запись относится к партии-гайке. Название берётся из batches,
+# иначе из копии в production.batch. Нужен LEFT JOIN batches b ON b.batch_number = p.batch_number.
+NUT_SQL = "(" + " OR ".join(
+    f"UPPER(LTRIM(COALESCE(NULLIF(b.batch_name, ''), p.batch, ''))) LIKE '{px}%'"
+    for px in NUT_PREFIXES) + ")"
+
+def nut_filter_sql(mode: str) -> str:
+    """Условие WHERE для режима фильтра. Ремонты к гайкам не относятся."""
+    is_nut = f"(COALESCE(p.record_type, 'production') = 'production' AND {NUT_SQL})"
+    if mode == "no_nuts":
+        return f" AND NOT {is_nut}"
+    if mode == "only_nuts":
+        return f" AND {is_nut}"
+    return ""
+
+def nut_filter_widget(container, key: str) -> str:
+    """Переключатель «Все / Без гаек / Только гайки». Выбор общий для страниц.
+
+    Начальное значение задаётся через session_state, а не через index=:
+    в Streamlit 1.35 смена параметра виджета меняет его id и сбрасывает выбор.
+    """
+    if key not in st.session_state:
+        st.session_state[key] = st.session_state.get("nut_mode", "all")
+    mode = container.radio(
+        f"🔩 Гайки ({' / '.join(NUT_PREFIXES)})", list(NUT_MODES),
+        format_func=NUT_MODES.get, horizontal=True, key=key,
+        help="По названию партии: начинается с " + " или ".join(NUT_PREFIXES) +
+             ". Действует на станки и рабочие центры.")
+    st.session_state["nut_mode"] = mode
+    return mode
+
+def nut_summary(mode: str, date_from: str, date_to: str):
+    """Сводка: какие партии-гайки попали в период и что с ними делает фильтр."""
+    rows = q(f"""
+        SELECT p.batch_number AS "№ партии",
+               COALESCE(NULLIF(b.batch_name, ''), p.batch, '') AS "Название",
+               SUM(p.produced_qty) AS "Выпущено (шт)"
+        FROM production p
+        LEFT JOIN batches b ON b.batch_number = p.batch_number
+        WHERE p.date BETWEEN ? AND ?
+          AND COALESCE(p.record_type, 'production') = 'production'
+          AND {NUT_SQL}
+        GROUP BY p.batch_number
+        ORDER BY 3 DESC
+    """, (date_from, date_to))
+    action = {"all": "учитываются", "no_nuts": "исключены",
+              "only_nuts": "показаны только они"}[mode]
+    total = sum(r["Выпущено (шт)"] or 0 for r in rows)
+    with st.expander(f"🔩 Гайки за период: {len(rows)} партий, {total:,} шт — {action}"):
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("За выбранный период выпуска гаек нет.")
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  СТРАНИЦЫ
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1236,6 +1296,9 @@ def page_history(role):
             options=["all", "production", "repair"],
             format_func=lambda x: {"all": "Все", "production": "🟢 Выпуск",
                                     "repair": "🔧 Ремонт"}[x])
+        nut_mode = nut_filter_widget(st, key="nut_mode_history")
+
+    nut_summary(nut_mode, date_from.isoformat(), date_to.isoformat())
 
     sql = """
         SELECT p.id,
@@ -1256,8 +1319,9 @@ def page_history(role):
         FROM production p
         LEFT JOIN machines  m ON m.id = p.machine_id
         LEFT JOIN operators o ON o.id = p.operator_id
+        LEFT JOIN batches   b ON b.batch_number = p.batch_number
         WHERE p.date BETWEEN ? AND ?
-    """
+    """ + nut_filter_sql(nut_mode)
     params = [date_from.isoformat(), date_to.isoformat()]
     if sel_m_f:
         sql += " AND p.machine_id = ?"
@@ -1824,9 +1888,14 @@ def page_charts():
         st.stop()
     st.title("📊 Графики и аналитика")
 
-    col_ctrl1, _ = st.columns([1, 3])
+    col_ctrl1, col_ctrl2 = st.columns([1, 3])
     days  = col_ctrl1.slider("Период (дней)", 7, 90, 14)
     since = (date.today() - timedelta(days=days)).isoformat()
+    nut_mode = nut_filter_widget(col_ctrl2, key="nut_mode_charts")
+    nut_summary(nut_mode, since, date.today().isoformat())
+    if nut_mode != "all":
+        st.caption("Фильтр гаек действует на все вкладки, кроме «Статусы станков» "
+                   "(она строится по журналу статусов, а не по партиям).")
 
     # ── Все записи типа "выпуск" с признаком рабочего центра ──────────
     data_all = q("""
@@ -1838,8 +1907,10 @@ def page_charts():
         FROM production p
         LEFT JOIN machines  m ON m.id = p.machine_id
         LEFT JOIN operators o ON o.id = p.operator_id
+        LEFT JOIN batches   b ON b.batch_number = p.batch_number
         WHERE p.date >= ?
           AND COALESCE(p.record_type, 'production') = 'production'
+    """ + nut_filter_sql(nut_mode) + """
         ORDER BY p.date
     """, (since,))
 
