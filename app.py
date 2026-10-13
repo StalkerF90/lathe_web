@@ -2584,17 +2584,28 @@ def page_batches(role):
     # ── Б) Список партий ──────────────────────────────────────────────
     st.markdown("### Список партий")
 
+    # Закрытая партия = финальный выпуск ОПТА достиг планового количества
+    # (то же правило, что у progress bar). Статус вычисляется, в БД не хранится.
+    def is_closed(b):
+        return b["total_qty"] > 0 and b["final_opta"] >= b["total_qty"]
+
+    active   = [b for b in batches if not is_closed(b)]
+    archived = [b for b in batches if is_closed(b)]
+
     if not batches:
         st.info("Партий пока нет. Создайте первую партию с помощью формы выше.")
     else:
-        # Заголовок таблицы
-        hc = st.columns([2, 3, 2, 2, 2, 2, 1])
-        for col, lbl in zip(hc, ["№ партии", "Название", "Всего (шт)",
-                                  "Финал станки", "Финал ОПТА ★", "Создана", ""]):
-            col.markdown(f"**{lbl}**")
-        st.divider()
+        if not active:
+            st.info("Активных партий нет — все партии выполнены на 100% и находятся в архиве.")
+        else:
+            # Заголовок таблицы
+            hc = st.columns([2, 3, 2, 2, 2, 2, 1])
+            for col, lbl in zip(hc, ["№ партии", "Название", "Всего (шт)",
+                                      "Финал станки", "Финал ОПТА ★", "Создана", ""]):
+                col.markdown(f"**{lbl}**")
+            st.divider()
 
-        for b in batches:
+        for b in active:
             tq  = b["total_qty"]
             fl  = b["final_lathe"]
             fo  = b["final_opta"]
@@ -2614,6 +2625,31 @@ def page_batches(role):
                 st.rerun()
 
         st.caption("★ Финал ОПТА = общий прогресс завершения партии  |  📦 = открыть прогресс партии")
+
+        # ── Архив: партии, выполненные на 100% — рисуются только по запросу ──
+        if archived:
+            st.divider()
+            if st.toggle(f"🗄 Показать архив — выполненные партии ({len(archived)})",
+                         key="show_batch_archive"):
+                df_arch = pd.DataFrame([{
+                    "№ партии":      b["batch_number"],
+                    "Название":      b["batch_name"] or "—",
+                    "Всего (шт)":    b["total_qty"],
+                    "Финал станки":  b["final_lathe"],
+                    "Финал ОПТА ★":  b["final_opta"],
+                    "Создана":       (b["created_at"] or "")[:10],
+                } for b in archived])
+                st.dataframe(df_arch, use_container_width=True, hide_index=True)
+                ac1, ac2 = st.columns([3, 1])
+                arch_bn = ac1.selectbox("Партия из архива",
+                                        options=[b["batch_number"] for b in archived],
+                                        key="archive_batch_sel")
+                ac2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                if ac2.button("📦 Открыть прогресс", key="archive_goto_bp",
+                              use_container_width=True):
+                    st.session_state["batch_progress_select"] = arch_bn
+                    st.session_state["nav_goto"] = "batch"
+                    st.rerun()
 
     if role not in ("admin",):
         st.info("👁 Создание, редактирование и удаление партий доступно только администратору.")
