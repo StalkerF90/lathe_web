@@ -15,6 +15,9 @@ import yaml
 import io
 import os
 import csv
+import html
+import json
+from contextlib import contextmanager
 from datetime import date, timedelta, datetime
 from pathlib import Path
 
@@ -260,9 +263,32 @@ code, pre              { color: #a8e6cf !important; background: #1a1d2e !importa
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
+
+@contextmanager
+def tx():
+    """Одна транзакция на несколько запросов: commit при успехе, rollback при ошибке."""
+    conn = get_conn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def audit(conn, action: str, table: str, record_id, old=None, new=None):
+    """Пишет запись в журнал изменений (кто, когда, что было и что стало)."""
+    conn.execute("""
+        INSERT INTO audit_log (changed_at, username, action, table_name, record_id, old_data, new_data)
+        VALUES (?,?,?,?,?,?,?)
+    """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+          st.session_state.get("username", ""), action, table, record_id,
+          json.dumps(old, ensure_ascii=False, default=str) if old is not None else None,
+          json.dumps(new, ensure_ascii=False, default=str) if new is not None else None))
 
 def init_db():
     conn = get_conn()
@@ -442,6 +468,20 @@ def init_db():
         )
     """)
 
+    # Журнал изменений: правки и удаления записей (old_data/new_data — JSON)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            changed_at  TEXT NOT NULL,
+            username    TEXT DEFAULT '',
+            action      TEXT NOT NULL,
+            table_name  TEXT NOT NULL,
+            record_id   INTEGER,
+            old_data    TEXT,
+            new_data    TEXT
+        )
+    """)
+
     # ── Начальные данные: только при самом первом запуске (таблицы только что созданы).
     # После явного удаления пользователем через UI реестры остаются пустыми — не пересоздаём.
     # Маркер первого запуска — таблица db_meta с флагом seeded.
@@ -515,6 +555,12 @@ def init_db():
     conn.commit()
     conn.close()
 
+@st.cache_resource
+def init_db_once():
+    """Миграции и проверка схемы — один раз на процесс, а не на каждый клик."""
+    init_db()
+    return True
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIG & AUTH
 # ═══════════════════════════════════════════════════════════════════════════
@@ -586,28 +632,38 @@ def create_batch(batch_number: str, batch_name: str, total_qty: int, notes: str 
     if get_batch(batch_number):
         return False
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    exec_sql("""
-        INSERT OR IGNORE INTO batches (batch_number, batch_name, total_qty, notes, created_at)
-        VALUES (?,?,?,?,?)
-    """, (batch_number.strip(), batch_name.strip(), int(total_qty), notes.strip(), now_str))
-    return True
+    with tx() as conn:
+        cur = conn.execute("""
+            INSERT OR IGNORE INTO batches (batch_number, batch_name, total_qty, notes, created_at)
+            VALUES (?,?,?,?,?)
+        """, (batch_number.strip(), batch_name.strip(), int(total_qty), notes.strip(), now_str))
+        # rowcount == 0 → партию с таким номером успели создать параллельно
+        return cur.rowcount == 1
 
 def update_batch(batch_id: int, batch_name: str, total_qty: int, notes: str):
     """Обновляет название, количество и примечание партии. Номер не меняется."""
-    exec_sql("""
-        UPDATE batches SET batch_name=?, total_qty=?, notes=? WHERE id=?
-    """, (batch_name.strip(), int(total_qty), notes.strip(), batch_id))
+    with tx() as conn:
+        old = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        conn.execute("""
+            UPDATE batches SET batch_name=?, total_qty=?, notes=? WHERE id=?
+        """, (batch_name.strip(), int(total_qty), notes.strip(), batch_id))
+        audit(conn, "update", "batches", batch_id, dict(old) if old else None,
+              {"batch_name": batch_name.strip(), "total_qty": int(total_qty), "notes": notes.strip()})
 
 def delete_batch_safe(batch_number: str):
     """
     Удаляет партию, если по ней нет записей выпуска.
     Возвращает (True, '') при успехе или (False, причина) при ошибке.
     """
-    cnt = q("SELECT COUNT(*) AS c FROM production WHERE batch_number=?",
-            (batch_number,), fetch="one")
-    if cnt and cnt["c"] > 0:
-        return False, f"Нельзя удалить партию: по ней существует {cnt['c']} записей выпуска."
-    exec_sql("DELETE FROM batches WHERE batch_number=?", (batch_number,))
+    with tx() as conn:
+        cnt = conn.execute("SELECT COUNT(*) FROM production WHERE batch_number=?",
+                           (batch_number,)).fetchone()[0]
+        if cnt > 0:
+            return False, f"Нельзя удалить партию: по ней существует {cnt} записей выпуска."
+        old = conn.execute("SELECT * FROM batches WHERE batch_number=?", (batch_number,)).fetchone()
+        conn.execute("DELETE FROM batches WHERE batch_number=?", (batch_number,))
+        if old:
+            audit(conn, "delete", "batches", old["id"], dict(old))
     return True, ""
 
 def all_batch_numbers():
@@ -746,12 +802,13 @@ def page_machines(role):
                 require_not_viewer()
                 now_str  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 username = st.session_state.get("username", "")
-                exec_sql("UPDATE machines SET status=?, notes=? WHERE id=?",
-                         (ch_status, ch_notes, ch_machine))
-                exec_sql("""
-                    INSERT INTO machine_status_log (machine_id, status, changed_by, changed_at)
-                    VALUES (?,?,?,?)
-                """, (ch_machine, ch_status, username, now_str))
+                with tx() as conn:
+                    conn.execute("UPDATE machines SET status=?, notes=? WHERE id=?",
+                                 (ch_status, ch_notes, ch_machine))
+                    conn.execute("""
+                        INSERT INTO machine_status_log (machine_id, status, changed_by, changed_at)
+                        VALUES (?,?,?,?)
+                    """, (ch_machine, ch_status, username, now_str))
                 st.success(f"✅ Статус обновлён на «{STATUS_LABELS.get(ch_status, ch_status)}»")
                 st.rerun()
 
@@ -1344,9 +1401,17 @@ def page_history(role):
                 del_id = st.number_input("ID записи для удаления", min_value=1, step=1)
                 if st.form_submit_button("🗑 Удалить запись", type="primary"):
                     require_not_viewer()
-                    exec_sql("DELETE FROM production WHERE id=?", (del_id,))
-                    st.success(f"Запись #{del_id} удалена.")
-                    st.rerun()
+                    with tx() as conn:
+                        old = conn.execute("SELECT * FROM production WHERE id=?",
+                                           (del_id,)).fetchone()
+                        if old:
+                            conn.execute("DELETE FROM production WHERE id=?", (del_id,))
+                            audit(conn, "delete", "production", del_id, dict(old))
+                    if old:
+                        st.success(f"Запись #{del_id} удалена.")
+                        st.rerun()
+                    else:
+                        st.error(f"Запись #{del_id} не найдена.")
 
         # ══════════════════════════════════════════════════════════════
         # ФОРМА РЕДАКТИРОВАНИЯ ЗАПИСИ
@@ -1489,7 +1554,7 @@ def page_history(role):
                                   (draft["machine_id"],), fetch="one")
                         prod_val = m_row["productivity"] if m_row else 1.0
                         plan_h = round(qty / prod_val, 3) if qty > 0 else 0.0
-                        exec_sql("""
+                        update_sql = """
                             UPDATE production SET
                                 record_type              = ?,
                                 machine_id               = ?,
@@ -1506,7 +1571,8 @@ def page_history(role):
                                 notes                    = ?,
                                 is_final_release         = ?
                             WHERE id = ?
-                        """, (
+                        """
+                        update_params = (
                             draft["record_type"],
                             draft["machine_id"],
                             draft["operator_id"],
@@ -1522,7 +1588,13 @@ def page_history(role):
                             draft["notes"],
                             draft["is_final_release"],
                             draft["id"],
-                        ))
+                        )
+                        with tx() as conn:
+                            old = conn.execute("SELECT * FROM production WHERE id=?",
+                                               (draft["id"],)).fetchone()
+                            conn.execute(update_sql, update_params)
+                            audit(conn, "update", "production", draft["id"],
+                                  dict(old) if old else None, dict(draft, actual_time=plan_h))
                         st.success(f"✅ Запись ID {draft['id']} успешно обновлена.")
                         # Сбрасываем состояние редактирования
                         del st.session_state["edit_record"]
@@ -1616,15 +1688,27 @@ def page_admin_crud():
             d_id = st.selectbox("Выберите станок для удаления",
                 options=[m["id"] for m in machines_now],
                 format_func=lambda x: f"#{x} {next(m['name'] for m in machines_now if m['id']==x)}")
-            confirm = st.checkbox("Подтверждаю удаление станка и его истории")
+            st.caption("Удалить можно только станок без записей выпуска и ремонтов — "
+                       "история не удаляется вместе со станком.")
+            confirm = st.checkbox("Подтверждаю удаление станка")
             if st.form_submit_button("Удалить", type="primary"):
                 if not confirm:
                     st.warning("Поставьте галочку для подтверждения.")
                 else:
-                    exec_sql("DELETE FROM production WHERE machine_id=?", (d_id,))
-                    exec_sql("DELETE FROM machines WHERE id=?", (d_id,))
-                    st.success("Станок удалён.")
-                    st.rerun()
+                    with tx() as conn:
+                        cnt = conn.execute("SELECT COUNT(*) FROM production WHERE machine_id=?",
+                                           (d_id,)).fetchone()[0]
+                        if cnt == 0:
+                            old = conn.execute("SELECT * FROM machines WHERE id=?",
+                                               (d_id,)).fetchone()
+                            conn.execute("DELETE FROM machines WHERE id=?", (d_id,))
+                            audit(conn, "delete", "machines", d_id, dict(old) if old else None)
+                    if cnt:
+                        st.error(f"❌ Нельзя удалить станок: по нему {cnt} записей в истории. "
+                                 "Чтобы убрать станок из работы, смените ему статус.")
+                    else:
+                        st.success("Станок удалён.")
+                        st.rerun()
 
     # ── Операторы ─────────────────────────────────────────────────────
     with tab_o:
@@ -1655,8 +1739,17 @@ def page_admin_crud():
                     options=[o["id"] for o in ops_now],
                     format_func=lambda x: next(o["name"] for o in ops_now if o["id"]==x))
                 if st.form_submit_button("Удалить оператора", type="primary"):
-                    exec_sql("UPDATE production SET operator_id=NULL WHERE operator_id=?", (do_id,))
-                    exec_sql("DELETE FROM operators WHERE id=?", (do_id,))
+                    with tx() as conn:
+                        old = conn.execute("SELECT * FROM operators WHERE id=?",
+                                           (do_id,)).fetchone()
+                        # Запоминаем, у каких записей был этот оператор — для восстановления
+                        prod_ids = [r[0] for r in conn.execute(
+                            "SELECT id FROM production WHERE operator_id=?", (do_id,))]
+                        conn.execute("UPDATE production SET operator_id=NULL WHERE operator_id=?",
+                                     (do_id,))
+                        conn.execute("DELETE FROM operators WHERE id=?", (do_id,))
+                        audit(conn, "delete", "operators", do_id,
+                              dict(dict(old) if old else {}, production_ids=prod_ids))
                     st.success("Оператор удалён.")
                     st.rerun()
 
@@ -2679,13 +2772,13 @@ def page_batch_progress():
     st.markdown(f"""
 <div style="background:#1e2130;border:1px solid #2e3150;border-radius:12px;padding:18px 22px;margin-bottom:16px;">
   <div style="color:#56cfe1;font-size:1.2rem;font-weight:700;margin-bottom:8px;">
-    📦 Партия: <b>{sel_bn}</b>
+    📦 Партия: <b>{html.escape(sel_bn)}</b>
   </div>
   <div style="color:#e0e0f5;font-size:0.95rem;line-height:1.7;">
-    {'<b>Название:</b> ' + batch_name + ' &nbsp;|&nbsp; ' if batch_name else ''}
+    {'<b>Название:</b> ' + html.escape(batch_name) + ' &nbsp;|&nbsp; ' if batch_name else ''}
     <b>Всего в партии:</b> {f'{total_qty:,} шт' if total_qty else '—'} &nbsp;|&nbsp;
-    <b>Создана:</b> {created}
-    {'<br><b>Примечание:</b> ' + batch_notes if batch_notes else ''}
+    <b>Создана:</b> {html.escape(created)}
+    {'<br><b>Примечание:</b> ' + html.escape(batch_notes) if batch_notes else ''}
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -2976,58 +3069,85 @@ def _j_get_entry_values(entry_id: int):
     return {r["column_id"]: r["value_text"] for r in rows}
 
 def _j_create_journal(name: str, desc: str, username: str) -> int:
-    exec_sql("""
-        INSERT INTO journals (name, description, created_by, created_at)
-        VALUES (?,?,?,?)
-    """, (name.strip(), desc.strip(), username,
-          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    row = q("SELECT id FROM journals WHERE name=? ORDER BY id DESC LIMIT 1",
-            (name.strip(),), fetch="one")
-    return row["id"] if row else 0
+    with tx() as conn:
+        cur = conn.execute("""
+            INSERT INTO journals (name, description, created_by, created_at)
+            VALUES (?,?,?,?)
+        """, (name.strip(), desc.strip(), username,
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        return cur.lastrowid
 
 def _j_save_columns(journal_id: int, cols: list):
-    """Полностью заменяет колонки журнала (без затрагивания данных)."""
-    exec_sql("DELETE FROM journal_columns WHERE journal_id=?", (journal_id,))
-    for i, c in enumerate(cols):
-        exec_sql("""
-            INSERT INTO journal_columns
-            (journal_id, col_order, col_name, col_type, col_options, col_unit)
-            VALUES (?,?,?,?,?,?)
-        """, (journal_id, i, c["col_name"], c["col_type"],
-              c.get("col_options", ""), c.get("col_unit", "")))
+    """
+    Сохраняет структуру журнала, обновляя колонки на месте.
+    ID существующих колонок не меняются, поэтому значения записей
+    (journal_entry_values.column_id) остаются привязанными.
+    Колонки, убранные из структуры, удаляются только из journal_columns —
+    их значения остаются в БД.
+    """
+    with tx() as conn:
+        existing_ids = {r[0] for r in conn.execute(
+            "SELECT id FROM journal_columns WHERE journal_id=?", (journal_id,))}
+        kept = set()
+        for i, c in enumerate(cols):
+            fields = (i, c["col_name"], c["col_type"],
+                      c.get("col_options", ""), c.get("col_unit", ""))
+            if c.get("id") in existing_ids:
+                conn.execute("""
+                    UPDATE journal_columns
+                    SET col_order=?, col_name=?, col_type=?, col_options=?, col_unit=?
+                    WHERE id=?
+                """, fields + (c["id"],))
+                kept.add(c["id"])
+            else:
+                conn.execute("""
+                    INSERT INTO journal_columns
+                    (journal_id, col_order, col_name, col_type, col_options, col_unit)
+                    VALUES (?,?,?,?,?,?)
+                """, (journal_id,) + fields)
+        for col_id in existing_ids - kept:
+            conn.execute("DELETE FROM journal_columns WHERE id=?", (col_id,))
 
 def _j_delete_journal(journal_id: int):
-    """Каскадное удаление журнала и всех его данных."""
-    entry_ids = [r["id"] for r in
-                 q("SELECT id FROM journal_entries WHERE journal_id=?", (journal_id,))]
-    for eid in entry_ids:
-        exec_sql("DELETE FROM journal_entry_values WHERE entry_id=?", (eid,))
-    exec_sql("DELETE FROM journal_entries WHERE journal_id=?", (journal_id,))
-    exec_sql("DELETE FROM journal_columns WHERE journal_id=?", (journal_id,))
-    exec_sql("DELETE FROM journals WHERE id=?", (journal_id,))
+    """Каскадное удаление журнала и всех его данных (одной транзакцией)."""
+    with tx() as conn:
+        old = conn.execute("SELECT * FROM journals WHERE id=?", (journal_id,)).fetchone()
+        n_entries = conn.execute("SELECT COUNT(*) FROM journal_entries WHERE journal_id=?",
+                                 (journal_id,)).fetchone()[0]
+        conn.execute("""
+            DELETE FROM journal_entry_values
+            WHERE entry_id IN (SELECT id FROM journal_entries WHERE journal_id=?)
+        """, (journal_id,))
+        conn.execute("DELETE FROM journal_entries WHERE journal_id=?", (journal_id,))
+        conn.execute("DELETE FROM journal_columns WHERE journal_id=?", (journal_id,))
+        conn.execute("DELETE FROM journals WHERE id=?", (journal_id,))
+        audit(conn, "delete", "journals", journal_id,
+              dict(dict(old) if old else {}, entries_deleted=n_entries))
 
 def _j_save_entry(journal_id: int, col_values: dict, username: str):
     """Сохраняет запись: INSERT journal_entries + journal_entry_values."""
     now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    exec_sql("""
-        INSERT INTO journal_entries (journal_id, created_by, created_at)
-        VALUES (?,?,?)
-    """, (journal_id, username, now_s))
-    entry_row = q("""
-        SELECT id FROM journal_entries
-        WHERE journal_id=? AND created_by=? AND created_at=?
-        ORDER BY id DESC LIMIT 1
-    """, (journal_id, username, now_s), fetch="one")
-    entry_id = entry_row["id"]
-    for col_id, val in col_values.items():
-        exec_sql("""
+    with tx() as conn:
+        entry_id = conn.execute("""
+            INSERT INTO journal_entries (journal_id, created_by, created_at)
+            VALUES (?,?,?)
+        """, (journal_id, username, now_s)).lastrowid
+        conn.executemany("""
             INSERT INTO journal_entry_values (entry_id, column_id, value_text)
             VALUES (?,?,?)
-        """, (entry_id, col_id, str(val) if val is not None else ""))
+        """, [(entry_id, col_id, str(val) if val is not None else "")
+              for col_id, val in col_values.items()])
 
 def _j_delete_entry(entry_id: int):
-    exec_sql("DELETE FROM journal_entry_values WHERE entry_id=?", (entry_id,))
-    exec_sql("DELETE FROM journal_entries WHERE id=?", (entry_id,))
+    with tx() as conn:
+        old = conn.execute("SELECT * FROM journal_entries WHERE id=?", (entry_id,)).fetchone()
+        values = {r[0]: r[1] for r in conn.execute(
+            "SELECT column_id, value_text FROM journal_entry_values WHERE entry_id=?",
+            (entry_id,))}
+        conn.execute("DELETE FROM journal_entry_values WHERE entry_id=?", (entry_id,))
+        conn.execute("DELETE FROM journal_entries WHERE id=?", (entry_id,))
+        audit(conn, "delete", "journal_entries", entry_id,
+              dict(dict(old) if old else {}, values=values))
 
 
 def _j_render_input(col, key_prefix: str, operators_list, machines_list):
@@ -3267,8 +3387,9 @@ def page_journals(role, username):
             st.markdown("---")
             st.markdown("**Добавить / переопределить колонки**")
             st.caption(
-                "⚠️ При сохранении список колонок заменяется полностью. "
-                "Значения существующих записей не удаляются (привязаны к ID колонок)."
+                "Существующие колонки обновляются на месте — значения записей сохраняются. "
+                "Если уменьшить количество колонок, последние колонки скрываются из журнала, "
+                "но их значения остаются в базе."
             )
 
             # Число колонок
@@ -3296,8 +3417,9 @@ def page_journals(role, username):
                 cunit = cc4.text_input("Единица",
                     value=existing["col_unit"] if existing else "",
                     key=f"jcfg_unit_{j_id}_{i}")
-                new_cols.append({"col_name": cname, "col_type": ctype,
-                                  "col_options": copts, "col_unit": cunit})
+                new_cols.append({"id": existing["id"] if existing else None,
+                                 "col_name": cname, "col_type": ctype,
+                                 "col_options": copts, "col_unit": cunit})
 
             if st.button("💾 Сохранить структуру", type="primary", key=f"jcfg_save_{j_id}"):
                 if any(not c["col_name"].strip() for c in new_cols):
@@ -3322,7 +3444,7 @@ def page_journals(role, username):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
-    init_db()
+    init_db_once()
 
     if not HAS_AUTH:
         st.error("❌ streamlit-authenticator не установлен. Установите зависимости из requirements.txt.")
@@ -3370,8 +3492,8 @@ def main():
 <div style="background:#2a2d40; border-radius:10px; padding:14px; margin-bottom:16px;">
   <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">🏭 НТА-Контроль</div>
   <div style="color:#8888aa; font-size:0.85rem; margin-top:4px;">
-    👤 {st.session_state.get('name', username)}<br>
-    🔑 {role_label}
+    👤 {html.escape(str(st.session_state.get('name') or username))}<br>
+    🔑 {html.escape(role_label)}
   </div>
 </div>
 """, unsafe_allow_html=True)

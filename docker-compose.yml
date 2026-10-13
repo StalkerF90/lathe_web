@@ -22,6 +22,9 @@ services:
     volumes:
       # Персистентное хранилище: БД + конфиг
       - lathe_data:/data
+      # Код приложения берётся с диска: обновление = git pull + docker compose restart
+      # (без пересборки образа и переустановки зависимостей)
+      - ./app.py:/app/app.py:ro
       # Опционально: монтировать свой config.yml (раскомментируйте)
       # - ./config.yml:/data/config.yml:ro
     environment:
