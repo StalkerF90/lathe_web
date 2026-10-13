@@ -5,6 +5,7 @@
 import bcrypt
 import yaml
 import os
+import secrets
 
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.yml")
 
@@ -28,7 +29,7 @@ config = {
     },
     "cookie": {
         "expiry_days": 7,
-        "key": "lathe_control_secret_key_2024_xK9mP",
+        "key": secrets.token_urlsafe(48),  # случайный ключ при каждой генерации
         "name": "lathe_auth_cookie",
     },
     "preauthorized": {

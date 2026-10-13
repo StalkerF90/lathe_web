@@ -17,7 +17,8 @@ services:
     container_name: lathe_app
     restart: unless-stopped
     ports:
-      - "8501:8501"         # Основной порт Streamlit
+      # Только localhost: снаружи приложение доступно через nginx (HTTPS)
+      - "127.0.0.1:8501:8501"
     volumes:
       # Персистентное хранилище: БД + конфиг
       - lathe_data:/data
