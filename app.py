@@ -748,8 +748,8 @@ MACHINE_STATUSES = list(STATUS_LABELS.keys())
 
 # ── Фильтр «гайки» ─────────────────────────────────────────────────────────
 # Партия считается гайками, если её название начинается с одного из префиксов
-# (FNN-12M-S, DN-8-S, …). Пополняйте список здесь.
-NUT_PREFIXES = ("FNN", "DN")
+# (FNN-12M-S, DN-8-S, FNUBN-10M-S, …). Пополняйте список здесь.
+NUT_PREFIXES = ("FNN", "DN", "FNUBN", "DUBN")
 NUT_MODES = {"all": "Все", "no_nuts": "Без гаек", "only_nuts": "Только гайки"}
 
 # 1, если запись относится к партии-гайке. Название берётся из batches,
@@ -2318,7 +2318,7 @@ def _tab_monthly_analytics(nut_mode: str):
         if show_other:
             fig.add_bar(name="Без гаек", x=labels, y=other.values, marker_color="#7c6af7")
         if show_nut:
-            fig.add_bar(name="Гайки (FNN/DN)", x=labels, y=nut.values, marker_color="#f9c74f")
+            fig.add_bar(name="Гайки", x=labels, y=nut.values, marker_color="#f9c74f")
         total = shown(other, nut)
         fig.add_scatter(x=labels, y=total.values, mode="text", showlegend=False,
                         text=[f"{int(v):,}" for v in total.values], textposition="top center")
