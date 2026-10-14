@@ -1976,7 +1976,7 @@ def page_charts():
         ORDER BY p.date
     """, (since,))
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab_opta = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab_opta, tab_month = st.tabs([
         "📈 Загрузка по дням",
         "🏭 Выпуск по станкам",
         "👤 По операторам",
@@ -1984,6 +1984,7 @@ def page_charts():
         "🔧 Наладка",
         "🔄 Статусы станков",
         "🏭 ОПТА",
+        "📅 По месяцам",
     ])
 
     # ── График 1: Загрузка по дням ─────────────────────────────────────
@@ -2209,6 +2210,218 @@ def page_charts():
     # ── Вкладка 7: ОПТА (рабочие центры) ─────────────────────────────
     with tab_opta:
         _tab_opta_analytics(data_opta, days)
+
+    # ── Вкладка 8: По месяцам (свой интервал, не зависит от ползунка периода) ──
+    with tab_month:
+        _tab_monthly_analytics(nut_mode)
+
+
+RU_MONTHS = ["янв", "фев", "мар", "апр", "май", "июн",
+             "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+def _month_label(month: str) -> str:
+    """'2026-08' → 'авг 2026'."""
+    y, m = month.split("-")
+    return f"{RU_MONTHS[int(m) - 1]} {y}"
+
+def _dark_layout(fig, title: str, height: int = 420):
+    fig.update_layout(title=title, template="plotly_dark", height=height,
+                      paper_bgcolor="#0f1117", plot_bgcolor="#1e2130", font_color="#ffffff",
+                      legend=dict(orientation="h", yanchor="top", y=-0.18, x=0,
+                                  font=dict(color="#e0e0f5")),
+                      margin=dict(t=60, b=90))
+    return fig
+
+def _tab_monthly_analytics(nut_mode: str):
+    """
+    Помесячная аналитика за выбранный интервал месяцев:
+    выпуск станков и финальный выпуск ОПТА с разбивкой гайки / без гаек,
+    связь выпуска гаек с остальным выпуском, часы работы станков,
+    выпуск по каждому станку и рабочему центру.
+    """
+    st.markdown("### 📅 Выпуск и загрузка по месяцам")
+
+    df = pd.DataFrame(q(f"""
+        SELECT substr(p.date, 1, 7)                     AS month,
+               m.name                                   AS machine,
+               COALESCE(m.is_work_center, 0)            AS wc,
+               COALESCE(p.produced_qty, 0)              AS qty,
+               COALESCE(p.is_final_release, 0)          AS fin,
+               COALESCE(p.actual_duration_minutes, 0)   AS fact_min,
+               COALESCE(p.setup_time, 0)                AS setup_h,
+               CASE WHEN {NUT_SQL} THEN 1 ELSE 0 END    AS nut
+        FROM production p
+        LEFT JOIN machines m ON m.id = p.machine_id
+        LEFT JOIN batches  b ON b.batch_number = p.batch_number
+        WHERE COALESCE(p.record_type, 'production') = 'production'
+          AND p.date IS NOT NULL AND p.date != ''
+    """))
+    if df.empty:
+        st.info("Нет записей выпуска.")
+        return
+
+    # ── Интервал месяцев и способ подсчёта ─────────────────────────────
+    months = sorted(df["month"].unique())
+    c1, c2, c3 = st.columns([2, 2, 4])
+    m_from = c1.selectbox("С месяца", months, index=max(0, len(months) - 6),
+                          format_func=_month_label, key="mon_from")
+    m_to = c2.selectbox("По месяц", months, index=len(months) - 1,
+                        format_func=_month_label, key="mon_to")
+    if m_from > m_to:
+        m_from, m_to = m_to, m_from
+    basis = c3.radio(
+        "Выпуск станков считать по", ["fin", "all"], horizontal=True, key="mon_basis",
+        format_func=lambda x: {"fin": "🏁 финальному выпуску (готовые детали)",
+                               "all": "всем установам"}[x],
+        help="Финальный выпуск — каждая деталь считается один раз. "
+             "Все установы — деталь с тремя установами считается трижды.")
+
+    sel_months = [m for m in months if m_from <= m <= m_to]
+    labels = [_month_label(m) for m in sel_months]
+    d = df[df["month"].isin(sel_months)]
+    if date.today().strftime("%Y-%m") in sel_months:
+        st.caption(f"ℹ️ {_month_label(date.today().strftime('%Y-%m'))} — месяц ещё не закончился.")
+
+    lathe = d[d["wc"] == 0]
+    lathe_out = lathe[lathe["fin"] == 1] if basis == "fin" else lathe
+    opta_fin = d[(d["wc"] == 1) & (d["fin"] == 1)]
+
+    def by_nut(frame):
+        """(без гаек, гайки) — суммы qty по месяцам интервала."""
+        g = (frame.groupby(["month", "nut"])["qty"].sum().unstack(fill_value=0)
+             .reindex(index=sel_months, columns=[0, 1], fill_value=0))
+        return g[0], g[1]
+
+    l_other, l_nut = by_nut(lathe_out)
+    o_other, o_nut = by_nut(opta_fin)
+
+    # Фильтр гаек со страницы: какие сегменты показывать
+    show_other = nut_mode != "only_nuts"
+    show_nut = nut_mode != "no_nuts"
+    def shown(other, nut):
+        return (other if show_other else 0) + (nut if show_nut else 0)
+
+    lathe_hours = lathe if nut_mode == "all" else lathe[lathe["nut"] == (1 if nut_mode == "only_nuts" else 0)]
+    hours = (lathe_hours["fact_min"] / 60 + lathe_hours["setup_h"])
+
+    # ── Итоги за интервал ──────────────────────────────────────────────
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("⚙️ Станки, шт" + (" (финал)" if basis == "fin" else " (установы)"),
+              f"{int(shown(l_other, l_nut).sum()):,}")
+    k2.metric("🏁 Финал ОПТА, шт", f"{int(shown(o_other, o_nut).sum()):,}")
+    tot_o = o_other.sum() + o_nut.sum()
+    k3.metric("🔩 Доля гаек в финале ОПТА", f"{(o_nut.sum() / tot_o * 100 if tot_o else 0):.1f}%")
+    k4.metric("⏱ Часы работы станков", f"{hours.sum():,.0f} ч")
+
+    def stacked(title, other, nut):
+        fig = go.Figure()
+        if show_other:
+            fig.add_bar(name="Без гаек", x=labels, y=other.values, marker_color="#7c6af7")
+        if show_nut:
+            fig.add_bar(name="Гайки (FNN/DN)", x=labels, y=nut.values, marker_color="#f9c74f")
+        total = shown(other, nut)
+        fig.add_scatter(x=labels, y=total.values, mode="text", showlegend=False,
+                        text=[f"{int(v):,}" for v in total.values], textposition="top center")
+        fig.update_layout(barmode="stack", yaxis_title="шт")
+        st.plotly_chart(_dark_layout(fig, title), use_container_width=True)
+
+    g1, g2 = st.columns(2)
+    with g1:
+        stacked("⚙️ Станки" + (", финал" if basis == "fin" else ", установы"), l_other, l_nut)
+    with g2:
+        stacked("🏁 Финал ОПТА", o_other, o_nut)
+
+    # ── Гайки против остального выпуска ───────────────────────────────
+    st.markdown("#### 🔩 Гайки и остальной выпуск: есть ли вытеснение")
+    src = st.radio("Источник", ["opta", "lathe"], horizontal=True, key="mon_corr_src",
+                   format_func=lambda x: {"opta": "Финал ОПТА", "lathe": "Станки"}[x])
+    other, nut = (o_other, o_nut) if src == "opta" else (l_other, l_nut)
+    from plotly.subplots import make_subplots
+    fig_c = make_subplots(specs=[[{"secondary_y": True}]])
+    fig_c.add_scatter(x=labels, y=other.values, name="Без гаек, шт", mode="lines+markers",
+                      line=dict(color="#7c6af7", width=3), secondary_y=False)
+    fig_c.add_scatter(x=labels, y=nut.values, name="Гайки, шт (правая ось)", mode="lines+markers",
+                      line=dict(color="#f9c74f", width=3), secondary_y=True)
+    fig_c.update_yaxes(title_text="без гаек, шт", secondary_y=False)
+    fig_c.update_yaxes(title_text="гайки, шт", secondary_y=True, showgrid=False)
+    st.plotly_chart(_dark_layout(fig_c, "Гайки и остальной выпуск"),
+                    use_container_width=True)
+
+    # Незаконченный текущий месяц занижает обе серии сразу — в расчёт связи не берём
+    cur_m = date.today().strftime("%Y-%m")
+    both = pd.DataFrame({"other": other.values, "nut": nut.values}, index=sel_months)
+    both = both.drop(index=cur_m, errors="ignore")
+    if len(both) >= 3 and both["nut"].std() > 0 and both["other"].std() > 0:
+        r = both["other"].corr(both["nut"])
+        if r <= -0.5:
+            verdict = "заметная обратная связь: в месяцы с большим выпуском гаек остальной выпуск ниже"
+        elif r <= -0.2:
+            verdict = "слабая обратная связь"
+        elif r < 0.2:
+            verdict = "связи почти нет"
+        else:
+            verdict = "прямая связь: гайки и остальной выпуск растут и падают вместе (общая загрузка)"
+        st.caption(f"Коэффициент корреляции по месяцам: **r = {r:+.2f}** — {verdict}. "
+                   f"Месяцев в расчёте: {len(both)}"
+                   + (" (текущий незаконченный месяц не учитывается)" if cur_m in sel_months else "")
+                   + "; при малом числе месяцев вывод предварительный. "
+                   "График показывает обе серии независимо от фильтра гаек.")
+    else:
+        st.caption("Для оценки связи нужно минимум 3 завершённых месяца с выпуском гаек и без них.")
+
+    # ── Часы работы станков ───────────────────────────────────────────
+    st.markdown("#### ⏱ Часы работы станков по месяцам")
+    st.caption("Фактическое время выпуска + наладка по записям станков (без рабочих центров)."
+               + ("" if nut_mode == "all" else f" Фильтр: {NUT_MODES[nut_mode].lower()}."))
+    h = (lathe_hours.assign(hours=hours).groupby(["month", "machine"])["hours"].sum()
+         .unstack(fill_value=0).reindex(index=sel_months, fill_value=0))
+    fig_h = go.Figure()
+    for mach in h.columns:
+        fig_h.add_bar(name=mach, x=labels, y=h[mach].round(1).values)
+    fig_h.add_scatter(x=labels, y=h.sum(axis=1).values, mode="text", showlegend=False,
+                      text=[f"{v:,.0f} ч" for v in h.sum(axis=1).values], textposition="top center")
+    fig_h.update_layout(barmode="stack", yaxis_title="часы")
+    st.plotly_chart(_dark_layout(fig_h, "Часы по станкам"), use_container_width=True)
+
+    # ── Выпуск по каждому станку / рабочему центру ────────────────────
+    st.markdown("#### 🏭 Выпуск по станкам и рабочим центрам по месяцам")
+    d_mach = d if nut_mode == "all" else d[d["nut"] == (1 if nut_mode == "only_nuts" else 0)]
+    mc0, mc1, mc2 = st.columns([2, 4, 2])
+    group = mc0.radio("Группа", ["lathe", "wc", "all"], key="mon_mach_group",
+                      format_func=lambda x: {"lathe": "⚙️ Станки", "wc": "🏭 Рабочие центры",
+                                             "all": "Все"}[x])
+    in_group = d_mach if group == "all" else d_mach[d_mach["wc"] == (1 if group == "wc" else 0)]
+    all_mach = (in_group[["machine", "wc"]].drop_duplicates()
+                .sort_values(["wc", "machine"])["machine"].tolist())
+    # default зависит от группы: при смене группы выбор сбрасывается на все её объекты
+    sel_mach = mc1.multiselect("Станки / РЦ", all_mach, default=all_mach, key=f"mon_machines_{group}")
+    only_fin = mc2.radio("Записи", ["all", "fin"], key="mon_mach_fin",
+                         format_func=lambda x: {"all": "все", "fin": "только финальные"}[x])
+    dm = d_mach[d_mach["machine"].isin(sel_mach)]
+    if only_fin == "fin":
+        dm = dm[dm["fin"] == 1]
+    if dm.empty:
+        st.info("Нет данных для выбранных станков / РЦ.")
+        return
+    pm = (dm.groupby(["month", "machine"])["qty"].sum().unstack(fill_value=0)
+          .reindex(index=sel_months, fill_value=0))
+    pm = pm[[c for c in all_mach if c in pm.columns]]
+    wc_names = set(d[d["wc"] == 1]["machine"])
+    fig_m = go.Figure()
+    for mach in pm.columns:
+        fig_m.add_scatter(x=labels, y=pm[mach].values, mode="lines+markers",
+                          name=("🏭 " if mach in wc_names else "⚙️ ") + mach)
+    fig_m.update_layout(yaxis_title="шт")
+    st.plotly_chart(_dark_layout(fig_m, "Выпуск по месяцам", height=480), use_container_width=True)
+
+    table = pm.T.copy()
+    table.columns = labels
+    table["Итого"] = table.sum(axis=1)
+    table.index.name = "Станок / РЦ"
+    st.dataframe(table, use_container_width=True)
+    st.download_button("⬇ CSV: выпуск по месяцам", table.to_csv().encode("utf-8-sig"),
+                       f"monthly_by_machine_{m_from}_{m_to}.csv", "text/csv",
+                       key="dl_monthly_by_machine")
 
 
 def _tab_setup_analytics(data: list, days: int):
