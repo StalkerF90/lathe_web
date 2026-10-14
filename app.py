@@ -1539,181 +1539,190 @@ def page_history(role):
                 st.session_state["edit_pending"] = False
 
         # Шаг 2: показываем форму редактирования
-        if "edit_record" in st.session_state and st.session_state["edit_record"]:
-            rec = st.session_state["edit_record"]
-            st.info(f"Редактируется запись **ID {rec['id']}** "
-                    f"| Дата: {rec['date']} "
-                    f"| Тип: {rec.get('record_type','production')}")
+        _render_edit_record_form()
 
-            all_machines = q("""
-                SELECT id, name, COALESCE(is_work_center,0) AS is_work_center
-                FROM machines ORDER BY is_work_center, name
-            """)
-            all_operators = q("SELECT id, name FROM operators ORDER BY name")
-            op_map_e = {0: "—"} | {o["id"]: o["name"] for o in all_operators}
 
-            def mach_lbl_e(mid):
-                m = next((x for x in all_machines if x["id"] == mid), None)
-                if not m: return str(mid)
-                return ("🏭 " if m["is_work_center"] else "⚙️ ") + m["name"]
+def _render_edit_record_form():
+    """Шаги 2–3 редактирования записи выпуска/ремонта (запись — в session_state["edit_record"]).
+    Используется в «Истории» и в «Прогрессе партии». Только для admin."""
+    _flash = st.session_state.pop("edit_flash", None)
+    if _flash:
+        st.success(_flash)
+    if "edit_record" in st.session_state and st.session_state["edit_record"]:
+        rec = st.session_state["edit_record"]
+        st.info(f"Редактируется запись **ID {rec['id']}** "
+                f"| Дата: {rec['date']} "
+                f"| Тип: {rec.get('record_type','production')}")
 
-            with st.form("edit_record_form"):
-                ec1, ec2, ec3 = st.columns([2, 3, 3])
+        all_machines = q("""
+            SELECT id, name, COALESCE(is_work_center,0) AS is_work_center
+            FROM machines ORDER BY is_work_center, name
+        """)
+        all_operators = q("SELECT id, name FROM operators ORDER BY name")
+        op_map_e = {0: "—"} | {o["id"]: o["name"] for o in all_operators}
 
-                # Тип записи
-                cur_rtype = rec.get("record_type") or "production"
-                e_rtype = ec1.selectbox(
-                    "Тип записи",
-                    options=["production", "repair"],
-                    index=0 if cur_rtype == "production" else 1,
-                    format_func=lambda x: "🟢 Выпуск" if x == "production" else "🔧 Ремонт")
+        def mach_lbl_e(mid):
+            m = next((x for x in all_machines if x["id"] == mid), None)
+            if not m: return str(mid)
+            return ("🏭 " if m["is_work_center"] else "⚙️ ") + m["name"]
 
-                # Машина
-                mach_ids = [m["id"] for m in all_machines]
-                cur_mid  = rec.get("machine_id") or (mach_ids[0] if mach_ids else 1)
-                e_mid = ec2.selectbox(
-                    "Станок / РЦ*",
-                    options=mach_ids,
-                    index=mach_ids.index(cur_mid) if cur_mid in mach_ids else 0,
-                    format_func=mach_lbl_e)
+        with st.form("edit_record_form"):
+            ec1, ec2, ec3 = st.columns([2, 3, 3])
 
-                # Оператор
-                op_ids  = [0] + [o["id"] for o in all_operators]
-                cur_oid = rec.get("operator_id") or 0
-                if cur_oid not in op_ids: cur_oid = 0
-                e_oid = ec3.selectbox(
-                    "Оператор",
-                    options=op_ids,
-                    index=op_ids.index(cur_oid),
-                    format_func=lambda x: op_map_e[x] if x in op_map_e else str(x))
+            # Тип записи
+            cur_rtype = rec.get("record_type") or "production"
+            e_rtype = ec1.selectbox(
+                "Тип записи",
+                options=["production", "repair"],
+                index=0 if cur_rtype == "production" else 1,
+                format_func=lambda x: "🟢 Выпуск" if x == "production" else "🔧 Ремонт")
 
-                ec4, ec5, ec6 = st.columns([2, 3, 3])
-                try:
-                    cur_date = date.fromisoformat(rec["date"])
-                except Exception:
-                    cur_date = date.today()
-                e_date     = ec4.date_input("Дата*", value=cur_date)
-                e_batch    = ec5.text_input("Партия",    value=rec.get("batch") or "")
-                e_batch_no = ec6.text_input("№ партии",  value=rec.get("batch_number") or "")
+            # Машина
+            mach_ids = [m["id"] for m in all_machines]
+            cur_mid  = rec.get("machine_id") or (mach_ids[0] if mach_ids else 1)
+            e_mid = ec2.selectbox(
+                "Станок / РЦ*",
+                options=mach_ids,
+                index=mach_ids.index(cur_mid) if cur_mid in mach_ids else 0,
+                format_func=mach_lbl_e)
 
-                ec7, ec8, ec9, ec10 = st.columns([2, 2, 2, 3])
-                e_setup = ec7.number_input(
-                    "Наладка (ч)", min_value=0.0, step=0.25,
-                    value=float(rec.get("setup_time") or 0.0))
-                e_qty   = ec8.number_input(
-                    "Выпущено (шт)", min_value=0, step=1,
-                    value=int(rec.get("produced_qty") or 0))
-                e_fact  = ec9.number_input(
-                    "Факт. время (мин)", min_value=0.0, step=1.0,
-                    value=float(rec.get("actual_duration_minutes") or 0.0))
-                e_repair_h = ec10.number_input(
-                    "Длит. ремонта (ч)", min_value=0.0, step=0.5,
-                    value=float(rec.get("repair_duration_hours") or 0.0))
+            # Оператор
+            op_ids  = [0] + [o["id"] for o in all_operators]
+            cur_oid = rec.get("operator_id") or 0
+            if cur_oid not in op_ids: cur_oid = 0
+            e_oid = ec3.selectbox(
+                "Оператор",
+                options=op_ids,
+                index=op_ids.index(cur_oid),
+                format_func=lambda x: op_map_e[x] if x in op_map_e else str(x))
 
-                ef1, ef2, ef3 = st.columns([3, 3, 2])
-                e_stage  = ef1.text_input("Этап / операция",
-                                          value=rec.get("stage_name") or "",
-                                          placeholder="1 установ, маркировка…")
-                e_notes  = ef2.text_input("Примечание", value=rec.get("notes") or "")
-                e_final  = ef3.checkbox(
-                    "✅ Финальный выпуск",
-                    value=bool(rec.get("is_final_release") or False))
+            ec4, ec5, ec6 = st.columns([2, 3, 3])
+            try:
+                cur_date = date.fromisoformat(rec["date"])
+            except Exception:
+                cur_date = date.today()
+            e_date     = ec4.date_input("Дата*", value=cur_date)
+            e_batch    = ec5.text_input("Партия",    value=rec.get("batch") or "")
+            e_batch_no = ec6.text_input("№ партии",  value=rec.get("batch_number") or "")
 
-                submitted = st.form_submit_button("📋 Подготовить изменение", type="primary",
-                                                   use_container_width=True)
-                if submitted:
-                    # Сохраняем черновик изменений в session_state
-                    st.session_state["edit_pending"] = True
-                    st.session_state["edit_draft"] = {
-                        "id":                       rec["id"],
-                        "record_type":              e_rtype,
-                        "machine_id":               e_mid,
-                        "operator_id":              e_oid if e_oid else None,
-                        "date":                     e_date.isoformat(),
-                        "batch":                    e_batch,
-                        "batch_number":             e_batch_no,
-                        "setup_time":               e_setup,
-                        "produced_qty":             e_qty,
-                        "actual_duration_minutes":  e_fact if e_fact > 0 else None,
-                        "repair_duration_hours":    e_repair_h if e_repair_h > 0 else None,
-                        "stage_name":               e_stage.strip() or None,
-                        "notes":                    e_notes,
-                        "is_final_release":         1 if e_final else 0,
-                    }
+            ec7, ec8, ec9, ec10 = st.columns([2, 2, 2, 3])
+            e_setup = ec7.number_input(
+                "Наладка (ч)", min_value=0.0, step=0.25,
+                value=float(rec.get("setup_time") or 0.0))
+            e_qty   = ec8.number_input(
+                "Выпущено (шт)", min_value=0, step=1,
+                value=int(rec.get("produced_qty") or 0))
+            e_fact  = ec9.number_input(
+                "Факт. время (мин)", min_value=0.0, step=1.0,
+                value=float(rec.get("actual_duration_minutes") or 0.0))
+            e_repair_h = ec10.number_input(
+                "Длит. ремонта (ч)", min_value=0.0, step=0.5,
+                value=float(rec.get("repair_duration_hours") or 0.0))
 
-            # Шаг 3: подтверждение
-            if st.session_state.get("edit_pending") and "edit_draft" in st.session_state:
-                draft = st.session_state["edit_draft"]
-                st.warning(
-                    f"⚠️ **Вы уверены, что хотите изменить запись ID {draft['id']}?**\n\n"
-                    f"Тип: `{draft['record_type']}` | Дата: `{draft['date']}` | "
-                    f"Выпущено: `{draft['produced_qty']} шт` | "
-                    f"Наладка: `{draft['setup_time']} ч`\n\n"
-                    "Изменения будут сохранены в базе данных."
-                )
-                conf_col, cancel_col = st.columns(2)
-                with conf_col:
-                    if st.button("✔ Подтвердить изменение", type="primary",
-                                 use_container_width=True, key="confirm_edit_btn"):
-                        require_not_viewer()
-                        # Вычисляем plan_h
-                        qty = draft["produced_qty"]
-                        m_row = q("SELECT productivity FROM machines WHERE id=?",
-                                  (draft["machine_id"],), fetch="one")
-                        prod_val = m_row["productivity"] if m_row else 1.0
-                        plan_h = round(qty / prod_val, 3) if qty > 0 else 0.0
-                        update_sql = """
-                            UPDATE production SET
-                                record_type              = ?,
-                                machine_id               = ?,
-                                operator_id              = ?,
-                                date                     = ?,
-                                batch                    = ?,
-                                batch_number             = ?,
-                                setup_time               = ?,
-                                produced_qty             = ?,
-                                actual_time              = ?,
-                                actual_duration_minutes  = ?,
-                                repair_duration_hours    = ?,
-                                stage_name               = ?,
-                                notes                    = ?,
-                                is_final_release         = ?
-                            WHERE id = ?
-                        """
-                        update_params = (
-                            draft["record_type"],
-                            draft["machine_id"],
-                            draft["operator_id"],
-                            draft["date"],
-                            draft["batch"],
-                            draft["batch_number"],
-                            draft["setup_time"],
-                            draft["produced_qty"],
-                            plan_h,
-                            draft["actual_duration_minutes"],
-                            draft["repair_duration_hours"],
-                            draft["stage_name"],
-                            draft["notes"],
-                            draft["is_final_release"],
-                            draft["id"],
-                        )
-                        with tx() as conn:
-                            old = conn.execute("SELECT * FROM production WHERE id=?",
-                                               (draft["id"],)).fetchone()
-                            conn.execute(update_sql, update_params)
-                            audit(conn, "update", "production", draft["id"],
-                                  dict(old) if old else None, dict(draft, actual_time=plan_h))
-                        st.success(f"✅ Запись ID {draft['id']} успешно обновлена.")
-                        # Сбрасываем состояние редактирования
-                        del st.session_state["edit_record"]
-                        del st.session_state["edit_draft"]
-                        st.session_state["edit_pending"] = False
-                        st.rerun()
-                with cancel_col:
-                    if st.button("✘ Отмена", use_container_width=True,
-                                 key="cancel_edit_btn"):
-                        st.session_state["edit_pending"] = False
-                        st.rerun()
+            ef1, ef2, ef3 = st.columns([3, 3, 2])
+            e_stage  = ef1.text_input("Этап / операция",
+                                      value=rec.get("stage_name") or "",
+                                      placeholder="1 установ, маркировка…")
+            e_notes  = ef2.text_input("Примечание", value=rec.get("notes") or "")
+            e_final  = ef3.checkbox(
+                "✅ Финальный выпуск",
+                value=bool(rec.get("is_final_release") or False))
+
+            submitted = st.form_submit_button("📋 Подготовить изменение", type="primary",
+                                               use_container_width=True)
+            if submitted:
+                # Сохраняем черновик изменений в session_state
+                st.session_state["edit_pending"] = True
+                st.session_state["edit_draft"] = {
+                    "id":                       rec["id"],
+                    "record_type":              e_rtype,
+                    "machine_id":               e_mid,
+                    "operator_id":              e_oid if e_oid else None,
+                    "date":                     e_date.isoformat(),
+                    "batch":                    e_batch,
+                    "batch_number":             e_batch_no,
+                    "setup_time":               e_setup,
+                    "produced_qty":             e_qty,
+                    "actual_duration_minutes":  e_fact if e_fact > 0 else None,
+                    "repair_duration_hours":    e_repair_h if e_repair_h > 0 else None,
+                    "stage_name":               e_stage.strip() or None,
+                    "notes":                    e_notes,
+                    "is_final_release":         1 if e_final else 0,
+                }
+
+        # Шаг 3: подтверждение
+        if st.session_state.get("edit_pending") and "edit_draft" in st.session_state:
+            draft = st.session_state["edit_draft"]
+            st.warning(
+                f"⚠️ **Вы уверены, что хотите изменить запись ID {draft['id']}?**\n\n"
+                f"Тип: `{draft['record_type']}` | Дата: `{draft['date']}` | "
+                f"Выпущено: `{draft['produced_qty']} шт` | "
+                f"Наладка: `{draft['setup_time']} ч`\n\n"
+                "Изменения будут сохранены в базе данных."
+            )
+            conf_col, cancel_col = st.columns(2)
+            with conf_col:
+                if st.button("✔ Подтвердить изменение", type="primary",
+                             use_container_width=True, key="confirm_edit_btn"):
+                    require_not_viewer()
+                    # Вычисляем plan_h
+                    qty = draft["produced_qty"]
+                    m_row = q("SELECT productivity FROM machines WHERE id=?",
+                              (draft["machine_id"],), fetch="one")
+                    prod_val = m_row["productivity"] if m_row else 1.0
+                    plan_h = round(qty / prod_val, 3) if qty > 0 else 0.0
+                    update_sql = """
+                        UPDATE production SET
+                            record_type              = ?,
+                            machine_id               = ?,
+                            operator_id              = ?,
+                            date                     = ?,
+                            batch                    = ?,
+                            batch_number             = ?,
+                            setup_time               = ?,
+                            produced_qty             = ?,
+                            actual_time              = ?,
+                            actual_duration_minutes  = ?,
+                            repair_duration_hours    = ?,
+                            stage_name               = ?,
+                            notes                    = ?,
+                            is_final_release         = ?
+                        WHERE id = ?
+                    """
+                    update_params = (
+                        draft["record_type"],
+                        draft["machine_id"],
+                        draft["operator_id"],
+                        draft["date"],
+                        draft["batch"],
+                        draft["batch_number"],
+                        draft["setup_time"],
+                        draft["produced_qty"],
+                        plan_h,
+                        draft["actual_duration_minutes"],
+                        draft["repair_duration_hours"],
+                        draft["stage_name"],
+                        draft["notes"],
+                        draft["is_final_release"],
+                        draft["id"],
+                    )
+                    with tx() as conn:
+                        old = conn.execute("SELECT * FROM production WHERE id=?",
+                                           (draft["id"],)).fetchone()
+                        conn.execute(update_sql, update_params)
+                        audit(conn, "update", "production", draft["id"],
+                              dict(old) if old else None, dict(draft, actual_time=plan_h))
+                    st.session_state["edit_flash"] = f"✅ Запись ID {draft['id']} успешно обновлена."
+                    # Сбрасываем состояние редактирования
+                    del st.session_state["edit_record"]
+                    del st.session_state["edit_draft"]
+                    st.session_state["edit_pending"] = False
+                    st.rerun()
+            with cancel_col:
+                if st.button("✘ Отмена", use_container_width=True,
+                             key="cancel_edit_btn"):
+                    st.session_state["edit_pending"] = False
+                    st.rerun()
 
 
 def page_admin_crud():
@@ -3006,6 +3015,7 @@ def page_batch_progress():
         fin_lbl = "✅ Финал" if r["is_final_release"] else "—"
         ctype   = "🏭 ОПТА" if r["is_work_center"] else "⚙️ Станок"
         stage_rows.append({
+            "ID":               r["id"],
             "Дата":             r["date"],
             "Центр":            ctype,
             "Этап / операция":  r["stage_name"] or "—",
@@ -3019,8 +3029,38 @@ def page_batch_progress():
 
     st.dataframe(pd.DataFrame(stage_rows), use_container_width=True, hide_index=True,
                  column_config={
+                     "ID":            st.column_config.NumberColumn(width="small", format="%d",
+                                                                    help="Номер записи — для редактирования"),
                      "Выпущено (шт)": st.column_config.NumberColumn(format="%d шт"),
                  })
+
+    # ── Редактирование записи партии прямо здесь (admin) ──────────────
+    if st.session_state.get("role") == "admin":
+        _flash = st.session_state.pop("edit_flash", None)   # после сохранения — вне свёрнутого блока
+        if _flash:
+            st.success(_flash)
+        cur = st.session_state.get("edit_record")
+        editing_here = bool(cur) and cur.get("batch_number") == sel_bn
+        with st.expander("✏️ Редактировать запись этой партии", expanded=editing_here):
+            rec_by_id = {r["id"]: r for r in rows}
+            pc1, pc2 = st.columns([4, 1])
+            pick = pc1.selectbox(
+                "Запись", options=list(rec_by_id),
+                format_func=lambda i: (f"#{i} — {rec_by_id[i]['date']} — "
+                                       f"{rec_by_id[i]['stage_name'] or '—'} — "
+                                       f"{rec_by_id[i]['machine'] or '—'} — "
+                                       f"{rec_by_id[i]['produced_qty']} шт"),
+                key=f"bp_edit_pick_{sel_bn}")
+            pc2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if pc2.button("✏️ Загрузить", key=f"bp_edit_load_{sel_bn}", use_container_width=True):
+                rec = q("SELECT * FROM production WHERE id=?", (pick,), fetch="one")
+                st.session_state["edit_record"]  = dict(rec) if rec else None
+                st.session_state["edit_pending"] = False
+                st.rerun()
+            # Форма показывается только для записи этой партии; без загруженной
+            # записи функция лишь выводит сообщение об успешном сохранении.
+            if editing_here or not cur:
+                _render_edit_record_form()
 
     st.divider()
 
