@@ -1024,6 +1024,7 @@ def _tab_rates(q, tx, audit):
         st.rerun()
     st.caption(f"Ставка амортизации = сумма в месяц ÷ ({SHIFT_HOURS_PER_DAY:g} ч × рабочие дни); "
                f"ставка ФОТ = ФОТ в месяц ÷ ({PERSON_HOURS_PER_DAY:g} ч × рабочие дни).")
+    _forging_price_form(q, tx, audit)
     _journal(q, tx, audit, "tech_prices", "Цены: металл, гайки, кольца, поковки",
              ["kind", "size", "price", "valid_from", "notes"],
              {"kind": "Что", "size": "Размер / обозначение", "price": "Цена, ₽", "valid_from": "Действует с",
@@ -1043,6 +1044,51 @@ def _tab_rates(q, tx, audit):
              {"role": "Роль", "fot_month": "ФОТ в месяц, ₽", "valid_from": "Действует с", "notes": "Примечание"},
              help_text="Полный ФОТ на одного человека в месяц. Наладка оплачивается наладчику, выпуск — оператору.",
              selects={"role": ["наладчик", "оператор"]}, nums=["fot_month"], dates=["valid_from"])
+
+
+_FORG_KIND = {"L": "угловой корпус", "T": "тройник", "X": "крестовина"}
+
+
+def _forging_price_form(q, tx, audit):
+    """Цена поковки: выбор из журнала поковок + цена + дата → запись в регистр цен (kind «поковка»)."""
+    st.markdown("#### Цена поковки")
+    forgings = q("SELECT designation, kind, dn, dims FROM tech_forgings ORDER BY designation")
+    if not forgings:
+        st.info("Журнал поковок пуст — сначала добавьте поковки на вкладке «🧱 Поковки».")
+        return
+    today = date.today()
+    cur = effective([r for r in q("SELECT * FROM tech_prices WHERE kind='поковка'")], "size", today)
+    lab = {f["designation"]: f"{f['designation']} — {_FORG_KIND.get(f['kind'], f['kind'])} Ду{f['dn']} {f['dims']}"
+                             + (f" · сейчас {cur[f['designation']]['price']:,.2f} ₽" if f["designation"] in cur else "")
+           for f in forgings}
+    with st.form("forging_price_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([4, 2, 2])
+        pick = c1.selectbox("Поковка", list(lab), format_func=lab.get)
+        price = c2.number_input("Цена, ₽ за шт", min_value=0.0, step=10.0, format="%.2f")
+        vf = c3.date_input("Действует с", value=today, format="DD.MM.YYYY")
+        if st.form_submit_button("➕ Добавить цену", type="primary"):
+            if price <= 0:
+                st.error("Укажите цену больше нуля.")
+            else:
+                row = {"kind": "поковка", "size": pick, "price": float(price), "valid_from": vf.isoformat(),
+                       "notes": "внесено через форму «Цена поковки»"}
+                with tx() as conn:
+                    rid = conn.execute("INSERT INTO tech_prices (kind, size, price, valid_from, notes) VALUES (?,?,?,?,?)",
+                                       tuple(row.values())).lastrowid
+                    audit(conn, "insert", "tech_prices", rid, None, row)
+                st.session_state["forg_price_flash"] = f"✅ Цена {price:,.2f} ₽ для {pick} с {vf:%d.%m.%Y} добавлена."
+                st.rerun()
+    msg = st.session_state.pop("forg_price_flash", None)
+    if msg:
+        st.success(msg)
+    table = [{"Поковка": f["designation"], "Тип": _FORG_KIND.get(f["kind"], f["kind"]), "Ду": f["dn"], "Габариты": f["dims"],
+              "Цена сейчас, ₽": cur[f["designation"]]["price"] if f["designation"] in cur else None,
+              "Действует с": str(cur[f["designation"]]["valid_from"])[:10] if f["designation"] in cur else ""}
+             for f in forgings]
+    st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True,
+                 column_config={"Цена сейчас, ₽": st.column_config.NumberColumn(format="%.2f")})
+    st.caption("Новая цена добавляется строкой с датой начала действия — прежние цены остаются в регистре ниже "
+               "(их можно поправить или удалить там же).")
 
 
 def _route_section(q, p, key, h, hist, parsed_all, n_pcs):
