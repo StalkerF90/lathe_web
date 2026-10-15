@@ -240,6 +240,8 @@ def canonical_key(p: dict) -> str | None:
     art = p["article"]
     if p.get("material"):
         art = re.sub(r"-(SD|HC|IN|TI|PE|S|B|C|D|M)A?$", "", art)
+    # буква формы уплотнения у метрической резьбы на изготовление не влияет: 14M10B ≡ 14M10
+    art = re.sub(r"(\d+M\d{2})[A-Z]+(?=-|$)", r"\1", art)
     if p["prefix"] == "D":
         art = "FN" + art[1:]
     elif p["prefix"] == "G":
@@ -751,7 +753,7 @@ def _tab_analysis(q, tx, audit):
         st.caption("Корпус делается из поковки — см. раздел 7.")
     elif not art or not art.get("body_len_mm"):
         st.warning(f"Нет данных о заготовке для {key} (HEX и длина корпуса). "
-                   "Добавьте их на вкладке «📚 Артикулы» или пришлите чертёж в чат.")
+                   "Добавьте их на вкладке «📚 Артикулы».")
     else:
         need = metal_need(n_pcs, art["body_len_mm"], art.get("hex_mm"))
         stock = q("SELECT COALESCE(SUM(length_m),0) AS m FROM tech_metal "
