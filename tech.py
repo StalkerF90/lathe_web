@@ -273,6 +273,15 @@ def end_label(e: dict) -> str:
 def _frac(s: str) -> str:
     return s.replace(" ", "")
 
+# дюймовый размер резьбы: 7/8, 1, 1-1/8, 1-5/16 (смешанная дробь — иначе «1-1/8-20» читается как «1/8-20»)
+_UN_SIZE = r"(?<![\d/])(\d+-\d+/\d+|\d+/\d+|\d+)"
+
+
+def _bore_spec(bore: str | None):
+    """«12,15 +0,04» → «BORE:12.15» (сравнение по номинальному диаметру)."""
+    m = re.search(r"\d+[.,]?\d*", bore or "")
+    return f"BORE:{float(m.group(0).replace(',', '.')):g}" if m else None
+
 def parse_gauge_name(name: str) -> dict:
     """«Резьбовой калибр-пробка 7/8-20 UNEF-2B ПР» → kind=plug, spec=UN:7/8-20, cls=2B, side=ПР."""
     n = (name or "").replace(" ", " ")
@@ -281,11 +290,15 @@ def parse_gauge_name(name: str) -> dict:
          "side": None, "spec": None, "cls": None, "smooth": "ГЛАДК" in n.upper()}
     if re.search(r"\bР-Г\b", n) or "P-Г" in n:
         g["side"] = "Р-Г"
+    elif re.search(r"ПР\s*[-/]\s*НЕ|GO\s*/\s*NO", n.upper()):   # комплект в одном калибре
+        g["side"] = "ПР-НЕ"
     elif re.search(r"\bНЕ\b", n):
         g["side"] = "НЕ"
     elif re.search(r"\bПР\b", n):
         g["side"] = "ПР"
-    if m := re.search(r"(\d+(?:/\d+)?)\s*-\s*(\d+)\s*(UNEF|UNF|UNC|UN)\s*-?\s*(\d[AB])", up):
+    if g["smooth"] and (m := re.search(r"Ø\s*(\d+[.,]\d+)", n)):           # гладкий калибр отверстия
+        g["spec"] = f"BORE:{float(m.group(1).replace(',', '.')):g}"
+    elif m := re.search(rf"{_UN_SIZE}\s*-\s*(\d+)\s*(UNEF|UNF|UNC|UN)(?:\s*-?\s*(\d[AB]))?", up):
         g["spec"], g["cls"] = f"UN:{_frac(m.group(1))}-{m.group(2)}", m.group(4)
     elif m := re.search(r"\bM(\d+)\s*[XХ×]\s*(\d+(?:[,.]\d+)?)\s*-?\s*(\d[GHgh])?", up):
         pitch = float(m.group(2).replace(",", "."))
@@ -307,13 +320,15 @@ def gauge_requirements(end: dict, tube_ends: dict) -> list[dict]:
             return [{"what": f"торец {end['label']}", "spec": None, "kind": None,
                      "missing_ref": f"нет данных о торце {end['code']} в справочнике торцов"}]
         un = _un_spec(te.get("body_thread") or te.get("nut_thread"))
+        no_thr = None if un else f"резьба для торца {end['code']} не указана в справочнике торцов"
         if slot == "tube":
-            req.append({"what": f"резьба корпуса под гайку {te.get('body_thread')}", "spec": un, "kind": "ring"})
+            req.append({"what": f"резьба корпуса под гайку {te.get('body_thread') or '—'}", "spec": un, "kind": "ring",
+                        "missing_ref": no_thr})
             if te.get("bore"):
-                req.append({"what": f"отверстие под трубку Ø{te['bore']}", "spec": f"BORE:{te['bore']}", "kind": "plug",
+                req.append({"what": f"отверстие под трубку Ø{te['bore']}", "spec": _bore_spec(te["bore"]), "kind": "plug",
                             "smooth": True})
-        req.append({"what": f"резьба гайки под фитинг {te.get('nut_thread')}", "spec": un, "kind": "plug",
-                    "for_nut": slot == "tube"})
+        req.append({"what": f"резьба гайки под фитинг {te.get('nut_thread') or '—'}", "spec": un, "kind": "plug",
+                    "for_nut": slot == "tube", "missing_ref": no_thr})
     elif k in ("pipe", "metric") and slot in ("male", "female"):
         kind = "ring" if slot == "male" else "plug"
         if k == "metric":
@@ -334,8 +349,17 @@ def gauge_requirements(end: dict, tube_ends: dict) -> list[dict]:
 def _un_spec(thread: str | None):
     if not thread:
         return None
-    m = re.search(r"(\d+(?:/\d+)?)\s*-\s*(\d+)", thread)
+    m = re.search(rf"{_UN_SIZE}\s*-\s*(\d+)", thread)
     return f"UN:{m.group(1)}-{m.group(2)}" if m else None
+
+
+def _gauge_ident(g: dict) -> str:
+    """Чем назвать калибр в отчёте: заводской №, иначе код из примечания (ZJV-RG-10), иначе ID записи."""
+    if g.get("serial"):
+        return f"№{g['serial']}"
+    if m := re.search(r"код (\S+?);", g.get("notes") or ""):
+        return m.group(1)
+    return f"ID {g.get('id')}" if g.get("id") else "без номера"
 
 
 def gauge_valid(g: dict, today: date) -> tuple[str, str]:
@@ -374,7 +398,8 @@ def match_gauges(req: dict, gauges: list[dict], today: date) -> dict:
     out["found"] = graded
     rank = {"ok": 0, "warn": 1, "bad": 2}
     def best(side):
-        xs = [g for g in graded if g.get("side") == side]
+        # калибр-комплект «ПР-НЕ» закрывает и ПР, и НЕ
+        xs = [g for g in graded if g.get("side") == side or (side in ("ПР", "НЕ") and g.get("side") == "ПР-НЕ")]
         return min((rank[g["level"]] for g in xs), default=None)
     if req.get("taper") and best("Р-Г") is not None:
         lvl = best("Р-Г")
@@ -733,7 +758,7 @@ def _tab_analysis(q, tx, audit):
                 continue
             seen_req.add(sig)
             mres = match_gauges(r, gauges, today)
-            found = "; ".join(f"{g['side'] or '?'} №{g['serial'] or '—'}"
+            found = "; ".join(f"{g['side'] or '?'} {_gauge_ident(g)}"
                               + (f" (инв. {g['inv_no']})" if g.get("inv_no") else "") + f" — {g['valid_text']}"
                               for g in mres["found"])
             grows.append({"Торец": i, "Итог": f"{_ICON[mres['level']]} {mres['text']}",
