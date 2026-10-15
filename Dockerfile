@@ -24,6 +24,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Исходный код
 COPY app.py           .
+COPY tech.py          .
+COPY run_streamlit.py .
 COPY manage_users.py  .
 COPY generate_config.py .
 

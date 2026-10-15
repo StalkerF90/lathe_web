@@ -12,6 +12,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import yaml
+import tech
 import io
 import os
 import csv
@@ -554,6 +555,9 @@ def init_db():
 
         # Ставим флаг — больше не инициализируем
         c.execute("INSERT INTO db_meta (key, value) VALUES ('seeded', '1')")
+
+    # Таблицы технологического модуля (справочники и журналы tech_*)
+    tech.init_tables(c)
 
     conn.commit()
     conn.close()
@@ -3937,6 +3941,7 @@ def main():
             "👥 Персонал / Станки": "crud",
             "📊 Графики":           "charts",
             "💾 Экспорт CSV":       "export",
+            "🛠 Технология":        "tech",
         }
         pages_viewer = {
             "📊 Графики":           "charts",
@@ -4019,6 +4024,8 @@ def main():
         page_charts()
     elif page_key == "export":
         page_export()
+    elif page_key == "tech":
+        tech.page_tech(q, tx, audit)
 
 
 if __name__ == "__main__":
