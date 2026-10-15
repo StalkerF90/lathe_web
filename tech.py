@@ -424,6 +424,9 @@ def match_gauges(req: dict, gauges: list[dict], today: date) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 CUT_ALLOWANCE_MM = 3.0          # припуск на штуку (отрезка + подрезка), «вчистую»
+DEFAULT_SETUP_H = 4.0           # наладка на маршрут (все установы), если статистики нет
+PERSON_HOURS_PER_DAY = 8.0      # ФОТ → ставка в час: ФОТ / (8 ч × рабочие дни)
+PRICE_KINDS = ["металл 316L, ₽/кг", "гайка", "кольцо переднее", "кольцо заднее", "поковка"]
 DENSITY_316L = 7.98             # г/см³
 SHIFT_HOURS_PER_DAY = 2 * 8 - 0.5   # 2 смены по 8 ч минус пересменка 30 мин в сутки
 
@@ -505,7 +508,50 @@ def init_tables(c):
             fixture_note TEXT DEFAULT '',
             notes        TEXT DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS tech_routes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            family      TEXT NOT NULL,              -- straight (прямые) | forging (из поковки)
+            machines    TEXT NOT NULL,              -- станки через запятую в порядке установов
+            parallel    INTEGER DEFAULT 0,          -- 1 = один оператор ведёт станки маршрута одновременно
+            is_default  INTEGER DEFAULT 0,
+            notes       TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS tech_prices (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind        TEXT NOT NULL,              -- металл 316L, ₽/кг | гайка | кольцо переднее | кольцо заднее | поковка
+            size        TEXT DEFAULT '',            -- трубка (12M, 8) или обозначение поковки; для металла пусто
+            price       REAL,
+            valid_from  TEXT,
+            notes       TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS tech_machine_rates (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine     TEXT NOT NULL,
+            amort_month REAL,
+            valid_from  TEXT,
+            notes       TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS tech_payroll (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            role        TEXT NOT NULL,              -- наладчик | оператор
+            fot_month   REAL,                       -- полный ФОТ в месяц на человека
+            valid_from  TEXT,
+            notes       TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS tech_settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
     """)
+    c.execute("INSERT OR IGNORE INTO tech_settings (key, value) VALUES ('work_days', '21')")
+    if c.execute("SELECT COUNT(*) FROM tech_routes").fetchone()[0] == 0:
+        c.executemany("INSERT INTO tech_routes (name, family, machines, parallel, is_default, notes) VALUES (?,?,?,?,?,?)", [
+            ("235 + 2100 (1-й и 2-й установ)", "straight", "Lathe 235, Lathe 2100", 1, 1,
+             "1-й установ на 235, 2-й на 2100; один оператор ведёт связку"),
+            ("2105 (оба установа)", "straight", "Lathe 2105", 0, 0, "оба установа за один"),
+            ("2100 (из поковки)", "forging", "Lathe 2100", 0, 1, "угольники, тройники, крестовины — только 2100"),
+        ])
 
 
 def add_months(d: date, months: int) -> date:
@@ -561,6 +607,137 @@ def machine_stats(h: pd.DataFrame) -> pd.DataFrame:
     return stats.reset_index()
 
 
+# ── Маршруты ───────────────────────────────────────────────────────────────
+
+def batch_routes(h: pd.DataFrame) -> pd.Series:
+    """Партия → набор станков (без РЦ), на которых её делали."""
+    lathe = h[h["wc"] == 0] if not h.empty else h
+    if lathe.empty:
+        return pd.Series(dtype=object)
+    return lathe.groupby("batch_number")["machine"].agg(lambda s: frozenset(s))
+
+
+def route_stats(h: pd.DataFrame, machines) -> pd.DataFrame:
+    """Статистика по станкам только для партий, сделанных ровно по этому маршруту."""
+    br = batch_routes(h)
+    want = frozenset(machines)
+    batches = [b for b, ms in br.items() if ms == want]
+    return machine_stats(h[h["batch_number"].isin(batches)]) if batches else pd.DataFrame()
+
+
+def parse_machines(text: str) -> tuple:
+    return tuple(m.strip() for m in (text or "").split(",") if m.strip())
+
+
+def route_estimate(norms: list[dict], n_pcs: int, parallel: bool) -> dict:
+    """norms: [{machine, setup_h, min_pc}] → часы по станкам и календарь.
+    parallel: один оператор ведёт станки одновременно (связка) — календарь по самому загруженному."""
+    rows, complete = [], True
+    for r in norms:
+        mpc = r.get("min_pc")
+        ok = mpc is not None and not pd.isna(mpc) and mpc >= 0
+        complete &= ok
+        run_h = n_pcs * mpc / 60 if ok else None
+        setup = float(r.get("setup_h") or 0)
+        rows.append({"machine": r["machine"], "setup_h": setup, "min_pc": mpc if ok else None,
+                     "run_h": run_h, "total_h": setup + run_h if ok else None})
+    totals = [r["total_h"] for r in rows if r["total_h"] is not None]
+    machine_hours = sum(totals) if totals else 0.0
+    wall = (max(totals) if parallel else sum(totals)) if totals else 0.0
+    return {"rows": rows, "complete": complete, "machine_hours": machine_hours, "wall_hours": wall,
+            "days": wall / SHIFT_HOURS_PER_DAY, "parallel": parallel}
+
+
+# ── Себестоимость ──────────────────────────────────────────────────────────
+
+def effective(rows: list[dict], key_field: str, today: date) -> dict:
+    """Действующие на дату записи регистра: {ключ: строка с наибольшей valid_from ≤ today}."""
+    best = {}
+    for r in rows:
+        vf = str(r.get("valid_from") or "0000-00-00")[:10]
+        if vf > today.isoformat():
+            continue
+        k = (r.get(key_field) or "").strip()
+        if k not in best or vf >= best[k][0]:
+            best[k] = (vf, r)
+    return {k: v[1] for k, v in best.items()}
+
+
+def cost_breakdown(p: dict, art: dict | None, n_pcs: int, est: dict, prices: dict, mrates: dict,
+                   payroll: dict, work_days: float) -> dict:
+    """Себестоимость партии. prices: {(kind, size): row}; mrates: {machine: row}; payroll: {role: row}.
+    Статья без данных → amount None (в итог не входит, показывается как «не задано»)."""
+    lines = []
+    def add(item, how, amount, missing=None):
+        lines.append({"item": item, "how": how, "amount": amount, "missing": missing})
+    price = lambda kind, size="": (prices.get((kind, size)) or {}).get("price")
+
+    # 1. Материал корпуса
+    if p.get("forging"):
+        fg = (art or {}).get("forging")
+        pr = price("поковка", fg) if fg else None
+        if pr is None:
+            add("Поковка", f"{n_pcs:,} шт × цена поковки {fg or '(поковка не выбрана)'}", None,
+                "нет цены поковки" if fg else "поковка не выбрана")
+        else:
+            add("Поковка", f"{n_pcs:,} шт × {pr:,.2f} ₽ ({fg})", n_pcs * pr)
+    else:
+        hex_mm, ln = (art or {}).get("hex_mm"), (art or {}).get("body_len_mm")
+        pr = price("металл 316L, ₽/кг")
+        if not hex_mm or not ln:
+            add("Металл", "нет HEX или длины корпуса в справочнике артикулов", None, "нет данных о заготовке")
+        else:
+            need = metal_need(n_pcs, ln, hex_mm)
+            if pr is None:
+                add("Металл", f"{need['kg']:,.2f} кг × цена за кг", None, "нет цены металла")
+            else:
+                add("Металл", f"{n_pcs:,} × ({ln:g}+{CUT_ALLOWANCE_MM:g}) мм = {need['meters']:,.2f} м · "
+                              f"HEX {hex_mm:g} = {need['kg']:,.2f} кг × {pr:,.2f} ₽/кг", need["kg"] * pr)
+
+    # 2. Гайки и кольца — только исполнение «в сборе» (A): на каждый обжимной торец 1 гайка + 2 кольца
+    if p.get("assembled"):
+        tubes = [e["code"] for e in p.get("ends", []) if e.get("slot") == "tube" and e.get("code")]
+        for kind in ("гайка", "кольцо переднее", "кольцо заднее"):
+            missing = sorted({t for t in tubes if price(kind, t) is None})
+            if not tubes:
+                continue
+            if missing:
+                add(kind.capitalize(), f"{len(tubes)} × {n_pcs:,} шт", None, f"нет цены для трубки {', '.join(missing)}")
+            else:
+                s = sum(price(kind, t) for t in tubes)
+                add(kind.capitalize(), f"{len(tubes)} шт на фитинг × {n_pcs:,} = {len(tubes) * n_pcs:,} шт · "
+                                       + ", ".join(f"{t}: {price(kind, t):,.2f} ₽" for t in sorted(set(tubes))), s * n_pcs)
+
+    # 3–5. Работа и амортизация (по выбранному маршруту)
+    rate = lambda role: ((payroll.get(role) or {}).get("fot_month") or 0) / (PERSON_HOURS_PER_DAY * work_days) \
+        if (payroll.get(role) or {}).get("fot_month") else None
+    setup_h = sum(r["setup_h"] for r in est["rows"])
+    r_set = rate("наладчик")
+    add("Наладка (наладчик)", f"{setup_h:,.2f} ч × " + (f"{r_set:,.2f} ₽/ч" if r_set else "ставка"),
+        setup_h * r_set if r_set else None, None if r_set else "нет ФОТ наладчика")
+    runs = [r["run_h"] for r in est["rows"] if r["run_h"] is not None]
+    if not est["complete"]:
+        add("Работа оператора", "нет нормы мин/шт для части станков", None, "нет нормы времени")
+    else:
+        op_h = (max(runs) if est["parallel"] else sum(runs)) if runs else 0
+        r_op = rate("оператор")
+        how = (f"связка: по самому загруженному станку {op_h:,.2f} ч" if est["parallel"] and len(runs) > 1
+               else f"{op_h:,.2f} ч") + (f" × {r_op:,.2f} ₽/ч" if r_op else "")
+        add("Работа оператора", how, op_h * r_op if r_op else None, None if r_op else "нет ФОТ оператора")
+    for r in est["rows"]:
+        a = (mrates.get(r["machine"]) or {}).get("amort_month")
+        hr = a / (SHIFT_HOURS_PER_DAY * work_days) if a else None
+        if r["total_h"] is None:
+            add(f"Амортизация {r['machine']}", "нет нормы времени", None, "нет нормы времени")
+        elif hr is None:
+            add(f"Амортизация {r['machine']}", f"{r['total_h']:,.2f} ч × ставка", None, "нет амортизации станка")
+        else:
+            add(f"Амортизация {r['machine']}", f"{r['total_h']:,.2f} ч × {hr:,.2f} ₽/ч", r["total_h"] * hr)
+    total = sum(l["amount"] for l in lines if l["amount"] is not None)
+    return {"lines": lines, "total": total, "per_piece": total / n_pcs if n_pcs else None,
+            "complete": all(l["amount"] is not None for l in lines)}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  СТРАНИЦА
 # ═══════════════════════════════════════════════════════════════════════════
@@ -573,10 +750,22 @@ def page_tech(q, tx, audit):
         st.error("⛔ Технологический модуль доступен только администратору.")
         st.stop()
     st.title("🛠 Технология")
-    t_an, t_g, t_m, t_f, t_a, t_e = st.tabs(
-        ["🔍 Анализ артикула", "📏 Калибры", "🔩 Металл", "🧱 Поковки", "📚 Артикулы", "🔧 Торцы"])
+    t_an, t_c, t_r, t_g, t_m, t_f, t_a, t_e = st.tabs(
+        ["🔍 Анализ артикула", "💰 Цены и ставки", "🛣 Маршруты", "📏 Калибры", "🔩 Металл", "🧱 Поковки",
+         "📚 Артикулы", "🔧 Торцы"])
     with t_an:
         _tab_analysis(q, tx, audit)
+    with t_c:
+        _tab_rates(q, tx, audit)
+    with t_r:
+        _journal(q, tx, audit, "tech_routes", "Маршруты",
+                 ["name", "family", "machines", "parallel", "is_default", "notes"],
+                 {"name": "Название", "family": "Вид", "machines": "Станки (через запятую, по установам)",
+                  "parallel": "Связка (1 оператор)", "is_default": "По умолчанию", "notes": "Примечание"},
+                 help_text="Вид: straight — прямые фитинги из HEX, forging — из поковки (угольники, тройники, крестовины). "
+                           "Названия станков — как в справочнике станков. «Связка» — один оператор ведёт станки "
+                           "одновременно: срок и оплата оператора считаются по самому загруженному станку.",
+                 selects={"family": ["straight", "forging"]}, bools=["parallel", "is_default"])
     with t_g:
         _journal(q, tx, audit, "tech_gauges", "Калибры",
                  ["name", "serial", "inv_no", "maker", "calib_date", "interval_months", "next_date",
@@ -668,7 +857,6 @@ def _tab_analysis(q, tx, audit):
 
     # ── 2. История ─────────────────────────────────────────────────────
     st.markdown("### 2. История выпуска")
-    stats = pd.DataFrame()
     if h.empty:
         st.info(f"Артикул {key} ранее не выпускался.")
     else:
@@ -677,54 +865,16 @@ def _tab_analysis(q, tx, audit):
             plan=("total_qty", "max"), machines=("machine", lambda s: ", ".join(sorted(set(s)))))
              .reset_index().sort_values("first"))
         b["дней"] = (pd.to_datetime(b["last"]) - pd.to_datetime(b["first"])).dt.days + 1
+        br = batch_routes(h)
+        b["route"] = b["batch_number"].map(lambda x: " + ".join(sorted(br.get(x, frozenset()))) or "—")
         st.dataframe(b.rename(columns={"batch_number": "Партия", "name": "Название", "first": "Начало",
-                                       "last": "Конец", "plan": "План, шт", "machines": "Станки / РЦ"}),
+                                       "last": "Конец", "plan": "План, шт", "route": "Маршрут (станки)",
+                                       "machines": "Станки / РЦ"}),
                      use_container_width=True, hide_index=True)
-        stats = machine_stats(h)
-        if not stats.empty:
-            st.dataframe(stats.rename(columns={
-                "machine": "Станок", "batches": "Партий", "setup_med_h": "Наладка на партию, ч (медиана)",
-                "min_per_pc_med": "Мин/шт (медиана)", "stages": "Этапы", "outliers": "Исключено (наладка > 24 ч)"}),
-                use_container_width=True, hide_index=True,
-                column_config={"Наладка на партию, ч (медиана)": st.column_config.NumberColumn(format="%.2f"),
-                               "Мин/шт (медиана)": st.column_config.NumberColumn(format="%.2f")})
 
-    # ── 3. Оценка партии ───────────────────────────────────────────────
-    st.markdown(f"### 3. Оценка партии {n_pcs:,} шт (только станки)")
-    approx = False
-    if stats.empty and not hist.empty:
-        compression = p["prefix"] in ("FN", "D")
-        same = [k for k, v in parsed_all.items()
-                if v.get("key") and v.get("key") != key and v.get("type_code") == p["type_code"]
-                and (v.get("prefix") in ("FN", "D")) == compression
-                and v.get("ends") and p.get("ends")
-                and v["ends"][0].get("code") == p["ends"][0].get("code")]
-        similar = hist[hist["name"].isin(same)]
-        if not similar.empty:
-            stats = machine_stats(similar)
-            approx = True
-            st.caption("Оценка ориентировочная — по похожим артикулам того же типа и размера: "
-                       + ", ".join(sorted({parsed_all[n]['key'] for n in same})))
-    if stats.empty:
-        st.info("Нет данных для оценки: артикул и похожие на него (тот же тип и размер трубки) не выпускались.")
-    else:
-        est = stats.copy()
-        est["setup_med_h"] = est["setup_med_h"].fillna(0)
-        est["Часы"] = est["setup_med_h"] + n_pcs * est["min_per_pc_med"].fillna(0) / 60
-        est["Смен (8 ч)"] = est["Часы"] / 8
-        est["Сутки (2 смены)"] = est["Часы"] / SHIFT_HOURS_PER_DAY
-        st.dataframe(est[["machine", "setup_med_h", "min_per_pc_med", "Часы", "Смен (8 ч)", "Сутки (2 смены)"]]
-                     .rename(columns={"machine": "Станок", "setup_med_h": "Наладка, ч", "min_per_pc_med": "Мин/шт"}),
-                     use_container_width=True, hide_index=True,
-                     column_config={c: st.column_config.NumberColumn(format="%.1f")
-                                    for c in ["Наладка, ч", "Мин/шт", "Часы", "Смен (8 ч)", "Сутки (2 смены)"]})
-        tot = est["Часы"].sum()
-        st.metric("Итого станко-часов" + (" (ориентировочно)" if approx else ""), f"{tot:,.1f} ч",
-                  help=f"Если станки работают последовательно: ≈ {tot / SHIFT_HOURS_PER_DAY:.1f} сут "
-                       f"при {SHIFT_HOURS_PER_DAY:g} ч в сутки (2 смены по 8 ч минус пересменка).")
-        st.caption(f"Последовательно на станках ≈ **{tot / SHIFT_HOURS_PER_DAY:.1f} сут** "
-                   f"({SHIFT_HOURS_PER_DAY:g} ч/сут: 2 смены по 8 ч минус 30 мин пересменки). "
-                   "Медианы по прошлым партиям; партии с наладкой > 24 ч исключены как ошибки ввода.")
+    # ── 3. Оценка партии по маршруту ───────────────────────────────────
+    st.markdown(f"### 3. Оценка партии {n_pcs:,} шт по маршруту")
+    est = _route_section(q, p, key, h, hist, parsed_all, n_pcs)
 
     # ── 4. Торцы ───────────────────────────────────────────────────────
     st.markdown("### 4. Торцы: делали ли такие раньше")
@@ -829,6 +979,143 @@ def _tab_analysis(q, tx, audit):
                 st.rerun()
         elif not chosen:
             st.warning("Подходящих поковок в журнале нет.")
+
+    # ── 8. Себестоимость ───────────────────────────────────────────────
+    st.markdown(f"### 8. Себестоимость партии {n_pcs:,} шт")
+    if est is None:
+        st.info("Себестоимость считается по маршруту из раздела 3 — выберите маршрут.")
+        return
+    prices = {(r["kind"], (r.get("size") or "").strip()): r
+              for r in effective([dict(x, _k=f"{x['kind']}|{(x.get('size') or '').strip()}")
+                                  for x in q("SELECT * FROM tech_prices")], "_k", today).values()}
+    mrates = effective(q("SELECT * FROM tech_machine_rates"), "machine", today)
+    payroll = effective(q("SELECT * FROM tech_payroll"), "role", today)
+    wd = q("SELECT value FROM tech_settings WHERE key='work_days'", fetch="one")
+    work_days = float(wd["value"]) if wd and wd["value"] else 21.0
+    cb = cost_breakdown(p, art, n_pcs, est, prices, mrates, payroll, work_days)
+    df_c = pd.DataFrame([{"Статья": l["item"], "Сумма, ₽": l["amount"], "Нет данных": l["missing"] or "",
+                          "Как посчитано": l["how"]} for l in cb["lines"]])
+    st.dataframe(df_c, use_container_width=True, hide_index=True,
+                 column_config={"Сумма, ₽": st.column_config.NumberColumn(format="%.2f")})
+    c1, c2 = st.columns(2)
+    c1.metric("Итого на партию" + ("" if cb["complete"] else " (неполная)"), f"{cb['total']:,.2f} ₽")
+    c2.metric("На 1 шт" + ("" if cb["complete"] else " (неполная)"), f"{cb['per_piece']:,.2f} ₽")
+    if not cb["complete"]:
+        st.warning("Себестоимость неполная: часть статей без данных (столбец «Нет данных»). "
+                   "Цены, амортизацию и ФОТ можно внести на вкладке «💰 Цены и ставки».")
+    st.caption(f"Ставки: амортизация = сумма в месяц ÷ ({SHIFT_HOURS_PER_DAY:g} ч × {work_days:g} раб. дн.); "
+               f"ФОТ = ФОТ в месяц ÷ ({PERSON_HOURS_PER_DAY:g} ч × {work_days:g} раб. дн.). "
+               "Цены и ставки — действующие на сегодня (по дате начала действия).")
+
+
+def _tab_rates(q, tx, audit):
+    """Регистры для себестоимости: цены, амортизация станков, ФОТ, рабочие дни."""
+    st.caption("Все значения — с датой начала действия: в расчёте берётся последняя запись с датой не позже сегодняшней. "
+               "Старые записи не удаляйте — по ним видно, как менялись цены.")
+    wd = q("SELECT value FROM tech_settings WHERE key='work_days'", fetch="one")
+    cur = float(wd["value"]) if wd and wd["value"] else 21.0
+    c1, c2 = st.columns([1, 3])
+    new = c1.number_input("Рабочих дней в месяце", min_value=1.0, max_value=31.0, step=0.5, value=cur, key="tech_wd")
+    c2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    if c2.button("Сохранить рабочие дни", key="tech_wd_save") and new != cur:
+        with tx() as conn:
+            conn.execute("INSERT OR REPLACE INTO tech_settings (key, value) VALUES ('work_days', ?)", (f"{new:g}",))
+            audit(conn, "update", "tech_settings", None, {"work_days": cur}, {"work_days": new})
+        st.rerun()
+    st.caption(f"Ставка амортизации = сумма в месяц ÷ ({SHIFT_HOURS_PER_DAY:g} ч × рабочие дни); "
+               f"ставка ФОТ = ФОТ в месяц ÷ ({PERSON_HOURS_PER_DAY:g} ч × рабочие дни).")
+    _journal(q, tx, audit, "tech_prices", "Цены: металл, гайки, кольца, поковки",
+             ["kind", "size", "price", "valid_from", "notes"],
+             {"kind": "Что", "size": "Размер / обозначение", "price": "Цена, ₽", "valid_from": "Действует с",
+              "notes": "Примечание"},
+             help_text="Металл — одна цена за кг на все HEX (размер не заполнять). Гайки и кольца — по размеру трубки "
+                       "(12M, 8 …): на каждый обжимной торец исполнения SA — 1 гайка, 1 переднее и 1 заднее кольцо. "
+                       "Поковка — по обозначению (НЛПА8.031.009).",
+             selects={"kind": PRICE_KINDS}, nums=["price"], dates=["valid_from"])
+    machines = [r["name"] for r in q("SELECT name FROM machines WHERE COALESCE(is_work_center,0)=0 ORDER BY name")]
+    _journal(q, tx, audit, "tech_machine_rates", "Амортизация станков",
+             ["machine", "amort_month", "valid_from", "notes"],
+             {"machine": "Станок", "amort_month": "Амортизация в месяц, ₽", "valid_from": "Действует с",
+              "notes": "Примечание"},
+             selects={"machine": machines}, nums=["amort_month"], dates=["valid_from"])
+    _journal(q, tx, audit, "tech_payroll", "ФОТ",
+             ["role", "fot_month", "valid_from", "notes"],
+             {"role": "Роль", "fot_month": "ФОТ в месяц, ₽", "valid_from": "Действует с", "notes": "Примечание"},
+             help_text="Полный ФОТ на одного человека в месяц. Наладка оплачивается наладчику, выпуск — оператору.",
+             selects={"role": ["наладчик", "оператор"]}, nums=["fot_month"], dates=["valid_from"])
+
+
+def _route_section(q, p, key, h, hist, parsed_all, n_pcs):
+    """Выбор маршрута, нормы по станкам (история / похожий / вручную) и расчёт времени. Возвращает est или None."""
+    family = "forging" if p.get("forging") else "straight"
+    defined = [r for r in q("SELECT * FROM tech_routes ORDER BY is_default DESC, id") if r["family"] == family]
+    counts = pd.Series(batch_routes(h).values).value_counts().to_dict() if not h.empty else {}
+    options = []
+    for r in defined:
+        ms = parse_machines(r["machines"])
+        n = counts.get(frozenset(ms), 0)
+        options.append({"label": r["name"] + (f" · в истории {n} парт." if n else ""), "machines": ms,
+                        "parallel": bool(r["parallel"]), "n": n})
+    for ms_set, n in counts.items():
+        if not any(frozenset(o["machines"]) == ms_set for o in options):
+            options.append({"label": f"по истории: {' + '.join(sorted(ms_set))} · {n} парт.",
+                            "machines": tuple(sorted(ms_set)), "parallel": False, "n": n})
+    if not options:
+        st.info("Для этого вида фитинга не задано ни одного маршрута (вкладка «🛣 Маршруты»).")
+        return None
+    # по умолчанию: самый частый в истории из заданных маршрутов; если по ним не делали — маршрут «по умолчанию»
+    with_hist = [i for i in range(len(defined)) if options[i]["n"] > 0]
+    best = max(with_hist, key=lambda i: options[i]["n"]) if with_hist else 0
+    labels = [o["label"] for o in options]
+    sel = options[labels.index(st.selectbox("Маршрут", labels, index=best, key=f"route_{key}"))]
+    ms = sel["machines"]
+
+    # похожие артикулы: тот же тип и размер первого торца, то же семейство (обжимной / резьбовой)
+    compression = p["prefix"] in ("FN", "D")
+    same_names = [n for n, v in parsed_all.items()
+                  if v.get("key") and v.get("key") != key and v.get("type_code") == p["type_code"]
+                  and (v.get("prefix") in ("FN", "D")) == compression and v.get("ends") and p.get("ends")
+                  and v["ends"][0].get("code") == p["ends"][0].get("code")]
+    exact = route_stats(h, ms) if not h.empty else pd.DataFrame()
+    similar_h = hist[hist["name"].isin(same_names)] if not hist.empty else hist
+    sim = route_stats(similar_h, ms) if not similar_h.empty else pd.DataFrame()
+    sim_keys = sorted({parsed_all[n]["key"] for n in same_names
+                       if n in set(similar_h["name"])}) if not similar_h.empty else []
+    rows = []
+    for m in ms:
+        src, setup, mpc = None, None, None
+        for df_, label in ((exact, "история"), (sim, "похожий: " + ", ".join(sim_keys[:3]))):
+            if not df_.empty and m in set(df_["machine"]):
+                r = df_[df_["machine"] == m].iloc[0]
+                if not pd.isna(r["min_per_pc_med"]):
+                    src, mpc = f"{label} ({int(r['batches'])} парт.)", float(r["min_per_pc_med"])
+                    setup = None if pd.isna(r["setup_med_h"]) else float(r["setup_med_h"])
+                    break
+        if setup is None:
+            setup = DEFAULT_SETUP_H / len(ms)
+            src = (src + "; наладка по умолчанию" if src else f"нет статистики — введите мин/шт; наладка {DEFAULT_SETUP_H:g} ч на маршрут")
+        rows.append({"Станок": m, "Наладка, ч": round(setup, 2), "Мин/шт": None if mpc is None else round(mpc, 2),
+                     "Откуда": src})
+    st.caption("Нормы можно поправить прямо в таблице — расчёт и себестоимость пересчитаются.")
+    edited = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                            disabled=["Станок", "Откуда"], key=f"norms_{key}_{'+'.join(ms)}",
+                            column_config={"Наладка, ч": st.column_config.NumberColumn(min_value=0.0, step=0.25, format="%.2f"),
+                                           "Мин/шт": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.2f")})
+    est = route_estimate([{"machine": r["Станок"], "setup_h": r["Наладка, ч"], "min_pc": r["Мин/шт"]}
+                          for r in edited.to_dict("records")], n_pcs, sel["parallel"])
+    out = pd.DataFrame([{"Станок": r["machine"], "Наладка, ч": r["setup_h"], "Выпуск, ч": r["run_h"],
+                         "Всего, ч": r["total_h"]} for r in est["rows"]])
+    st.dataframe(out, use_container_width=True, hide_index=True,
+                 column_config={c: st.column_config.NumberColumn(format="%.1f") for c in ["Наладка, ч", "Выпуск, ч", "Всего, ч"]})
+    c1, c2 = st.columns(2)
+    c1.metric("Итого станко-часов", f"{est['machine_hours']:,.1f} ч")
+    c2.metric("Календарно", f"≈ {est['days']:.1f} сут",
+              help=("связка: станки работают одновременно, срок — по самому загруженному" if est["parallel"] and len(ms) > 1
+                    else "станки маршрута последовательно") + f"; {SHIFT_HOURS_PER_DAY:g} ч в сутки (2 смены по 8 ч минус пересменка)")
+    if not est["complete"]:
+        st.warning("Для части станков нет нормы мин/шт — введите её в таблице выше.")
+    st.caption("Медианы по партиям, сделанным ровно по этому маршруту; партии с наладкой > 24 ч исключены как ошибки ввода.")
+    return est
 
 
 def _save_article_field(tx, audit, key, fields: dict, source: str):
