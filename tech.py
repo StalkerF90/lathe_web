@@ -67,7 +67,7 @@ COMPRESSION_TYPES = {
     "LSW":  ("Угольник для приварки враструб",          ["tube", "weld"], "L"),
     "BUW":  ("Проходная муфта под приварку",            ["tube", "weld"], None),
     "P":    ("Заглушка",                                ["stub"], None),
-    "C":    ("Колпак",                                  ["nut"], None),
+    "C":    ("Колпак",                                  ["tube"], None),   # выточенный колпак + гайка и кольца
     "N":    ("Гайка",                                   ["nut"], None),
     "UBN":  ("Монтажная гайка",                         ["nut"], None),
     "CP":   ("Соединение для проходного канала",        ["tube", "tube"], None),
@@ -664,9 +664,12 @@ def effective(rows: list[dict], key_field: str, today: date) -> dict:
 
 
 def cost_breakdown(p: dict, art: dict | None, n_pcs: int, est: dict, prices: dict, mrates: dict,
-                   payroll: dict, work_days: float) -> dict:
+                   payroll: dict, work_days: float, with_components: bool | None = None) -> dict:
     """Себестоимость партии. prices: {(kind, size): row}; mrates: {machine: row}; payroll: {role: row}.
+    with_components: комплектовать гайками и кольцами (по умолчанию — исполнение «в сборе», A).
     Статья без данных → amount None (в итог не входит, показывается как «не задано»)."""
+    if with_components is None:
+        with_components = bool(p.get("assembled"))
     lines = []
     def add(item, how, amount, missing=None):
         lines.append({"item": item, "how": how, "amount": amount, "missing": missing})
@@ -694,8 +697,8 @@ def cost_breakdown(p: dict, art: dict | None, n_pcs: int, est: dict, prices: dic
                 add("Металл", f"{n_pcs:,} × ({ln:g}+{CUT_ALLOWANCE_MM:g}) мм = {need['meters']:,.2f} м · "
                               f"HEX {hex_mm:g} = {need['kg']:,.2f} кг × {pr:,.2f} ₽/кг", need["kg"] * pr)
 
-    # 2. Гайки и кольца — только исполнение «в сборе» (A): на каждый обжимной торец 1 гайка + 2 кольца
-    if p.get("assembled"):
+    # 2. Гайки и кольца (комплектация): на каждый обжимной торец 1 гайка + переднее и заднее кольцо
+    if with_components:
         tubes = [e["code"] for e in p.get("ends", []) if e.get("slot") == "tube" and e.get("code")]
         for kind in ("гайка", "кольцо переднее", "кольцо заднее"):
             missing = sorted({t for t in tubes if price(kind, t) is None})
@@ -992,7 +995,13 @@ def _tab_analysis(q, tx, audit):
     payroll = effective(q("SELECT * FROM tech_payroll"), "role", today)
     wd = q("SELECT value FROM tech_settings WHERE key='work_days'", fetch="one")
     work_days = float(wd["value"]) if wd and wd["value"] else 21.0
-    cb = cost_breakdown(p, art, n_pcs, est, prices, mrates, payroll, work_days)
+    n_tube = sum(1 for e in p.get("ends", []) if e.get("slot") == "tube")
+    with_comp = st.checkbox(
+        "Комплектовать гайками и кольцами" + (f" ({n_tube} обжимн. соединени{'е' if n_tube == 1 else 'я'})" if n_tube else ""),
+        value=bool(p.get("assembled")), key=f"cost_comp_{key}", disabled=not n_tube,
+        help="По умолчанию включено для исполнения «в сборе» (A, например -SA). На каждое обжимное соединение — "
+             "1 гайка, 1 переднее и 1 заднее кольцо по ценам из регистра.")
+    cb = cost_breakdown(p, art, n_pcs, est, prices, mrates, payroll, work_days, with_components=with_comp)
     df_c = pd.DataFrame([{"Статья": l["item"], "Сумма, ₽": l["amount"], "Нет данных": l["missing"] or "",
                           "Как посчитано": l["how"]} for l in cb["lines"]])
     st.dataframe(df_c, use_container_width=True, hide_index=True,
