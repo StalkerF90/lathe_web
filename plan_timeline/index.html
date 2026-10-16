@@ -77,7 +77,7 @@
     return String(d.getFullYear());
   }
 
-  var items = new vis.DataSet(), groups = new vis.DataSet(), timeline = null, windowKey = null, editable = true;
+  var items = new vis.DataSet(), groups = new vis.DataSet(), timeline = null, windowKey = null, editable = true, loaded = null;
   var msg = document.getElementById("msg");
 
   function build(args) {
@@ -107,6 +107,18 @@
     }
     timeline = new vis.Timeline(document.getElementById("tl"), items, groups, opts);
     timeline.on("changed", setHeight);
+    // прокрутили / изменили масштаб за пределы загруженного периода — просим Python догрузить полосы
+    var rangeTimer = null;
+    timeline.on("rangechanged", function (p) {
+      if (!p.byUser || !loaded) { return; }
+      clearTimeout(rangeTimer);
+      rangeTimer = setTimeout(function () {
+        if (p.start < parse(loaded.start) || p.end > parse(loaded.end)) {
+          msg.textContent = "Загрузка периода…";
+          setValue({ action: "range", start: fmt(p.start), end: fmt(p.end) });
+        }
+      }, 350);
+    });
     timeline.on("select", function (p) {
       if (p.items && p.items.length && String(p.items[0]).indexOf("bg") !== 0) {
         setValue({ action: "select", id: p.items[0] });
@@ -115,6 +127,7 @@
   }
 
   function render(args) {
+    loaded = args.loaded || null;                 // период, полосы которого переданы
     if (!timeline) { build(args); }
     editable = args.editable !== false;
     timeline.setOptions({ editable: editable ? { add: false, remove: false, updateTime: true, updateGroup: true, overrideItems: false } : false });

@@ -650,12 +650,25 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
     c1, c2, c3, c4 = st.columns([2, 2, 1.4, 3])
     today = date.today()
     d0 = c1.date_input("С даты", value=today - timedelta(days=today.weekday()), format="DD.MM.YYYY", key="plan_from")
-    span = c2.selectbox("Показать", ["1 неделя", "2 недели", "4 недели"], key="plan_span")
-    days = {"1 неделя": 7, "2 недели": 14, "4 недели": 28}[span]
-    d1 = d0 + timedelta(days=days - 1)
+    span = c2.selectbox("Показать", ["1 неделя", "2 недели", "4 недели", "весь план"], key="plan_span",
+                        help="Только что открыть: график можно прокручивать (перетаскиванием фона) и масштабировать "
+                             "(Ctrl + колесо) на любые даты — полосы догружаются сами. «Весь план» — от первой до последней полосы.")
     c3.markdown("<div style='height:30px'></div>", unsafe_allow_html=True)
     show_fact = c3.checkbox("Факт по истории", value=True, key="plan_show_fact",
                             help="Серо-зелёные полосы нижней дорожки — как закрытые партии реально шли по записям выпуска.")
+    shown = [i for i in items if show_fact or i["kind"] != FACT_KIND]
+    if span == "весь план" and shown:
+        d0 = min(_dt(i["start"]) for i in shown).date()
+        d1 = max(_dt(i["end"]) for i in shown).date()
+    else:
+        d1 = d0 + timedelta(days={"1 неделя": 7, "2 недели": 14, "4 недели": 28}.get(span, 14) - 1)
+    days = (d1 - d0).days + 1
+    # загруженный период: окно ± запас; расширяется, когда график прокручивают дальше (событие «range»)
+    vkey = f"{d0}|{d1}|{show_fact}"
+    rng = st.session_state.get("plan_range")
+    if not rng or rng[0] != vkey:
+        rng = (vkey, datetime.combine(d0 - timedelta(days=7), time(0)), datetime.combine(d1 + timedelta(days=21), time(0)))
+        st.session_state["plan_range"] = rng
     c4.caption("Перетаскивайте партии по времени и тяните за край, чтобы растянуть/сжать. "
                "Пересекающиеся партии сдвигаются вперёд, ремонт и обслуживание не двигаются. "
                "Серое — нерабочее время, красное — праздник.")
@@ -667,7 +680,7 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
     prog = progress(q, items)
     now_s = _s(datetime.now())
     e = html.escape
-    lo, hi = _s(datetime.combine(d0 - timedelta(days=7), time(0))), _s(datetime.combine(d1 + timedelta(days=21), time(0)))
+    lo, hi = _s(rng[1]), _s(rng[2])
     vis_items = []
     for it in items:
         if it["end"] < lo or it["start"] > hi:       # за пределами окна — не передаём (история — тысячи полос)
@@ -712,14 +725,21 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
                               "content": f"🔧 {e(it['kind'])}" + (f": {e(it['notes'])}" if it.get("notes") else ""),
                               "title": f"{e(it['kind'])}<br>{it['start']} → {it['end']}<br>{e(it.get('notes') or '')}",
                               "className": "kind-repair" if it["kind"] == "ремонт" else "kind-service"})
-    vis_items += _background(ctx, d0 - timedelta(days=7), d1 + timedelta(days=21))
+    vis_items += _background(ctx, rng[1].date(), rng[2].date())
     ev = _timeline(groups=groups, items=vis_items,
                    window={"key": f"{d0}|{days}", "start": f"{d0} 00:00", "end": f"{d1 + timedelta(days=1)} 00:00"},
+                   loaded={"start": lo, "end": hi},
                    selected=st.session_state.get("plan_sel"), key="plan_tl", default=None)
 
     if ev and ev.get("nonce") != st.session_state.get("plan_nonce"):
         st.session_state["plan_nonce"] = ev.get("nonce")
-        if ev.get("action") == "select":
+        if ev.get("action") == "range":              # прокрутили за загруженный период — расширяем с запасом
+            s_, e_ = _dt(ev["start"]), _dt(ev["end"])
+            pad = max(timedelta(days=7), (e_ - s_) / 2)
+            st.session_state["plan_range"] = (rng[0], min(rng[1], (s_ - pad).replace(hour=0, minute=0)),
+                                              max(rng[2], (e_ + pad).replace(hour=0, minute=0)))
+            st.rerun()
+        elif ev.get("action") == "select":
             st.session_state["plan_sel"] = ev.get("id")
             st.rerun()
         elif ev.get("action") == "move":
