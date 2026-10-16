@@ -513,7 +513,7 @@ def init_tables(c):
         CREATE TABLE IF NOT EXISTS tech_routes (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             name        TEXT NOT NULL,
-            family      TEXT NOT NULL,              -- straight (прямые) | forging (из поковки)
+            family      TEXT NOT NULL,              -- straight (прямые) | forging (из поковки) | other (любые детали)
             machines    TEXT NOT NULL,              -- станки через запятую в порядке установов
             parallel    INTEGER DEFAULT 0,          -- 1 = один оператор ведёт станки маршрута одновременно
             is_default  INTEGER DEFAULT 0,
@@ -553,6 +553,8 @@ def init_tables(c):
              "1-й установ на 235, 2-й на 2100; один оператор ведёт связку"),
             ("2105 (оба установа)", "straight", "Lathe 2105", 0, 0, "оба установа за один"),
             ("2100 (из поковки)", "forging", "Lathe 2100", 0, 1, "угольники, тройники, крестовины — только 2100"),
+            ("АПТ (оба установа)", "straight", "АПТ", 0, 0, "оба установа за один (FNP, FNU, FNMC, FNCP …)"),
+            ("MILL (фрезерные операции)", "other", "MILL", 0, 0, "корпуса кранов и другие детали; все операции на MILL"),
         ])
 
 
@@ -566,6 +568,22 @@ def add_months(d: date, months: int) -> date:
 # ═══════════════════════════════════════════════════════════════════════════
 #  ИСТОРИЯ ВЫПУСКА
 # ═══════════════════════════════════════════════════════════════════════════
+
+_DESIGNATION = re.compile(r"НЛПА\s*(\d+)\.(\d+)\.(\d+)", re.I)
+
+
+def part_key(name: str, parsed: dict | None = None) -> str | None:
+    """Ключ детали для истории и наладки: артикул фитинга, иначе чертёжное обозначение (НЛПА8.034.040 —
+    одинаково для «НЛПА8.034.040 / Корпус» и «НЛПА8.034.040_Корпус_VN8B…»), иначе название без регистра и пробелов."""
+    p = parsed if parsed is not None else parse_article(name or "")
+    if p.get("key"):
+        return p["key"]
+    m = _DESIGNATION.search(name or "")
+    if m:
+        return "НЛПА{}.{}.{}".format(*m.groups())
+    s = re.sub(r"\s+", " ", (name or "").strip()).upper()
+    return s or None
+
 
 def load_history(q) -> pd.DataFrame:
     """Все записи выпуска станков с распознанным ключом артикула."""
@@ -585,6 +603,8 @@ def load_history(q) -> pd.DataFrame:
         return df
     parsed = {n: parse_article(n) for n in df["name"].unique()}
     df["key"] = df["name"].map(lambda n: parsed[n].get("key"))
+    pkeys = {n: part_key(n, parsed[n]) for n in parsed}
+    df["pkey"] = df["name"].map(pkeys)               # фитинг — артикул, прочие детали — обозначение / название
     df.attrs["parsed"] = parsed
     return df
 
@@ -777,10 +797,11 @@ def page_tech(q, tx, audit):
                  ["name", "family", "machines", "parallel", "is_default", "notes"],
                  {"name": "Название", "family": "Вид", "machines": "Станки (через запятую, по установам)",
                   "parallel": "Связка (1 оператор)", "is_default": "По умолчанию", "notes": "Примечание"},
-                 help_text="Вид: straight — прямые фитинги из HEX, forging — из поковки (угольники, тройники, крестовины). "
+                 help_text="Вид: straight — прямые фитинги из HEX, forging — из поковки (угольники, тройники, крестовины), "
+                           "other — для любых деталей (предлагается всегда, например MILL для корпусов кранов). "
                            "Названия станков — как в справочнике станков. «Связка» — один оператор ведёт станки "
                            "одновременно: срок и оплата оператора считаются по самому загруженному станку.",
-                 selects={"family": ["straight", "forging"]}, bools=["parallel", "is_default"])
+                 selects={"family": ["straight", "forging", "other"]}, bools=["parallel", "is_default"])
     with t_g:
         _journal(q, tx, audit, "tech_gauges", "Калибры",
                  ["name", "serial", "inv_no", "maker", "calib_date", "interval_months", "next_date",
@@ -1118,7 +1139,7 @@ def _forging_price_form(q, tx, audit):
 def _route_section(q, p, key, h, hist, parsed_all, n_pcs):
     """Выбор маршрута, нормы по станкам (история / похожий / вручную) и расчёт времени. Возвращает est или None."""
     family = "forging" if p.get("forging") else "straight"
-    defined = [r for r in q("SELECT * FROM tech_routes ORDER BY is_default DESC, id") if r["family"] == family]
+    defined = [r for r in q("SELECT * FROM tech_routes ORDER BY is_default DESC, id") if r["family"] in (family, "other")]
     counts = pd.Series(batch_routes(h).values).value_counts().to_dict() if not h.empty else {}
     options = []
     for r in defined:
