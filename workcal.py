@@ -177,6 +177,24 @@ def add_work_hours(start: datetime, hours: float, shift_rows, calendar) -> datet
     return last
 
 
+def back_work_hours(t: datetime, hours: float, shift_rows, calendar) -> datetime:
+    """Самый поздний момент s ≤ t, от которого до t ровно hours рабочих часов (обратное к add_work_hours)."""
+    if hours <= 0:
+        return t
+    lo, hi = t - timedelta(days=max(3, int(hours / 4) + 10)), t
+    while work_hours_between(lo, t, shift_rows, calendar) < hours:
+        lo -= timedelta(days=30)
+    for _ in range(40):                              # бинарный поиск до секунды
+        mid = lo + (hi - lo) / 2
+        if work_hours_between(mid, t, shift_rows, calendar) >= hours:
+            lo = mid
+        else:
+            hi = mid
+        if (hi - lo).total_seconds() < 1:
+            break
+    return lo
+
+
 def first_start(from_dt: datetime, shift_rows, calendar, min_left_h: float = 2.0) -> datetime:
     """Первый момент ≥ from_dt, когда можно начать новую партию: до конца непрерывного периода работы
     (конец последней смены дня) должно оставаться не меньше min_left_h рабочих часов."""

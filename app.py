@@ -172,6 +172,51 @@ h1, h2, h3, h4           { color: #ffffff !important; }
     color: #e0e0f5 !important;
     border: 1px solid #3a3d5c !important;
 }
+/* кнопки по data-testid: кнопка с подсказкой (help=) обёрнута в tooltip-div, и «.stButton > button» её не ловит */
+button[data-testid="baseButton-secondary"],
+button[data-testid="baseButton-secondaryFormSubmit"] {
+    background: #252840 !important;
+    color: #e0e0f5 !important;
+    border: 1px solid #3a3d5c !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+}
+button[data-testid="baseButton-secondary"] p,
+button[data-testid="baseButton-secondaryFormSubmit"] p { color: #e0e0f5 !important; }
+button[data-testid="baseButton-primary"],
+button[data-testid="baseButton-primaryFormSubmit"] {
+    background: #7c6af7 !important;
+    color: #ffffff !important;
+    border: none !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+}
+button[data-testid="baseButton-primary"] p,
+button[data-testid="baseButton-primaryFormSubmit"] p { color: #ffffff !important; }
+button[data-testid^="baseButton"]:disabled { opacity: 0.45 !important; }
+/* всплывающие меню (st.popover) и кнопки форм: без правил были светлыми с белым текстом — невидимы */
+[data-testid="stPopover"] button,
+.stFormSubmitButton > button:not([kind="primaryFormSubmit"]) {
+    background: #252840 !important;
+    color: #e0e0f5 !important;
+    border: 1px solid #3a3d5c !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+}
+[data-testid="stPopover"] button p,
+[data-testid="stPopover"] button span,
+.stFormSubmitButton > button p { color: #e0e0f5 !important; }
+.stFormSubmitButton > button[kind="primaryFormSubmit"] {
+    background: #7c6af7 !important; color: #ffffff !important; border: none !important;
+    border-radius: 6px !important; font-weight: 600 !important;
+}
+.stFormSubmitButton > button[kind="primaryFormSubmit"] p { color: #ffffff !important; }
+[data-testid="stPopoverBody"] {
+    background: #1a1d2e !important;
+    border: 1px solid #3a3d5c !important;
+}
+[data-testid="stPopoverBody"] > div { background: transparent !important; }   /* внутренняя светлая подложка */
+[data-testid="stPopoverBody"] p, [data-testid="stPopoverBody"] label { color: #e0e0f5 !important; }
 .stDownloadButton > button {
     background: #252840 !important;
     color: #e0e0f5 !important;
@@ -357,6 +402,9 @@ def init_db():
     # stage_name — название этапа/операции (например «1 установ», «маркировка»)
     if "stage_name" not in existing_cols:
         c.execute("ALTER TABLE production ADD COLUMN stage_name TEXT DEFAULT NULL")
+    # end_key — какой торец фитинга делался на этом установе (tube:12M, male:8N …); для статистики по торцам
+    if "end_key" not in existing_cols:
+        c.execute("ALTER TABLE production ADD COLUMN end_key TEXT DEFAULT NULL")
 
     # ── Таблица партий (batches) ──────────────────────────────────────
     # Полноценная управляемая сущность партий.
@@ -1106,6 +1154,7 @@ def page_machines(role):
 
         stage_confirmed = True    # разрешает/блокирует кнопку «Записать»
         confirmed_stage = ""      # итоговое значение этапа для INSERT
+        end_choice = ""           # торец установа (235 / 2100), "" — не указан
 
         if not is_wc:
             # ── Станок ──────────────────────────────────────────────────
@@ -1119,6 +1168,26 @@ def page_machines(role):
             confirmed_stage = normalize_stage(stage_input)
             # Сброс ОПТА-флагов если переключились на станок
             st.session_state.pop(f"{PF}stage_choice", None)
+            # Какой торец делается на этом установе — на станках, где фитинг делается по торцам (235, 2100)
+            if machine_nm in tech.per_end_machines(q) and batch_no_stripped:
+                _bname = (bm_record or {}).get("batch_name") or new_batch_name_val
+                _ends = [e for e in (tech.parse_article(_bname).get("ends") or []) if e.get("kind")] if _bname else []
+                if _ends:
+                    _labels = {tech.end_key(e): tech.end_label(e) for e in _ends}
+                    _opts = [""] + list(_labels)
+                    _ek = f"{PF}end_{batch_no_stripped}_{sel_machine}"
+                    if _ek not in st.session_state:  # по умолчанию — торец прошлой записи этой партии на этом станке
+                        _prev = q("SELECT end_key FROM production WHERE batch_number=? AND machine_id=? "
+                                  "AND COALESCE(end_key,'')<>'' ORDER BY id DESC LIMIT 1",
+                                  (batch_no_stripped, sel_machine), fetch="one")
+                        if _prev and _prev["end_key"] in _opts:
+                            st.session_state[_ek] = _prev["end_key"]
+                    ec1, _ = st.columns([3, 4])
+                    end_choice = ec1.selectbox(
+                        "Торец на этом установе", _opts, key=_ek,
+                        format_func=lambda x: "— не указано —" if x == "" else _labels.get(x, x),
+                        help="Какой торец фитинга обрабатывается в этом установе. По записям с указанным торцом "
+                             "копится статистика «мин/шт на торец» — по ней оцениваются новые фитинги.")
         else:
             # ── ОПТА ────────────────────────────────────────────────────
             auto_stage = machine_nm  # эталон из БД
@@ -1240,15 +1309,15 @@ def page_machines(role):
                 (date, machine_id, operator_id, batch, batch_number,
                  setup_time, produced_qty, actual_time,
                  actual_duration_minutes, record_type, is_final_release,
-                 stage_name, notes)
-                VALUES (?,?,?,?,?,?,?,?,?,'production',?,?,?)
+                 stage_name, notes, end_key)
+                VALUES (?,?,?,?,?,?,?,?,?,'production',?,?,?,?)
             """, (prod_date.isoformat(), sel_machine,
                   sel_operator if sel_operator else None,
                   used_batch_name, batch_no_stripped,
                   setup_time, produced_qty, plan_h, fact_min,
                   1 if is_final else 0,
                   confirmed_stage or None,
-                  notes_prod))
+                  notes_prod, (end_choice or None) if not is_wc else None))
 
             # ── Сообщение об успехе ─────────────────────────────────────
             stage_lbl = f" | этап «{confirmed_stage}»" if confirmed_stage else ""
@@ -1265,11 +1334,12 @@ def page_machines(role):
                 if fact_min:
                     msg += f" | факт {fact_min:.0f} мин"
             # ── Сброс полей формы: новое поколение ключей ───────────────
-            # Количество, наладка, время, примечание и «финальный» очищаются; станок, оператор,
-            # дата и этап переносятся в новую форму — следующую запись обычно вносят на том же станке.
+            # Наладка, время, примечание и «финальный» очищаются; станок, оператор, дата, этап и количество
+            # переносятся в новую форму — следующую запись (на том же станке или следующий этап партии,
+            # например пассивацию того же количества) вносят без повторного ввода.
             st.session_state["pf_flash"] = msg
             keep = {"machine": sel_machine, "operator": sel_operator, "date": prod_date,
-                    "machine_prev": sel_machine}
+                    "machine_prev": sel_machine, "qty": produced_qty}
             if not is_wc and confirmed_stage:
                 keep["stage_lathe"] = confirmed_stage
             for _k in [k for k in st.session_state if k.startswith(PF)]:
@@ -1646,6 +1716,20 @@ def _render_edit_record_form():
             e_final  = ef3.checkbox(
                 "✅ Финальный выпуск",
                 value=bool(rec.get("is_final_release") or False))
+            # Торец установа (для станков, где фитинг делается по торцам) — можно дозаполнить в старых записях
+            _bn_rec = get_batch(rec.get("batch_number") or "")
+            _bname_e = (_bn_rec or {}).get("batch_name") or rec.get("batch") or ""
+            _ends_e = [e for e in (tech.parse_article(_bname_e).get("ends") or []) if e.get("kind")] if _bname_e else []
+            _lab_e = {tech.end_key(e): tech.end_label(e) for e in _ends_e}
+            _cur_end = rec.get("end_key") or ""
+            if _cur_end and _cur_end not in _lab_e:
+                _lab_e[_cur_end] = _cur_end
+            e_end = _cur_end
+            if _lab_e:
+                _opts_e = [""] + list(_lab_e)
+                e_end = st.selectbox("Торец на этом установе (235 / 2100)", _opts_e, index=_opts_e.index(_cur_end),
+                                     format_func=lambda x: "— не указано —" if x == "" else _lab_e.get(x, x),
+                                     help="По записям с указанным торцом копится статистика «мин/шт на торец».")
 
             submitted = st.form_submit_button("📋 Подготовить изменение", type="primary",
                                                use_container_width=True)
@@ -1667,6 +1751,7 @@ def _render_edit_record_form():
                     "stage_name":               e_stage.strip() or None,
                     "notes":                    e_notes,
                     "is_final_release":         1 if e_final else 0,
+                    "end_key":                  e_end or None,
                 }
 
         # Шаг 3: подтверждение
@@ -1705,7 +1790,8 @@ def _render_edit_record_form():
                             repair_duration_hours    = ?,
                             stage_name               = ?,
                             notes                    = ?,
-                            is_final_release         = ?
+                            is_final_release         = ?,
+                            end_key                  = ?
                         WHERE id = ?
                     """
                     update_params = (
@@ -1723,6 +1809,7 @@ def _render_edit_record_form():
                         draft["stage_name"],
                         draft["notes"],
                         draft["is_final_release"],
+                        draft.get("end_key"),
                         draft["id"],
                     )
                     with tx() as conn:

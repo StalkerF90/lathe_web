@@ -545,8 +545,19 @@ def init_tables(c):
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+        CREATE TABLE IF NOT EXISTS tech_end_norms (     -- справочник: время на торец на станке (235, 2100 …)
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine   TEXT NOT NULL,
+            end_slot  TEXT NOT NULL,                    -- обжимной (трубка) | наружная резьба | внутренняя резьба …
+            end_size  TEXT NOT NULL,                    -- 12M, 8 (1/2"), 8N, M20x1.5
+            min_pc    REAL,                             -- минут на штуку на этот торец
+            notes     TEXT DEFAULT ''
+        );
     """)
     c.execute("INSERT OR IGNORE INTO tech_settings (key, value) VALUES ('work_days', '21')")
+    if "offsets" not in [r[1] for r in c.execute("PRAGMA table_info(tech_routes)")]:
+        # сдвиг старта станков связки в рабочих часах: «Lathe 235=2» — 235 начинает через 2 ч после 2100
+        c.execute("ALTER TABLE tech_routes ADD COLUMN offsets TEXT DEFAULT ''")
     if c.execute("SELECT COUNT(*) FROM tech_routes").fetchone()[0] == 0:
         c.executemany("INSERT INTO tech_routes (name, family, machines, parallel, is_default, notes) VALUES (?,?,?,?,?,?)", [
             ("235 + 2100 (1-й и 2-й установ)", "straight", "Lathe 235, Lathe 2100", 1, 1,
@@ -592,7 +603,7 @@ def load_history(q) -> pd.DataFrame:
                b.total_qty, m.name AS machine, COALESCE(m.is_work_center,0) AS wc,
                COALESCE(p.produced_qty,0) AS qty, COALESCE(p.setup_time,0) AS setup_h,
                COALESCE(p.actual_duration_minutes,0) AS fact_min, p.stage_name,
-               COALESCE(p.is_final_release,0) AS fin
+               COALESCE(p.is_final_release,0) AS fin, p.end_key
         FROM production p
         LEFT JOIN machines m ON m.id = p.machine_id
         LEFT JOIN batches  b ON b.batch_number = p.batch_number
@@ -606,6 +617,10 @@ def load_history(q) -> pd.DataFrame:
     pkeys = {n: part_key(n, parsed[n]) for n in parsed}
     df["pkey"] = df["name"].map(pkeys)               # фитинг — артикул, прочие детали — обозначение / название
     df.attrs["parsed"] = parsed
+    try:                                             # справочник норм по торцам — рядом с историей для route_norms
+        df.attrs["end_ref"] = end_ref_rows(q("SELECT * FROM tech_end_norms"))
+    except Exception:
+        df.attrs["end_ref"] = {}
     return df
 
 
@@ -649,6 +664,26 @@ def route_stats(h: pd.DataFrame, machines) -> pd.DataFrame:
 
 def parse_machines(text: str) -> tuple:
     return tuple(m.strip() for m in (text or "").split(",") if m.strip())
+
+
+def parse_offsets(text: str, machines) -> dict:
+    """«Lathe 235=2; 2100=0» → {станок: часы ≥ 0} для станков маршрута (можно короче: «235=2»).
+    Нераспознанное игнорируется; станки без сдвига — 0."""
+    out = {m: 0.0 for m in machines}
+    for part in re.split(r"[;\n]", text or ""):
+        if "=" not in part and ":" not in part:
+            continue
+        k, v = re.split(r"[=:]", part, maxsplit=1)
+        k = k.strip().lower()
+        hit = [m for m in machines if m.lower() == k or m.lower().endswith(" " + k)]
+        try:
+            val = float(v.strip().replace(",", "."))
+        except ValueError:
+            continue
+        if len(hit) == 1 and val >= 0:
+            out[hit[0]] = val
+    lo = min(out.values()) if out else 0
+    return {m: v - lo for m, v in out.items()}       # хотя бы один станок начинает без сдвига
 
 
 def machine_hours_per_day(q, day: date | None = None) -> float:
@@ -785,22 +820,27 @@ def page_tech(q, tx, audit):
         st.error("⛔ Технологический модуль доступен только администратору.")
         st.stop()
     st.title("🛠 Технология")
-    t_an, t_c, t_r, t_g, t_m, t_f, t_a, t_e = st.tabs(
-        ["🔍 Анализ артикула", "💰 Цены и ставки", "🛣 Маршруты", "📏 Калибры", "🔩 Металл", "🧱 Поковки",
-         "📚 Артикулы", "🔧 Торцы"])
+    t_an, t_c, t_r, t_n, t_g, t_m, t_f, t_a, t_e = st.tabs(
+        ["🔍 Анализ артикула", "💰 Цены и ставки", "🛣 Маршруты", "⏱ Нормы по торцам", "📏 Калибры", "🔩 Металл",
+         "🧱 Поковки", "📚 Артикулы", "🔧 Торцы"])
     with t_an:
         _tab_analysis(q, tx, audit)
+    with t_n:
+        _tab_end_norms(q, tx, audit)
     with t_c:
         _tab_rates(q, tx, audit)
     with t_r:
         _journal(q, tx, audit, "tech_routes", "Маршруты",
-                 ["name", "family", "machines", "parallel", "is_default", "notes"],
+                 ["name", "family", "machines", "parallel", "offsets", "is_default", "notes"],
                  {"name": "Название", "family": "Вид", "machines": "Станки (через запятую, по установам)",
-                  "parallel": "Связка (1 оператор)", "is_default": "По умолчанию", "notes": "Примечание"},
+                  "parallel": "Связка (1 оператор)", "offsets": "Сдвиг старта, ч (Lathe 235=2)",
+                  "is_default": "По умолчанию", "notes": "Примечание"},
                  help_text="Вид: straight — прямые фитинги из HEX, forging — из поковки (угольники, тройники, крестовины), "
                            "other — для любых деталей (предлагается всегда, например MILL для корпусов кранов). "
                            "Названия станков — как в справочнике станков. «Связка» — один оператор ведёт станки "
-                           "одновременно: срок и оплата оператора считаются по самому загруженному станку.",
+                           "одновременно: срок и оплата оператора считаются по самому загруженному станку. "
+                           "«Сдвиг старта» — для связки: какой станок начинает позже и на сколько рабочих часов "
+                           "(например «Lathe 235=2»: 2100 начинает, 235 подхватывает через 2 ч); пусто — одновременно.",
                  selects={"family": ["straight", "forging", "other"]}, bools=["parallel", "is_default"])
     with t_g:
         _journal(q, tx, audit, "tech_gauges", "Калибры",
@@ -1052,6 +1092,42 @@ def _tab_analysis(q, tx, audit):
                "Цены и ставки — действующие на сегодня (по дате начала действия).")
 
 
+def _tab_end_norms(q, tx, audit):
+    """Справочник времени на торец по станкам + статистика по записям выпуска с указанным торцом."""
+    st.caption("Когда по артикулу нет истории выпуска (и нет похожих), норма станка берётся по торцам: сначала из "
+               "статистики по записям выпуска, где указан торец, затем из этого справочника, и только если нет и его — "
+               "оценкой по партиям с такими же торцами. На 235 и 2100 установ = один торец; для 2105 / АПТ можно "
+               "занести время каждого торца — норма станка будет суммой по торцам фитинга.")
+    machines = [r["name"] for r in q("SELECT name FROM machines WHERE COALESCE(is_work_center,0)=0 ORDER BY name")]
+    _journal(q, tx, audit, "tech_end_norms", "Справочник: время на торец",
+             ["machine", "end_slot", "end_size", "min_pc", "notes"],
+             {"machine": "Станок", "end_slot": "Торец", "end_size": "Размер (код)", "min_pc": "Мин/шт",
+              "notes": "Примечание"},
+             help_text="Размер — как в артикуле: трубка 12M (мм) или 8 (дюймовый код, 8 = 1/2\"), резьба 8N (1/2\" NPT), "
+                       "4G (1/4\" BSPP), метрическая M20x1.5. Мин/шт — время на этот торец на одну штуку, без наладки.",
+             selects={"machine": machines, "end_slot": list(SLOT_RU.values())}, nums=["min_pc"])
+    hist = load_history(q)
+    stats = end_stats(hist)
+    st.markdown("#### Статистика по торцам (записи выпуска с указанным торцом)")
+    if stats:
+        st.dataframe(pd.DataFrame([{"Станок": m, "Торец": k.split(":", 1)[1], "Вид": SLOT_RU.get(k.split(":", 1)[0], k),
+                                    "Мин/шт (медиана)": v["min_pc"], "Партий": v["batches"]}
+                                   for (m, k), v in sorted(stats.items())]), use_container_width=True, hide_index=True)
+    else:
+        st.info("Пока нет записей выпуска с указанным торцом. Торец выбирается при внесении выпуска на станках, "
+                "где фитинг делается по установам (сейчас: " + ", ".join(sorted(per_end_machines(q))) + ").")
+    with st.expander("Какие торцы встречаются в истории (подсказка по кодам)"):
+        seen = {}
+        for name, v in (hist.attrs.get("parsed", {}) if not hist.empty else {}).items():
+            for e in v.get("ends") or []:
+                k = end_key(e)
+                if k:
+                    seen.setdefault(k, {"label": end_label(e), "arts": set()})["arts"].add(v.get("key") or name)
+        st.dataframe(pd.DataFrame([{"Вид": SLOT_RU.get(k.split(":", 1)[0], k), "Код": k.split(":", 1)[1],
+                                    "Торец": s["label"], "Артикулов": len(s["arts"])}
+                                   for k, s in sorted(seen.items())]), use_container_width=True, hide_index=True)
+
+
 def _tab_rates(q, tx, audit):
     """Регистры для себестоимости: цены, амортизация станков, ФОТ, рабочие дни."""
     st.caption("Все значения — с датой начала действия: в расчёте берётся последняя запись с датой не позже сегодняшней. "
@@ -1199,6 +1275,86 @@ def _route_section(q, p, key, h, hist, parsed_all, n_pcs):
     return est
 
 
+def per_end_machines(q) -> set:
+    """Станки, на которых фитинг делается по торцам (установ = торец): станки маршрутов из нескольких станков
+    (сейчас 235 + 2100). На 2105 / АПТ фитинг делается целиком."""
+    try:
+        return {m for r in q("SELECT machines FROM tech_routes") for m in parse_machines(r["machines"])
+                if len(parse_machines(r["machines"])) > 1}
+    except Exception:
+        return set()
+
+
+SLOT_RU = {"tube": "обжимной (трубка)", "male": "наружная резьба", "female": "внутренняя резьба",
+           "stub": "трубный хвостовик", "nut": "гайка", "weld": "под приварку"}
+RU_SLOT = {v: k for k, v in SLOT_RU.items()}
+
+
+def norm_end_code(code: str) -> str:
+    """Размер торца из справочника → как в ключе торца: «m20x1,5» → M20x1.5, «12м» → 12M, «8n» → 8N."""
+    s = (code or "").strip().upper().replace("М", "M").replace("Х", "X").replace("×", "X").replace(",", ".")
+    m = re.fullmatch(r"M(\d+)X(\d+(?:\.\d+)?)", s)
+    if m:
+        return f"M{int(m.group(1))}x{float(m.group(2)):g}"
+    return s
+
+
+def end_ref_rows(rows: list[dict]) -> dict:
+    """Справочник tech_end_norms → {(станок, ключ торца): строка}."""
+    out = {}
+    for r in rows or []:
+        slot = RU_SLOT.get((r.get("end_slot") or "").strip(), (r.get("end_slot") or "").strip())
+        code = norm_end_code(r.get("end_size") or "")
+        if r.get("machine") and slot and code and r.get("min_pc") not in (None, ""):
+            out[(r["machine"].strip(), f"{slot}:{code}")] = r
+    return out
+
+
+def end_stats(hist: pd.DataFrame) -> dict:
+    """Статистика по торцам из записей выпуска с указанным торцом: {(станок, торец): {'min_pc', 'batches'}}.
+    По партии: минуты ÷ штуки записей этого торца; по партиям — медиана."""
+    if hist is None or hist.empty or "end_key" not in hist:
+        return {}
+    h = hist[(hist["wc"] == 0) & hist["end_key"].notna() & (hist["end_key"] != "") & (hist["qty"] > 0)]
+    if h.empty:
+        return {}
+    g = h.groupby(["machine", "end_key", "batch_number"]).agg(m=("fact_min", "sum"), q=("qty", "sum")).reset_index()
+    g = g[(g["m"] > 0) & (g["q"] > 0)]
+    g["mpc"] = g["m"] / g["q"]
+    out = {}
+    for (m, k), grp in g.groupby(["machine", "end_key"]):
+        out[(m, k)] = {"min_pc": round(float(grp["mpc"].median()), 2), "batches": int(len(grp))}
+    return out
+
+
+def end_norms(p: dict, ms, stats: dict, ref: dict) -> dict:
+    """Нормы маршрута по торцам: статистика по торцам, иначе справочник. Маршрут из нескольких станков —
+    по торцу на станок (подбирается раскладка торцов, для которой есть данные; сначала в порядке артикула);
+    один станок — сумма по всем торцам. → {станок: (мин/шт, источник)} или {}."""
+    import itertools
+    ends = list(dict.fromkeys(end_key(e) for e in (p.get("ends") or []) if e.get("kind")))
+    if not ends:
+        return {}
+    def look(m, k):
+        if (m, k) in stats:
+            s = stats[(m, k)]
+            return s["min_pc"], f"{k.split(':', 1)[1]} — статистика по торцу ({s['batches']} парт.)"
+        if (m, k) in ref:
+            return float(ref[(m, k)]["min_pc"]), f"{k.split(':', 1)[1]} — справочник"
+        return None
+    if len(ms) == 1:
+        vals = [look(ms[0], k) for k in ends]
+        if all(vals):
+            return {ms[0]: (round(sum(v[0] for v in vals), 2), "по торцам: " + "; ".join(v[1] for v in vals))}
+        return {}
+    if len(ms) == len(ends):
+        for perm in itertools.permutations(ends):
+            vals = [look(m, k) for m, k in zip(ms, perm)]
+            if all(vals):
+                return {m: (v[0], "по торцам: " + v[1]) for m, v in zip(ms, vals)}
+    return {}
+
+
 def _end_size_mm(e: dict) -> float | None:
     """Размер торца в мм для поиска ближайшего: трубка 10M → 10, дюймовые коды (8 = 1/2") → n/16", M14×1,5 → 14."""
     if e.get("kind") == "metric":
@@ -1313,7 +1469,7 @@ def route_norms(p, key, h, hist, parsed_all, ms) -> list[dict]:
     sim_keys = sorted({parsed_all[n]["key"] for n in same_names
                        if n in set(similar_h["name"])}) if not similar_h.empty else []
     rows = []
-    est = None
+    est = by_end = None
     for m in ms:
         src, setup, mpc = None, None, None
         for df_, label in ((exact, "история"), (sim, "похожий: " + ", ".join(sim_keys[:3]))):
@@ -1323,7 +1479,12 @@ def route_norms(p, key, h, hist, parsed_all, ms) -> list[dict]:
                     src, mpc = f"{label} ({int(r['batches'])} парт.)", float(r["min_per_pc_med"])
                     setup = None if pd.isna(r["setup_med_h"]) else float(r["setup_med_h"])
                     break
-        if mpc is None:                              # ни истории, ни похожего — оценка по торцам
+        if mpc is None:                              # ни истории, ни похожего — статистика по торцам / справочник
+            if by_end is None:
+                by_end = end_norms(p, ms, end_stats(hist), (hist.attrs.get("end_ref") if hist is not None else None) or {})
+            if m in by_end:
+                mpc, src = by_end[m]
+        if mpc is None:                              # и их нет — оценка по торцам из истории партий
             if est is None:
                 est = end_estimate(p, hist, parsed_all, ms) or {}
             hit = next((r for r in est.get("rows", []) if r["machine"] == m), None)

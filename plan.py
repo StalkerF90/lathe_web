@@ -111,6 +111,8 @@ def init_tables(c):
         c.execute("ALTER TABLE plan_items ADD COLUMN due_date TEXT")
     if "setup_manual" not in cols:                  # наладка, заданная вручную (0 — без наладки); NULL — по правилам
         c.execute("ALTER TABLE plan_items ADD COLUMN setup_manual REAL")
+    if "offset_h" not in cols:                      # сдвиг старта станка в связке, рабочих часов (0 / NULL — сразу)
+        c.execute("ALTER TABLE plan_items ADD COLUMN offset_h REAL")
     c.execute("INSERT OR IGNORE INTO plan_settings (key, value) VALUES ('machines', ?)", (", ".join(DEFAULT_MACHINES),))
     c.execute("INSERT OR IGNORE INTO plan_settings (key, value) VALUES ('saturday_shifts', ?)", (str(workcal.DEFAULT_SAT_SHIFTS),))
     if c.execute("SELECT COUNT(*) FROM plan_shifts").fetchone()[0] == 0:
@@ -216,17 +218,44 @@ def _overlap_end(busy: dict, machine: str, s: datetime, e: datetime):
     return max(hit) if hit else None
 
 
+def _off(it: dict) -> float:
+    """Сдвиг старта станка в связке, рабочих часов (0 — начинает вместе с началом связки)."""
+    try:
+        return max(0.0, float(it.get("offset_h") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def unit_times(unit: list[dict], s: datetime, shifts, cal) -> dict:
+    """Старт и окончание каждого станка постановки при начале связки s: {id(it): (start, end)}."""
+    out = {}
+    for it in unit:
+        st_ = s if _off(it) == 0 else _rm(workcal.add_work_hours(s, _off(it), shifts, cal))
+        out[id(it)] = (st_, _rm(workcal.add_work_hours(st_, item_hours(it), shifts, cal)))
+    return out
+
+
+def unit_base(unit: list[dict]) -> datetime:
+    """Начало связки — старт станков без сдвига (у одиночной позиции — её старт)."""
+    lo = min(_off(it) for it in unit)
+    return min(_dt(it["start"]) for it in unit if _off(it) == lo)
+
+
 def place_unit(unit: list[dict], earliest: datetime, busy: dict, shifts, cal) -> datetime:
-    """Первый допустимый старт ≥ earliest: правило 2 ч, общий старт для связки, без пересечений."""
+    """Первый допустимый старт связки ≥ earliest: правило 2 ч, станки — со своими сдвигами, без пересечений."""
     t = earliest
     for _ in range(2000):
         s = _rm(workcal.first_start(t, shifts, cal, MIN_LEFT_H))
         conflict = None
         for it in unit:
-            e = _rm(workcal.add_work_hours(s, item_hours(it), shifts, cal))
-            ce = _overlap_end(busy, it["machine"], s, max(e, s + timedelta(minutes=1)))
-            if ce is not None and (conflict is None or ce > conflict):
-                conflict = ce
+            st_, e = unit_times([it], s, shifts, cal)[id(it)]
+            ce = _overlap_end(busy, it["machine"], st_, max(e, st_ + timedelta(minutes=1)))
+            if ce is not None:
+                # сдвинуть начало связки так, чтобы этот станок стартовал не раньше конца занятости
+                need = ce if _off(it) == 0 else workcal.back_work_hours(ce, _off(it), shifts, cal)
+                need = max(need, s + timedelta(minutes=1))
+                if conflict is None or need > conflict:
+                    conflict = need
         if conflict is None:
             return s
         t = conflict
@@ -250,14 +279,15 @@ def reflow(items: list[dict], ctx: dict, arts: dict, made_hist: set, anchor_grp=
         return any((anchor_grp and it.get("grp") == anchor_grp) or (anchor_id and it.get("id") == anchor_id) for it in u)
 
     for _ in range(6):                               # наладка зависит от порядка → до стабилизации
-        order = sorted(units, key=lambda u: (not is_anchor(u), min(_dt(it["start"]) for it in u), u[0].get("id") or 0))
+        order = sorted(units, key=lambda u: (not is_anchor(u), unit_base(u), u[0].get("id") or 0))
         busy = {m: list(v) for m, v in fixed.items()}
         for u in order:
-            s = place_unit(u, min(_dt(it["start"]) for it in u), busy, shifts, cal)
+            s = place_unit(u, unit_base(u), busy, shifts, cal)
+            tm = unit_times(u, s, shifts, cal)
             for it in u:
-                e = _rm(workcal.add_work_hours(s, item_hours(it), shifts, cal))
-                it["start"], it["end"] = _s(s), _s(e)
-                busy.setdefault(it["machine"], []).append((s, e))
+                st_, e = tm[id(it)]
+                it["start"], it["end"] = _s(st_), _s(e)
+                busy.setdefault(it["machine"], []).append((st_, e))
         # наладка по фактическому порядку на станке
         changed = False
         made = set(made_hist)
@@ -292,8 +322,9 @@ def conflicts(items: list[dict]) -> list[str]:
         for a, b in zip(lst, lst[1:]):
             if _dt(b["start"]) < _dt(a["end"]):
                 out.append(f"{m}: «{label(a)}» и «{label(b)}» пересекаются")
-    for u in units_of(items):
-        if len(u) > 1 and len({it["start"] for it in u}) > 1:
+    for u in units_of(items):                        # станки связки без сдвига — в один момент
+        lo = min(_off(it) for it in u)
+        if len(u) > 1 and len({it["start"] for it in u if _off(it) == lo}) > 1:
             out.append(f"связка {label(u[0])}: станки стартуют не одновременно")
     return out
 
@@ -536,7 +567,7 @@ def made_from_history(hist: pd.DataFrame) -> set:
 def save_items(tx, audit, before: list[dict], after: list[dict], new_items=(), deleted_ids=()):
     """Записывает изменения плана одной транзакцией (с журналом изменений)."""
     cols = ["kind", "batch_number", "qty", "machine", "grp", "linked", "route", "start", "end", "setup_h", "setup_why",
-            "min_pc", "run_h", "hours_manual", "notes", "order_id", "due_date", "setup_manual"]
+            "min_pc", "run_h", "hours_manual", "notes", "order_id", "due_date", "setup_manual", "offset_h"]
     old = {it["id"]: it for it in before if it.get("id")}
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     qc = lambda c: {"start": "start_at", "end": "end_at"}.get(c, c)
@@ -724,6 +755,8 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
             content = (f"{name} · {it['qty'] or 0} шт" + (f" · {sp}%" if sd else "")
                        + (" ✔" if pr["pct"] >= 100 else "") + (" ✋" if it.get("hours_manual") is not None else ""))
             title = (f"{name}<br>{it['qty'] or 0} шт · {e(it['route'] or '')}<br>"
+                     + (f"старт через {_off(it):g} ч после начала связки<br>" if _off(it) else "")
+                     + f""
                      f"{it['start']} → {it['end']}<br>наладка {it['setup_h'] or 0:g} ч ({e(it['setup_why'] or '')}), "
                      f"выпуск {it['run_h'] or 0:.1f} ч" + (f"<br>длительность задана вручную: {hrs:.1f} ч"
                                                          if it.get("hours_manual") is not None else "")
@@ -833,8 +866,10 @@ def _on_move(q, tx, audit, ctx, items, arts, made, ev):
                     i["hours_manual"] = _minutes_h(hrs)
         unit = [i for i in new if (it.get("linked") and i.get("grp") == it.get("grp") and i["kind"] == "партия")
                 or i["id"] == it["id"]]
+        # перетащили станок со сдвигом старта — начало связки на столько рабочих часов раньше
+        base = s if _off(it) == 0 or len(unit) == 1 else workcal.back_work_hours(s, _off(it), ctx["shifts"], ctx["cal"])
         for i in unit:
-            i["start"] = _s(s)
+            i["start"] = _s(base)
     return apply_change(q, tx, audit, ctx, items, arts, made, changed=new,
                         anchor_grp=it.get("grp") if it.get("linked") else None, anchor_id=it["id"])
 
@@ -848,10 +883,14 @@ def apply_edit(items: list[dict], unit_ids: set, qty: int, per_machine: dict, no
     Если меняется то, от чего зависит длительность, ручная длительность (растягивание) сбрасывается.
     → (новый план, сброшена ли ручная длительность)."""
     new, reset = [], False
+    offs = {m: (v[3] if len(v) > 3 else None) for m, v in per_machine.items()}
+    if len(offs) > 1 and all(v is not None for v in offs.values()):
+        lo = min(float(v) for v in offs.values())    # хотя бы один станок связки — без сдвига
+        offs = {m: float(v) - lo for m, v in offs.items()}
     for i in items:
         i = dict(i)
         if i["id"] in unit_ids:
-            mpc, mode, hrs = per_machine[i["machine"]]
+            mpc, mode, hrs = per_machine[i["machine"]][:3]
             sm = None if mode == "по правилам" else 0.0 if mode == "без наладки" else float(hrs)
             run = int(qty) * float(mpc) / 60
             changed = (int(i.get("qty") or 0) != int(qty) or float(i.get("min_pc") or 0) != float(mpc)
@@ -860,6 +899,8 @@ def apply_edit(items: list[dict], unit_ids: set, qty: int, per_machine: dict, no
                 i["hours_manual"] = None
                 reset = True
             i.update(qty=int(qty), min_pc=float(mpc), run_h=run, setup_manual=sm)
+            if offs.get(i["machine"]) is not None:
+                i["offset_h"] = offs[i["machine"]]
             if note is not None:
                 i["notes"] = note
         new.append(i)
@@ -873,7 +914,10 @@ def _edit_form(q, tx, audit, ctx, items, arts, made, it, unit):
                                   value=int(it.get("qty") or 1))
             per = {}
             for i in unit:
-                c1, c2, c3 = st.columns([2, 2, 1.4])
+                if len(unit) > 1:
+                    c1, c2, c3, c4 = st.columns([2, 2, 1.4, 1.6])
+                else:
+                    c1, c2, c3 = st.columns([2, 2, 1.4])
                 mpc = c1.number_input(f"{i['machine']}: мин/шт", min_value=0.01, step=0.1, format="%.2f",
                                       value=max(float(i.get("min_pc") or 0), 0.01), key=f"pe_mpc_{i['id']}")
                 sm = i.get("setup_manual")
@@ -884,7 +928,14 @@ def _edit_form(q, tx, audit, ctx, items, arts, made, it, unit):
                 hrs = c3.number_input("ч (если вручную)", min_value=0.0, step=0.25, format="%.2f",
                                       value=float(sm if sm not in (None, 0) else (i.get("setup_h") or 0)),
                                       key=f"pe_h_{i['id']}")
-                per[i["machine"]] = (mpc, mode, hrs)
+                if len(unit) > 1:
+                    off = c4.number_input("старт позже, ч", min_value=0.0, step=0.5, format="%.1f", value=_off(i),
+                                          key=f"pe_off_{i['id']}",
+                                          help="Через сколько рабочих часов после начала связки этот станок начинает "
+                                               "(например, 2100 — 0, 235 — 2: 235 подхватывает через 2 ч).")
+                    per[i["machine"]] = (mpc, mode, hrs, off)
+                else:
+                    per[i["machine"]] = (mpc, mode, hrs)
             note = st.text_input("Примечание", value=it.get("notes") or "")
             go = st.form_submit_button("Применить", type="primary")
         if go:
@@ -907,7 +958,7 @@ def _selected_panel(q, tx, audit, ctx, items, arts, made, it, names):
              "По остатку, шт": prog.get(i["id"], {}).get("done", 0),
              "Наладка, ч": i.get("setup_h"), "Почему такая наладка": i.get("setup_why") or "",
              "Мин/шт": i.get("min_pc"), "Выпуск, ч": None if i.get("run_h") is None else round(i["run_h"], 2),
-             "Вручную, ч": i.get("hours_manual")} for i in unit]
+             "Вручную, ч": i.get("hours_manual"), "Старт позже, ч": _off(i) if len(unit) > 1 else None} for i in unit]
     if it["kind"] != "партия":
         rows = [{"Станок": it["machine"], "Начало": it["start"], "Окончание": it["end"], "Примечание": it.get("notes") or ""}]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -981,6 +1032,7 @@ def route_options(q, ctx, p: dict) -> list[dict]:
         par = bool(r["parallel"]) and len(ms) > 1
         fits = rank(r["family"]) < 2
         out.append({"key": f"r{r['id']}", "name": r["name"], "machines": ms, "parallel": par, "fits": fits,
+                    "offsets": tech.parse_offsets(r.get("offsets") or "", ms) if par else {m: 0.0 for m in ms},
                     "label": r["name"] + (" · связка, старт одновременно" if par else "")
                              + ("" if fits else " · (маршрут другого вида)")})
     singles = {o["machines"][0] for o in out if len(o["machines"]) == 1}
@@ -1077,14 +1129,17 @@ def batch_norms(hist: pd.DataFrame, p: dict, machines, name: str = "") -> list[d
 
 
 def new_batch_items(bn: str, qty: int, route: dict, mpc: dict, note: str, start: datetime,
-                    order_id=None, due=None) -> list[dict]:
-    """Позиции новой постановки партии по маршруту (время уточнит раскладка)."""
+                    order_id=None, due=None, offsets: dict | None = None) -> list[dict]:
+    """Позиции новой постановки партии по маршруту (время уточнит раскладка).
+    offsets — сдвиг старта станков связки, рабочих часов (по умолчанию — из маршрута)."""
     grp = uuid.uuid4().hex[:12]
     linked = 1 if route["parallel"] else 0
+    offs = offsets if offsets is not None else (route.get("offsets") or {})
     return [{"kind": "партия", "batch_number": bn, "qty": int(qty), "machine": m, "grp": grp, "linked": linked,
              "route": route["name"], "start": _s(start), "end": _s(start), "setup_h": None, "setup_why": "",
              "min_pc": float(mpc[m]), "run_h": int(qty) * float(mpc[m]) / 60, "hours_manual": None, "notes": note,
-             "order_id": order_id, "due_date": due, "id": None, "_tmp": f"{grp}:{k}"}
+             "order_id": order_id, "due_date": due, "id": None, "_tmp": f"{grp}:{k}",
+             "offset_h": float(offs.get(m) or 0) if linked else None}
             for k, m in enumerate(route["machines"])]
 
 
@@ -1171,7 +1226,16 @@ def _add_batch_form(q, tx, audit, ctx, items, arts, made, hist, batches, batch_i
         return
     if not route["parallel"] and len(ms) > 1:
         st.caption("Маршрут без связки: станки ставятся друг за другом.")
-    new = new_batch_items(bn, qty, route, mpc, note, earliest)
+    offsets = None
+    if route["parallel"]:
+        st.caption("Сдвиг старта станков связки (рабочих часов после начала): 0 — начинает сразу. По умолчанию — из маршрута.")
+        oc = st.columns(len(ms))
+        offsets = {m: oc[k].number_input(f"{m}: старт позже, ч", min_value=0.0, step=0.5, format="%.1f",
+                                         value=float((route.get("offsets") or {}).get(m, 0)),
+                                         key=f"plan_add_off_{bn}_{rkey}_{k}") for k, m in enumerate(ms)}
+        lo = min(offsets.values())
+        offsets = {m: v - lo for m, v in offsets.items()}
+    new = new_batch_items(bn, qty, route, mpc, note, earliest, offsets=offsets)
     res = place_new([dict(i) for i in items], new, ctx, arts, made)
     mine = [r for r in res if r.get("_tmp")]
     pv = pd.DataFrame([{"Станок": r["machine"], "Начало": r["start"], "Окончание": r["end"], "Наладка, ч": r["setup_h"],
@@ -1844,9 +1908,12 @@ class _MachineState:
         hours = {m: setups[m][0] + qty * float(mpc[m]) / 60 for m in ms}
         starts, ends = {}, {}
         if route["parallel"] or len(ms) == 1:
-            s = place_unit([{"machine": m, "hours_manual": hours[m]} for m in ms], t0, self.busy, ctx["shifts"], ctx["cal"])
-            for m in ms:
-                starts[m], ends[m] = s, _rm(workcal.add_work_hours(s, hours[m], ctx["shifts"], ctx["cal"]))
+            offs = route.get("offsets") or {}
+            unit = [{"machine": m, "hours_manual": hours[m], "offset_h": offs.get(m, 0)} for m in ms]
+            s = place_unit(unit, t0, self.busy, ctx["shifts"], ctx["cal"])
+            tm = unit_times(unit, s, ctx["shifts"], ctx["cal"])
+            for u_ in unit:
+                starts[u_["machine"]], ends[u_["machine"]] = tm[id(u_)]
         else:                                         # без связки — станки друг за другом
             t = t0
             for m in ms:
