@@ -1072,7 +1072,16 @@ def page_machines(role):
         #  новые ключи и создаются пустыми. (Простое удаление ключей из
         #  session_state в Streamlit 1.35 не очищает значения в браузере.)
         # ═══════════════════════════════════════════════════════════════
-        PF = f"pf{st.session_state.setdefault('pf_gen', 0)}_"
+        # Выбрали другую партию — форма с нуля (станок, оператор, количество… переносятся только
+        # между записями одной партии, см. сброс после сохранения)
+        _gen = st.session_state.setdefault("pf_gen", 0)
+        _prev_bn = st.session_state.get("pf_batch_prev")
+        if _prev_bn and _prev_bn != batch_no_stripped:  # была выбрана другая партия (не «пусто → партия»)
+            for _k in [k for k in st.session_state if k.startswith(f"pf{_gen}_")]:
+                del st.session_state[_k]
+            st.session_state["pf_gen"] = _gen + 1
+        st.session_state["pf_batch_prev"] = batch_no_stripped
+        PF = f"pf{st.session_state['pf_gen']}_"
 
         def normalize_stage(s: str) -> str:
             import re as _re
