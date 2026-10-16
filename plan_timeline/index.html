@@ -26,6 +26,9 @@
   .vis-item.vis-background.holiday { background: rgba(200,60,60,0.16); }
   .vis-item .vis-item-content { padding: 2px 5px; }
   .vis-item.vis-range { height: 40px; line-height: 34px; }
+  /* партия: выполненная часть — тёмная полоса слева, поэтому текст светлый с тенью (читается на обеих частях) */
+  .vis-item.batch { color: #fff; text-shadow: 0 0 2px #000, 0 0 3px #000; }
+  .vis-item.batch.late { border-width: 2px; }
   .vis-labelset .vis-label .vis-inner { min-height: 40px; line-height: 40px; padding: 4px 10px; }
   .vis-current-time { background-color: #ff4b4b; width: 2px; }
   #msg { font-size: 12px; opacity: 0.75; padding: 3px 2px; min-height: 16px; }

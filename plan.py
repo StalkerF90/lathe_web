@@ -15,6 +15,7 @@
   • ремонт и обслуживание — фиксированные блоки по календарю, партии обходят их;
   • при перетаскивании партия встаёт куда поставили, пересекающиеся сдвигаются вперёд.
 """
+import html
 import json
 import os
 import uuid
@@ -255,6 +256,61 @@ def conflicts(items: list[dict]) -> list[str]:
     return out
 
 
+def item_progress(items: list[dict], fact: list[dict]) -> dict:
+    """Факт выпуска по позициям плана: {id: {'done', 'pct', 'last'}}.
+    fact — записи выпуска станков {batch_number, machine, date, stage, fin, qty}. На станке считаем
+    финальный выпуск, если он есть, иначе — самый продвинутый этап (записи идут по этапам, сумма этапов
+    дала бы 200 % для двух установов на одном станке). Учитываются записи не раньше даты начала позиции
+    или даты её постановки в план (что раньше) — выпуск до планирования остатка партии не засчитывается.
+    Несколько позиций одной партии на станке заполняются по порядку."""
+    by_key = {}
+    for f in fact:
+        by_key.setdefault((f["batch_number"], f["machine"]), []).append(f)
+    out = {}
+    groups = {}
+    for it in items:
+        if it["kind"] == "партия" and it.get("id"):
+            groups.setdefault((it["batch_number"], it["machine"]), []).append(it)
+    for key, lst in groups.items():
+        lst = sorted(lst, key=lambda i: (i["start"], i["id"]))
+        cut = min(min(i["start"][:10], (i.get("created_at") or i["start"])[:10]) for i in lst)
+        recs = [f for f in by_key.get(key, []) if str(f["date"] or "")[:10] >= cut]
+        fin = [f for f in recs if f["fin"]]
+        if fin:
+            done = sum(int(f["qty"] or 0) for f in fin)
+        else:
+            per_stage = {}
+            for f in recs:
+                per_stage[f["stage"]] = per_stage.get(f["stage"], 0) + int(f["qty"] or 0)
+            done = max(per_stage.values()) if per_stage else 0
+        last = max((str(f["date"])[:10] for f in recs), default="")
+        for i in lst:
+            qty = int(i.get("qty") or 0)
+            got = min(done, qty) if qty else 0
+            done -= got
+            out[i["id"]] = {"done": got, "pct": round(100 * got / qty) if qty else 0, "last": last}
+    return out
+
+
+def load_fact(q, items: list[dict]) -> list[dict]:
+    bns = sorted({i["batch_number"] for i in items if i["kind"] == "партия" and i.get("batch_number")})
+    if not bns:
+        return []
+    return q(f"""
+        SELECT p.batch_number, m.name AS machine, p.date, COALESCE(p.stage_name,'') AS stage,
+               COALESCE(p.is_final_release,0) AS fin, COALESCE(p.produced_qty,0) AS qty
+        FROM production p JOIN machines m ON m.id = p.machine_id
+        WHERE COALESCE(p.record_type,'production')='production' AND p.batch_number IN ({','.join('?' * len(bns))})""",
+             tuple(bns))
+
+
+def _shade(hex_color: str, k: float = 0.5) -> str:
+    """Темнее на долю k (для выполненной части полосы)."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return "#%02x%02x%02x" % (int(r * (1 - k)), int(g * (1 - k)), int(b * (1 - k)))
+
+
 def label(it: dict) -> str:
     if it["kind"] != "партия":
         return f"{it['kind']}" + (f": {it['notes']}" if it.get("notes") else "")
@@ -425,23 +481,35 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
     extra = sorted({it["machine"] for it in items} - set(ctx["machines"]))
     groups += [{"id": m, "label": m + " (нет в списке станков)"} for m in extra]
     names = {b["batch_number"]: b.get("batch_name") or "" for b in batches}
+    prog = item_progress(items, load_fact(q, items))
+    now_s = _s(datetime.now())
+    e = html.escape
     vis_items = []
     for it in items:
         if it["kind"] == "партия":
             hrs = item_hours(it)
-            content = f"№{it['batch_number']} {names.get(it['batch_number'], '')} · {it['qty'] or 0} шт"
-            title = (f"№{it['batch_number']} {names.get(it['batch_number'], '')}<br>{it['qty'] or 0} шт · {it['route'] or ''}<br>"
-                     f"{it['start']} → {it['end']}<br>наладка {it['setup_h'] or 0:g} ч ({it['setup_why'] or ''}), "
+            pr = prog.get(it["id"], {"done": 0, "pct": 0, "last": ""})
+            name = e(f"№{it['batch_number']} {names.get(it['batch_number'], '')}")
+            late = it["end"] < now_s and pr["pct"] < 100
+            content = (f"{name} · {it['qty'] or 0} шт" + (f" · {pr['pct']}%" if pr["done"] else "")
+                       + (" ✔" if pr["pct"] >= 100 else "") + (" ✋" if it.get("hours_manual") is not None else ""))
+            title = (f"{name}<br>{it['qty'] or 0} шт · {e(it['route'] or '')}<br>"
+                     f"{it['start']} → {it['end']}<br>наладка {it['setup_h'] or 0:g} ч ({e(it['setup_why'] or '')}), "
                      f"выпуск {it['run_h'] or 0:.1f} ч" + (f"<br>длительность задана вручную: {hrs:.1f} ч"
-                                                         if it.get("hours_manual") is not None else ""))
+                                                         if it.get("hours_manual") is not None else "")
+                     + f"<br><b>Факт: {pr['done']} из {it['qty'] or 0} шт ({pr['pct']}%)</b>"
+                     + (f", последняя запись {pr['last']}" if pr["last"] else "")
+                     + ("<br>⚠️ срок по плану прошёл, партия не закончена" if late else ""))
+            col, p = _color(it["batch_number"]), max(0, min(pr["pct"], 100))
+            bg = (f"linear-gradient(90deg, {_shade(col)} 0%, {_shade(col)} {p}%, {col} {p}%, {col} 100%)" if p else col)
             vis_items.append({"id": it["id"], "group": it["machine"], "start": it["start"], "end": it["end"],
-                              "content": content + (" ✋" if it.get("hours_manual") is not None else ""),
-                              "title": title, "style": f"background:{_color(it['batch_number'])};border-color:#444;",
-                              "updateGroup": False})
+                              "content": content, "title": title, "updateGroup": False,
+                              "className": "batch" + (" late" if late else ""),
+                              "style": f"background:{bg};border-color:{'#ff4b4b' if late else '#444'};"})
         else:
             vis_items.append({"id": it["id"], "group": it["machine"], "start": it["start"], "end": it["end"],
-                              "content": f"🔧 {it['kind']}" + (f": {it['notes']}" if it.get("notes") else ""),
-                              "title": f"{it['kind']}<br>{it['start']} → {it['end']}<br>{it.get('notes') or ''}",
+                              "content": f"🔧 {e(it['kind'])}" + (f": {e(it['notes'])}" if it.get("notes") else ""),
+                              "title": f"{e(it['kind'])}<br>{it['start']} → {it['end']}<br>{e(it.get('notes') or '')}",
                               "className": "kind-repair" if it["kind"] == "ремонт" else "kind-service"})
     vis_items += _background(ctx, d0 - timedelta(days=7), d1 + timedelta(days=21))
     ev = _timeline(groups=groups, items=vis_items,
@@ -509,7 +577,9 @@ def _selected_panel(q, tx, audit, ctx, items, arts, made, it, names):
     st.markdown("#### Выбрано: " + (f"партия №{it['batch_number']} {names.get(it['batch_number'], '')}" if it["kind"] == "партия"
                                     else f"{it['kind']} · {it['machine']}"))
     unit = [i for i in items if it.get("linked") and i.get("grp") == it.get("grp")] or [it]
+    prog = item_progress(items, load_fact(q, items)) if it["kind"] == "партия" else {}
     rows = [{"Станок": i["machine"], "Начало": i["start"], "Окончание": i["end"], "Кол-во": i.get("qty"),
+             "Факт, шт": prog.get(i["id"], {}).get("done", 0), "Факт, %": prog.get(i["id"], {}).get("pct", 0),
              "Наладка, ч": i.get("setup_h"), "Почему такая наладка": i.get("setup_why") or "",
              "Мин/шт": i.get("min_pc"), "Выпуск, ч": None if i.get("run_h") is None else round(i["run_h"], 2),
              "Вручную, ч": i.get("hours_manual")} for i in unit]
@@ -697,31 +767,33 @@ def _tab_list(q):
     if not items:
         st.info("План пуст.")
         return
-    fact = {(r["batch_number"], r["machine"]): r for r in q("""
-        SELECT p.batch_number, m.name AS machine, SUM(COALESCE(p.produced_qty,0)) AS made, MIN(p.date) AS first, MAX(p.date) AS last
-        FROM production p JOIN machines m ON m.id = p.machine_id
-        WHERE COALESCE(p.record_type,'production')='production' GROUP BY p.batch_number, m.name""")}
+    prog = item_progress(items, load_fact(q, items))
     names = {r["batch_number"]: r["batch_name"] for r in q("SELECT batch_number, batch_name FROM batches")}
     rows = []
     for it in items:
-        f = fact.get((it["batch_number"], it["machine"])) if it["kind"] == "партия" else None
-        made_q = (f or {}).get("made") or 0
+        pr = prog.get(it["id"], {"done": 0, "pct": 0, "last": ""})
+        made_q = pr["done"]
+        late = _dt(it["end"]) < datetime.now()
         status = "" if it["kind"] != "партия" else (
-            "выполнено" if it.get("qty") and made_q >= it["qty"] else "в работе" if made_q else
-            "просрочено" if _dt(it["end"]) < datetime.now() else "не начато")
+            "выполнено" if it.get("qty") and made_q >= it["qty"] else
+            ("в работе, срок прошёл" if late else "в работе") if made_q else
+            "просрочено" if late else "не начато")
         rows.append({"ID": it["id"], "Вид": it["kind"], "Станок": it["machine"],
                      "Партия": it["batch_number"] or "", "Название": names.get(it["batch_number"], ""),
                      "Кол-во": it.get("qty"), "Начало": it["start"], "Окончание": it["end"],
                      "Часы": round(item_hours(it), 2) if it["kind"] == "партия" else None,
                      "Наладка, ч": it.get("setup_h"), "Факт, шт": made_q if it["kind"] == "партия" else None,
-                     "Факт: даты": f"{f['first']} … {f['last']}" if f else "", "Статус": status,
+                     "Факт, %": pr["pct"] if it["kind"] == "партия" else None,
+                     "Последняя запись": pr["last"], "Статус": status,
                      "Примечание": it.get("notes") or ""})
     df = pd.DataFrame(rows)
     flt = st.selectbox("Станок", ["все"] + sorted(df["Станок"].unique()), key="plan_list_m")
     if flt != "все":
         df = df[df["Станок"] == flt]
     st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption("Факт — выпуск по записям станка для этой партии (все записи, не только в даты плана).")
+    st.caption("Факт — выпуск партии на этом станке по истории выпуска: финальный выпуск, а если его нет — самый "
+               "продвинутый этап. Считаются записи не раньше начала позиции или даты постановки в план (что раньше); "
+               "если партия стоит на станке несколько раз, факт заполняет позиции по порядку.")
 
 
 def _tab_shifts(q, tx, audit):
