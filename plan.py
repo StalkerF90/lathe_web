@@ -636,7 +636,8 @@ def _color(s: str) -> str:
 
 
 def page_plan(q, tx, audit, all_batches, batch_is_archived):
-    if st.session_state.get("role") != "admin":
+    _p = st.session_state.get("perms")              # права из app.py; без них — по роли, как раньше
+    if not ("page:plan" in _p if _p is not None else st.session_state.get("role") in ("admin", "master")):
         st.error("⛔ План станков доступен только администратору.")
         st.stop()
     st.title("📅 План станков")

@@ -816,7 +816,8 @@ _ICON = {"ok": "✅", "warn": "⚠️", "bad": "❌"}
 
 
 def page_tech(q, tx, audit):
-    if st.session_state.get("role") != "admin":
+    _p = st.session_state.get("perms")              # права из app.py; без них — по роли, как раньше
+    if not ("page:tech" in _p if _p is not None else st.session_state.get("role") in ("admin", "master")):
         st.error("⛔ Технологический модуль доступен только администратору.")
         st.stop()
     st.title("🛠 Технология")

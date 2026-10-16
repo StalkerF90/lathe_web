@@ -635,15 +635,68 @@ def get_role(username: str) -> str:
     except Exception:
         return "user"
 
-def require_admin():
-    """Останавливает выполнение, если роль не admin."""
-    if st.session_state.get("role") != "admin":
-        st.error("⛔ Доступ запрещён. Требуются права администратора.")
+# ── Права доступа ──────────────────────────────────────────────────────────
+# Роль — набор прав по умолчанию; master может задать пользователю свой набор (config.yml → perms).
+# master всегда имеет все права (защита от потери доступа к управлению пользователями).
+PERM_GROUPS = [
+    ("Страницы", [
+        ("page:machines", "⚙️ Станки"), ("page:history", "📋 История"), ("page:batches", "📋 Партии"),
+        ("page:batch", "📦 Прогресс партии"), ("page:journals", "📓 Журналы"),
+        ("page:crud", "👥 Персонал / Станки"), ("page:charts", "📊 Графики"), ("page:export", "💾 Экспорт CSV"),
+        ("page:tech", "🛠 Технология"), ("page:plan", "📅 План станков"),
+    ]),
+    ("Действия", [
+        ("records.add", "Вносить выпуск и ремонт, менять статус станков"),
+        ("records.edit", "Редактировать и удалять записи выпуска"),
+        ("batches.manage", "Создавать, редактировать, архивировать партии"),
+        ("journals.add", "Добавлять записи в журналы"),
+        ("journals.manage", "Создавать журналы, менять их структуру, удалять записи"),
+        ("users.manage", "Пользователи и права (только master)"),
+    ]),
+]
+ALL_PERMS = [k for _g, items in PERM_GROUPS for k, _l in items]
+PERM_LABEL = {k: l for _g, items in PERM_GROUPS for k, l in items}
+_BASE_PAGES = {"page:machines", "page:history", "page:batches", "page:batch", "page:journals"}
+ROLE_PRESETS = {
+    "viewer": _BASE_PAGES | {"page:charts", "page:export"},
+    "user":   _BASE_PAGES | {"records.add", "journals.add"},
+    "admin":  set(ALL_PERMS) - {"users.manage"},
+    "master": set(ALL_PERMS),
+}
+ROLE_LABELS = {"master": "Мастер (суперадмин)", "admin": "Администратор", "user": "Оператор", "viewer": "Наблюдатель"}
+
+
+def user_perms(user: dict) -> set:
+    """Права пользователя из config.yml: свой набор (perms) или права роли; master — всегда все."""
+    role = (user or {}).get("role", "user")
+    if role == "master":
+        return set(ALL_PERMS)
+    own = (user or {}).get("perms")
+    perms = set(own) if isinstance(own, list) else set(ROLE_PRESETS.get(role, ROLE_PRESETS["user"]))
+    return {p for p in perms if p in ALL_PERMS and p != "users.manage"}
+
+
+def can(perm: str) -> bool:
+    """Есть ли право у текущего пользователя (без загруженных прав — по роли, как раньше)."""
+    perms = st.session_state.get("perms")
+    if perms is None:
+        perms = ROLE_PRESETS.get(st.session_state.get("role", "user"), set())
+    return perm in perms
+
+
+def require_perm(perm: str):
+    if not can(perm):
+        st.error(f"⛔ Доступ запрещён: нужно право «{PERM_LABEL.get(perm, perm)}».")
         st.stop()
 
+
+def require_admin():
+    """Останавливает выполнение без права на страницу «Персонал / Станки» (раньше — роль admin)."""
+    require_perm("page:crud")
+
 def require_not_viewer():
-    """Останавливает выполнение, если роль viewer — запрет любых изменений данных."""
-    if st.session_state.get("role") == "viewer":
+    """Останавливает выполнение без права вносить данные (раньше — роль viewer)."""
+    if not (can("records.add") or can("records.edit") or can("batches.manage")):
         st.error("⛔ Недостаточно прав для изменения данных. "
                  "Роль «Наблюдатель» предназначена только для просмотра.")
         st.stop()
@@ -937,7 +990,7 @@ def page_machines(role):
     st.divider()
 
     # ── Смена статуса (доступна user и admin, не viewer) ───────────────
-    if st.session_state.get("role") == "viewer":
+    if not can("records.add"):
         st.info("👁 Режим просмотра — изменение статусов недоступно.")
     else:
         st.markdown("### 🔄 Изменить статус станка")
@@ -967,7 +1020,7 @@ def page_machines(role):
     st.divider()
 
     # ── Внести запись (Выпуск или Ремонт) — User + Admin ──────────────
-    if st.session_state.get("role") == "viewer":
+    if not can("records.add"):
         st.info("👁 Режим просмотра — внесение записей недоступно.")
         return
 
@@ -1570,7 +1623,7 @@ def page_history(role):
     base_cols = ["Тип", "Объект", "Фин. выпуск", "Этап", "Дата", "Оператор",
                  "Партия", "№ партии", "Наладка (ч)", "Выпущено",
                  "План. время (ч)", "Факт. мин", "Ремонт (ч)", "Δ план/факт", "Примечание"]
-    if role == "admin":
+    if can("records.edit"):
         base_cols = ["ID"] + base_cols
         st.markdown("*Для удаления или редактирования — укажите ID записи в формах ниже*")
 
@@ -1597,7 +1650,7 @@ def page_history(role):
         }
     )
 
-    if role == "admin":
+    if can("records.edit"):
         st.divider()
         # ══════════════════════════════════════════════════════════════
         # ФОРМА УДАЛЕНИЯ ЗАПИСИ
@@ -1891,7 +1944,7 @@ def page_admin_crud():
             em1, em2, em3, em4, em5 = st.columns([2, 3, 2, 1, 2])
             e_id    = em1.selectbox("Станок / РЦ",
                 options=[m["id"] for m in machines_now],
-                format_func=lambda x: f"{'🏭' if next(m['is_work_center'] for m in machines_now if m['id']==x) else '⚙️'} #{x} {next(m['name'] for m in machines_now if m['id']==x)}")
+                format_func=lambda x, _ms=machines_now: f"{'🏭' if next(m['is_work_center'] for m in _ms if m['id']==x) else '⚙️'} #{x} {next(m['name'] for m in _ms if m['id']==x)}")
             e_name  = em2.text_input("Новое название")
             e_model = em3.text_input("Модель")
             e_prod  = em4.number_input("Произв.", min_value=0.1, value=10.0, step=0.5)
@@ -1919,7 +1972,7 @@ def page_admin_crud():
             machines_now = q("SELECT id, name FROM machines ORDER BY id")
             d_id = st.selectbox("Выберите станок для удаления",
                 options=[m["id"] for m in machines_now],
-                format_func=lambda x: f"#{x} {next(m['name'] for m in machines_now if m['id']==x)}")
+                format_func=lambda x, _ms=machines_now: f"#{x} {next(m['name'] for m in _ms if m['id']==x)}")
             st.caption("Удалить можно только станок без записей выпуска и ремонтов — "
                        "история не удаляется вместе со станком.")
             confirm = st.checkbox("Подтверждаю удаление станка")
@@ -1969,7 +2022,7 @@ def page_admin_crud():
             if ops_now:
                 do_id = st.selectbox("Оператор",
                     options=[o["id"] for o in ops_now],
-                    format_func=lambda x: next(o["name"] for o in ops_now if o["id"]==x))
+                    format_func=lambda x, _os=ops_now: next(o["name"] for o in _os if o["id"]==x))
                 if st.form_submit_button("Удалить оператора", type="primary"):
                     with tx() as conn:
                         old = conn.execute("SELECT * FROM operators WHERE id=?",
@@ -1987,64 +2040,162 @@ def page_admin_crud():
 
     # ── Пользователи ──────────────────────────────────────────────────
     with tab_u:
-        st.markdown("#### 🔑 Управление пользователями (config.yml)")
-        st.info("""
-Пользователи хранятся в **config.yml** (bcrypt-хеши).
-Для добавления нового пользователя используйте скрипт ниже или отредактируйте файл вручную.
-        """)
-        with st.expander("📋 Текущие пользователи"):
+        if can("users.manage"):
+            _users_master()
+        else:
+            st.info("🔒 Пользователей, пароли и права меняет только мастер (суперадмин).")
             try:
-                cfg = load_config()
-                users = cfg["credentials"]["usernames"]
-                user_data = [
-                    {"Логин": u, "Имя": v.get("name", ""), "Роль": v.get("role", "user")}
-                    for u, v in users.items()
-                ]
-                st.dataframe(pd.DataFrame(user_data), use_container_width=True, hide_index=True)
+                users = load_config()["credentials"]["usernames"]
+                st.dataframe(pd.DataFrame([{"Логин": u, "Имя": v.get("name", ""), "Роль": ROLE_LABELS.get(v.get("role"), v.get("role")),
+                                            "Свои права": "да" if isinstance(v.get("perms"), list) else ""}
+                                           for u, v in users.items()]), use_container_width=True, hide_index=True)
             except Exception as e:
                 st.error(f"Ошибка чтения config.yml: {e}")
 
-        st.markdown("#### ➕ Добавить пользователя")
-        st.markdown("Выполните команду в контейнере:")
-        st.code("""docker exec -it lathe_app python manage_users.py add <login> <password> <name> <role>
-# Пример:
-docker exec -it lathe_app python manage_users.py add operator2 pass456 "Смирнов А.В." user""", language="bash")
 
-        with st.form("add_user_form", clear_on_submit=True):
-            uu1, uu2, uu3, uu4 = st.columns([2, 2, 2, 1])
-            new_login = uu1.text_input("Логин*")
-            new_pass  = uu2.text_input("Пароль*", type="password")
-            new_name  = uu3.text_input("Полное имя*")
-            new_role  = uu4.selectbox("Роль", ["user", "viewer", "admin"],
-                                       help="user = ввод данных; viewer = только просмотр; admin = полный доступ")
-            if st.form_submit_button("Создать пользователя", type="primary"):
-                if not all([new_login, new_pass, new_name]):
-                    st.error("Заполните все обязательные поля.")
+# ── Пользователи и права (master) ──────────────────────────────────────────
+
+def save_users_config(cfg: dict, action: str, login: str, old: dict | None, new: dict | None):
+    """Записывает config.yml атомарно, с резервной копией прежнего файла и записью в журнал изменений
+    (без хешей паролей)."""
+    import shutil
+    bdir = os.path.join(os.path.dirname(os.path.abspath(CONFIG_PATH)), "config_backups")
+    os.makedirs(bdir, exist_ok=True)
+    if os.path.exists(CONFIG_PATH):
+        shutil.copy2(CONFIG_PATH, os.path.join(bdir, f"config_{datetime.now():%Y%m%d_%H%M%S_%f}.yml"))
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    os.replace(tmp, CONFIG_PATH)
+    strip = lambda d: None if d is None else {k: v for k, v in d.items() if k != "password"}
+    with tx() as conn:
+        audit(conn, action, "users", None, dict(strip(old) or {}, login=login), dict(strip(new) or {}, login=login))
+
+
+def _hash_pw(pw: str) -> str:
+    import bcrypt as _bcrypt
+    return _bcrypt.hashpw(pw.encode(), _bcrypt.gensalt(12)).decode()
+
+
+def _users_master():
+    import re
+    me = st.session_state.get("username", "")
+    flash = st.session_state.pop("users_flash", None)
+    if flash:
+        (st.success if flash[0] else st.error)(flash[1])
+    cfg = load_config()
+    users = cfg["credentials"]["usernames"]
+    masters = [u for u, v in users.items() if v.get("role") == "master"]
+
+    # ── обзор: кто что может ──────────────────────────────────────────
+    st.markdown("#### 🔐 Кто что может")
+    st.caption("Роль задаёт права по умолчанию; у пользователя можно включить или выключить отдельные права "
+               "(тогда в колонке «Свои права» — «да»). Мастер всегда может всё.")
+    rows = []
+    for u, v in users.items():
+        pr = user_perms(v)
+        rows.append({"Логин": u, "Имя": v.get("name", ""), "Роль": ROLE_LABELS.get(v.get("role"), v.get("role")),
+                     "Свои права": "да" if isinstance(v.get("perms"), list) and v.get("role") != "master" else "",
+                     **{PERM_LABEL[p]: "✓" if p in pr else "" for p in ALL_PERMS}})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ── редактирование пользователя ───────────────────────────────────
+    st.markdown("#### ✏️ Пользователь: роль, права, пароль")
+    login = st.selectbox("Пользователь", list(users), format_func=lambda u: f"{u} — {users[u].get('name', '')}",
+                         key="um_user")
+    u = users[login]
+    eff = user_perms(u)
+    with st.form(f"um_edit_{login}"):
+        c1, c2 = st.columns(2)
+        name = c1.text_input("Имя", value=u.get("name", ""))
+        roles = list(ROLE_LABELS)
+        role = c2.selectbox("Роль", roles, index=roles.index(u.get("role")) if u.get("role") in roles else 2,
+                            format_func=ROLE_LABELS.get,
+                            help="Роль — набор прав по умолчанию. Мастер может всё, в том числе управлять пользователями.")
+        mode = st.radio("Права", ["по роли", "свой набор"], horizontal=True,
+                        index=1 if isinstance(u.get("perms"), list) else 0,
+                        help="«По роли» — права меняются вместе с ролью. «Свой набор» — галочки ниже.")
+        chosen = []
+        for gname, items in PERM_GROUPS:
+            st.markdown(f"**{gname}**")
+            cols = st.columns(3)
+            for k, (p, lbl) in enumerate(items):
+                if p == "users.manage":
+                    continue
+                if cols[k % 3].checkbox(lbl, value=p in eff, key=f"um_{login}_{p}"):
+                    chosen.append(p)
+        st.caption("Галочки применяются, только если выбрано «свой набор». Право «Пользователи и права» есть только у мастера.")
+        pw1 = st.text_input("Новый пароль (пусто — не менять)", type="password")
+        pw2 = st.text_input("Повторите пароль", type="password")
+        go = st.form_submit_button("💾 Сохранить пользователя", type="primary")
+    if go:
+        err = None
+        if login == me and role != "master" and u.get("role") == "master":
+            err = "Нельзя снять роль мастера с самого себя."
+        elif u.get("role") == "master" and role != "master" and len(masters) <= 1:
+            err = "Это последний мастер — сначала назначьте другого."
+        elif pw1 and (pw1 != pw2):
+            err = "Пароли не совпадают."
+        elif pw1 and len(pw1) < 6:
+            err = "Пароль — не короче 6 символов."
+        if err:
+            st.session_state["users_flash"] = (False, err)
+        else:
+            old = dict(u)
+            new = dict(u, name=name.strip() or u.get("name", ""), role=role)
+            if mode == "свой набор" and role != "master":
+                new["perms"] = sorted(chosen)
+            else:
+                new.pop("perms", None)
+            if pw1:
+                new["password"] = _hash_pw(pw1)
+            users[login] = new
+            save_users_config(cfg, "update", login, old, dict(new, password_changed=bool(pw1)))
+            st.session_state["users_flash"] = (True, f"✅ Пользователь «{login}» сохранён"
+                                                     + (", пароль изменён" if pw1 else "") + ".")
+        st.rerun()
+
+    # ── добавить / удалить ────────────────────────────────────────────
+    c1, c2 = st.columns(2)
+    with c1.expander("➕ Добавить пользователя"):
+        with st.form("um_add", clear_on_submit=True):
+            n_login = st.text_input("Логин*")
+            n_name = st.text_input("Имя*")
+            n_role = st.selectbox("Роль", list(ROLE_LABELS), index=2, format_func=ROLE_LABELS.get)
+            n_pw = st.text_input("Пароль* (не короче 6 символов)", type="password")
+            if st.form_submit_button("Создать", type="primary"):
+                lg = n_login.strip()
+                if not lg or not n_name.strip() or len(n_pw) < 6:
+                    st.session_state["users_flash"] = (False, "Укажите логин, имя и пароль не короче 6 символов.")
+                elif not re.fullmatch(r"[A-Za-z0-9_.-]{2,40}", lg):
+                    st.session_state["users_flash"] = (False, "Логин — латиница, цифры, «_ . -», 2–40 символов.")
+                elif lg in users:
+                    st.session_state["users_flash"] = (False, f"Пользователь «{lg}» уже есть.")
                 else:
-                    try:
-                        import bcrypt as _bcrypt
-                        hashed = _bcrypt.hashpw(
-                            new_pass.encode(), _bcrypt.gensalt(12)
-                        ).decode()
-                        cfg = load_config()
-                        if new_login in cfg["credentials"]["usernames"]:
-                            st.error(f"Пользователь «{new_login}» уже существует.")
-                        else:
-                            cfg["credentials"]["usernames"][new_login] = {
-                                "name": new_name,
-                                "password": hashed,
-                                "role": new_role,
-                            }
-                            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                                yaml.dump(cfg, f, allow_unicode=True)
-                            st.success(f"✅ Пользователь «{new_login}» создан. Перезапустите приложение для применения.")
-                    except ImportError:
-                        st.error("bcrypt не установлен. Используйте скрипт manage_users.py в контейнере.")
+                    users[lg] = {"name": n_name.strip(), "password": _hash_pw(n_pw), "role": n_role}
+                    save_users_config(cfg, "insert", lg, None, users[lg])
+                    st.session_state["users_flash"] = (True, f"✅ Пользователь «{lg}» создан.")
+                st.rerun()
+    with c2.expander("🗑 Удалить пользователя"):
+        del_opts = [x for x in users if x != me and not (users[x].get("role") == "master" and len(masters) <= 1)]
+        if not del_opts:
+            st.caption("Удалять некого.")
+        else:
+            d_login = st.selectbox("Пользователь", del_opts, key="um_del_user",
+                                   format_func=lambda x: f"{x} — {users[x].get('name', '')}")
+            sure = st.checkbox(f"Да, удалить «{d_login}»", key=f"um_del_cb_{d_login}")
+            if st.button("Удалить", key="um_del_go", disabled=not sure):
+                old = users.pop(d_login)
+                save_users_config(cfg, "delete", d_login, old, None)
+                st.session_state["users_flash"] = (True, f"Пользователь «{d_login}» удалён (копия config.yml сохранена).")
+                st.rerun()
+    st.caption("Изменения действуют со следующего действия пользователя на сайте (права читаются при каждом обновлении "
+               "страницы). Перед каждым изменением сохраняется копия config.yml в /data/config_backups.")
 
 
 def page_charts():
     role = st.session_state.get("role", "user")
-    if role not in ("admin", "viewer"):
+    if not can("page:charts"):
         st.error("⛔ Доступ запрещён. Требуются права администратора или наблюдателя.")
         st.stop()
     st.title("📊 Графики и аналитика")
@@ -2901,7 +3052,7 @@ def _tab_status_analytics(days: int, since: str):
 
 def page_export():
     role = st.session_state.get("role", "user")
-    if role not in ("admin", "viewer"):
+    if not can("page:export"):
         st.error("⛔ Доступ запрещён.")
         st.stop()
     st.title("💾 Экспорт данных")
@@ -3009,7 +3160,7 @@ def page_batches(role):
     bn_options = [b["batch_number"] for b in batches]
 
     # ── А) Создание новой партии — СВЕРХУ для удобного доступа ──────────
-    if role == "admin":
+    if can("batches.manage"):
         with st.expander("➕ Создать новую партию", expanded=not batches):
             with st.form("create_batch_form", clear_on_submit=True):
                 cb1, cb2, cb3 = st.columns([2, 3, 2])
@@ -3105,7 +3256,7 @@ def page_batches(role):
                     st.session_state["nav_goto"] = "batch"
                     st.rerun()
 
-    if role not in ("admin",):
+    if not can("batches.manage"):
         st.info("👁 Создание, редактирование и удаление партий доступно только администратору.")
         return
 
@@ -3314,7 +3465,7 @@ def page_batch_progress():
             st.info(f"🗄 Партия в архиве ({why}) — в списке активных партий не показывается.")
         elif state == "active" and auto_closed:
             st.info("📤 Партия вручную оставлена в работе, хотя финал ОПТА достиг плана.")
-        if st.session_state.get("role") == "admin":
+        if can("batches.manage"):
             label = "📤 Вернуть в работу" if archived else "🗄 Отправить в архив"
             if st.button(label, key=f"bp_archive_toggle_{sel_bn}"):
                 set_batch_archived(sel_bn, not archived, auto_closed)
@@ -3363,7 +3514,7 @@ def page_batch_progress():
                  })
 
     # ── Редактирование записи партии прямо здесь (admin) ──────────────
-    if st.session_state.get("role") == "admin":
+    if can("records.edit"):
         _flash = st.session_state.pop("edit_flash", None)   # после сохранения — вне свёрнутого блока
         if _flash:
             st.success(_flash)
@@ -3805,7 +3956,7 @@ def page_journals(role, username):
                 st.markdown(badge)
 
     with jcol_right:
-        if role == "admin":
+        if can("journals.manage"):
             with st.expander("➕ Создать новый журнал"):
                 with st.form("create_journal_form", clear_on_submit=True):
                     jname = st.text_input("Название журнала *")
@@ -3833,7 +3984,7 @@ def page_journals(role, username):
 
     tab_entries, tab_add, tab_cfg = st.tabs(
         ["📋 Записи", "➕ Добавить запись", "⚙️ Структура журнала"]
-        if role in ("admin", "user") else
+        if can("journals.add") else
         ["📋 Записи", "➕ Добавить запись (нет доступа)", "⚙️ Структура журнала"]
     )
 
@@ -3867,7 +4018,7 @@ def page_journals(role, username):
                     mime="text/csv", key="dl_journal_csv")
 
                 # Удаление записей (только admin)
-                if role == "admin":
+                if can("journals.manage"):
                     with st.expander("🗑 Удалить запись"):
                         del_entry_id = st.selectbox(
                             "Запись (ID — Дата)",
@@ -3882,7 +4033,7 @@ def page_journals(role, username):
 
     # ── Г) Добавление записи ─────────────────────────────────────────
     with tab_add:
-        if role == "viewer":
+        if not can("journals.add"):
             st.info("👁 Добавление записей доступно только операторам и администраторам.")
         elif not j_cols:
             st.warning("Структура журнала не настроена. Попросите администратора добавить колонки.")
@@ -3909,7 +4060,7 @@ def page_journals(role, username):
 
     # ── Д) Управление структурой (только admin) ──────────────────────
     with tab_cfg:
-        if role != "admin":
+        if not can("journals.manage"):
             st.info("👁 Настройка структуры журнала доступна только администраторам.")
         else:
             st.markdown(f"#### Структура журнала «{sel_jname}»")
@@ -4027,10 +4178,13 @@ def main():
     # Авторизован
     role = get_role(username)
     st.session_state["role"] = role
+    st.session_state["perms"] = user_perms(cfg["credentials"]["usernames"].get(username, {}))
 
     # ── Sidebar ───────────────────────────────────────────────────────
     with st.sidebar:
-        role_label = {"admin": "Администратор", "user": "Оператор", "viewer": "Наблюдатель"}.get(role, role)
+        role_label = ROLE_LABELS.get(role, role)
+        if role != "master" and isinstance(cfg["credentials"]["usernames"].get(username, {}).get("perms"), list):
+            role_label += " · свои права"
         st.markdown(f"""
 <div style="background:#2a2d40; border-radius:10px; padding:14px; margin-bottom:16px;">
   <div style="color:#56cfe1; font-weight:700; font-size:1.1rem;">🏭 НТА-Контроль</div>
@@ -4041,30 +4195,24 @@ def main():
 </div>
 """, unsafe_allow_html=True)
 
-        pages_all = {
+        pages_order = {
             "⚙️ Станки":            "machines",
             "📋 История":           "history",
             "📋 Партии":            "batches",
             "📦 Прогресс партии":   "batch",
             "📓 Журналы":           "journals",
-        }
-        pages_admin = {
             "👥 Персонал / Станки": "crud",
             "📊 Графики":           "charts",
             "💾 Экспорт CSV":       "export",
             "🛠 Технология":        "tech",
             "📅 План станков":      "plan",
         }
-        pages_viewer = {
-            "📊 Графики":           "charts",
-            "💾 Экспорт CSV":       "export",
-        }
-
-        all_pages = dict(pages_all)
-        if role == "admin":
-            all_pages.update(pages_admin)
-        elif role == "viewer":
-            all_pages.update(pages_viewer)
+        # страницы — по правам пользователя (роль задаёт права по умолчанию, master может изменить)
+        all_pages = {k: v for k, v in pages_order.items() if can(f"page:{v}")}
+        if not all_pages:
+            st.warning("Нет доступа ни к одной странице — обратитесь к администратору.")
+            authenticator.logout("🚪 Выйти", "sidebar")
+            st.stop()
 
         page_keys = list(all_pages.keys())
         page_vals = list(all_pages.values())
@@ -4106,7 +4254,7 @@ def main():
         page = st.session_state["_nav_page"]
 
         st.divider()
-        if role in ("admin", "viewer"):
+        if can("page:charts"):
             st.markdown("**Быстрая статистика**")
             stats = q("""
                 SELECT status, COUNT(*) as cnt FROM machines GROUP BY status
