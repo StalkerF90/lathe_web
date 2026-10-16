@@ -27,6 +27,9 @@ services:
       - ./app.py:/app/app.py:ro
       - ./run_streamlit.py:/app/run_streamlit.py:ro
       - ./tech.py:/app/tech.py:ro
+      - ./plan.py:/app/plan.py:ro
+      - ./workcal.py:/app/workcal.py:ro
+      - ./plan_timeline:/app/plan_timeline:ro
     # Запуск через run_streamlit.py: исправляет обрывы WebSocket (см. комментарий в файле)
     entrypoint: ["python", "run_streamlit.py"]
       # Опционально: монтировать свой config.yml (раскомментируйте)

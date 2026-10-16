@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<!-- График загрузки станков: vis-timeline 7.7.3 (vendor/, лицензия Apache-2.0 / MIT).
+     Протокол Streamlit-компонента реализован вручную (без streamlit-component-lib). -->
+<link rel="stylesheet" href="vendor/vis-timeline-graph2d.min.css">
+<script src="vendor/vis-timeline-graph2d.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; font-family: "Source Sans Pro", sans-serif; font-size: 13px;
+               background: transparent; color: var(--fg, #fafafa); }
+  #tl { border-radius: 6px; }
+  .vis-timeline { border: 1px solid var(--grid, #3a3f4b); background: var(--bg, #0e1117); }
+  .vis-labelset .vis-label, .vis-time-axis .vis-text { color: var(--fg, #fafafa); }
+  .vis-labelset .vis-label { border-bottom: 1px solid var(--grid, #3a3f4b); font-weight: 600; }
+  .vis-panel.vis-left, .vis-panel.vis-center, .vis-foreground .vis-group { border-color: var(--grid, #3a3f4b); }
+  .vis-time-axis .vis-grid.vis-minor { border-color: var(--grid-minor, #23262e); }
+  .vis-time-axis .vis-grid.vis-major { border-color: var(--grid, #3a3f4b); }
+  .vis-item { border-radius: 4px; color: #111; font-size: 12px; border-width: 1px; }
+  .vis-item.vis-selected { box-shadow: 0 0 0 2px #ffbd45; }
+  .vis-item.kind-repair { background: repeating-linear-gradient(45deg, #b33a3a, #b33a3a 6px, #8f2c2c 6px, #8f2c2c 12px);
+                          color: #fff; border-color: #6e2020; }
+  .vis-item.kind-service { background: repeating-linear-gradient(45deg, #9a7b2f, #9a7b2f 6px, #7d6324 6px, #7d6324 12px);
+                           color: #fff; border-color: #5e4a1a; }
+  .vis-item.vis-background.off { background: var(--off, rgba(128,128,128,0.16)); }
+  .vis-item.vis-background.holiday { background: rgba(200,60,60,0.16); }
+  .vis-item .vis-item-content { padding: 2px 5px; }
+  .vis-item.vis-range { height: 40px; line-height: 34px; }
+  .vis-labelset .vis-label .vis-inner { min-height: 40px; line-height: 40px; padding: 4px 10px; }
+  .vis-current-time { background-color: #ff4b4b; width: 2px; }
+  #msg { font-size: 12px; opacity: 0.75; padding: 3px 2px; min-height: 16px; }
+</style>
+</head>
+<body>
+<div id="tl"></div>
+<div id="msg"></div>
+<script>
+(function () {
+  "use strict";
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
+  }
+  function setHeight() { send("streamlit:setFrameHeight", { height: document.body.scrollHeight + 4 }); }
+  var nonce = 0;
+  function setValue(v) { nonce += 1; v.nonce = Date.now() + "-" + nonce; send("streamlit:setComponentValue", { value: v, dataType: "json" }); }
+
+  // наивное локальное время ⇄ строка "YYYY-MM-DD HH:MM" (без часовых поясов: что видим, то и сохраняем)
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  function fmt(d) {
+    d = new Date(d);
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+  }
+  function parse(s) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(s);
+    return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) : new Date(s);
+  }
+
+  var WD = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
+  var MON = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
+  function minorLabel(date, scale) {
+    var d = new Date(date.valueOf());
+    if (scale === "minute") { return pad(d.getHours()) + ":" + pad(d.getMinutes()); }
+    if (scale === "hour") { return pad(d.getHours()); }
+    if (scale === "weekday" || scale === "day") { return WD[d.getDay()] + " " + d.getDate(); }
+    if (scale === "month") { return MON[d.getMonth()].slice(0, 3); }
+    return String(d.getFullYear());
+  }
+  function majorLabel(date, scale) {
+    var d = new Date(date.valueOf());
+    if (scale === "minute" || scale === "hour") { return WD[d.getDay()] + " " + pad(d.getDate()) + "." + pad(d.getMonth() + 1); }
+    if (scale === "weekday" || scale === "day") { return MON[d.getMonth()] + " " + d.getFullYear(); }
+    return String(d.getFullYear());
+  }
+
+  var items = new vis.DataSet(), groups = new vis.DataSet(), timeline = null, windowKey = null, editable = true;
+  var msg = document.getElementById("msg");
+
+  function build(args) {
+    var opts = {
+      stack: false, orientation: { axis: "top", item: "top" }, zoomKey: "ctrlKey", horizontalScroll: true,
+      margin: { item: { horizontal: 0, vertical: 8 } }, groupHeightMode: "fixed",
+      snap: function (date) { var ms = 15 * 60 * 1000; return Math.round(date / ms) * ms; },   // шаг 15 минут
+      locale: "ru", locales: { ru: { current: "сейчас", time: "время", deleteSelected: "удалить" } },
+      format: { minorLabels: minorLabel, majorLabels: majorLabel },
+      editable: { add: false, remove: false, updateTime: true, updateGroup: true, overrideItems: false },
+      itemsAlwaysDraggable: { item: false, range: false },
+      onMove: function (item, callback) {
+        var orig = items.get(item.id);
+        callback(item);
+        setValue({ action: "move", id: item.id, group: item.group, start: fmt(item.start), end: fmt(item.end),
+                   orig_start: orig ? fmt(orig.start) : null, orig_end: orig ? fmt(orig.end) : null,
+                   orig_group: orig ? orig.group : null });
+        msg.textContent = "Пересчёт…";
+      },
+      onMoving: function (item, callback) {
+        msg.textContent = fmt(item.start) + " → " + fmt(item.end);
+        callback(item);
+      }
+    };
+    if (args.window) {                         // без start/end vis сам «подгоняет» масштаб под все элементы (включая фон)
+      opts.start = parse(args.window.start); opts.end = parse(args.window.end); windowKey = args.window.key;
+    }
+    timeline = new vis.Timeline(document.getElementById("tl"), items, groups, opts);
+    timeline.on("changed", setHeight);
+    timeline.on("select", function (p) {
+      if (p.items && p.items.length && String(p.items[0]).indexOf("bg") !== 0) {
+        setValue({ action: "select", id: p.items[0] });
+      }
+    });
+  }
+
+  function render(args) {
+    if (!timeline) { build(args); }
+    editable = args.editable !== false;
+    timeline.setOptions({ editable: editable ? { add: false, remove: false, updateTime: true, updateGroup: true, overrideItems: false } : false });
+    groups.clear();
+    groups.add((args.groups || []).map(function (g, i) { return { id: g.id, content: g.label || g.id, order: i }; }));
+    items.clear();
+    items.add((args.items || []).map(function (it) {
+      var o = { id: it.id, group: it.group, start: parse(it.start), end: parse(it.end), content: it.content || "",
+                title: it.title || "", className: it.className || "", style: it.style || "" };
+      if (it.type) { o.type = it.type; }
+      if (it.editable === false) { o.editable = false; }
+      else if (it.updateGroup === false) { o.editable = { updateTime: true, updateGroup: false, remove: false }; }
+      return o;
+    }));
+    if (args.window && args.window.key !== windowKey) {     // окно просмотра меняем только по запросу (не на каждый перерасчёт)
+      windowKey = args.window.key;
+      timeline.setWindow(parse(args.window.start), parse(args.window.end), { animation: false });
+    }
+    if (args.selected) { timeline.setSelection([args.selected]); }
+    msg.textContent = args.message || "Перетащите партию по времени; потяните за край, чтобы растянуть или сжать. Ctrl + колесо — масштаб.";
+    setHeight();
+  }
+
+  window.addEventListener("message", function (e) {
+    // приложение всегда тёмное (свой CSS в app.py), поэтому тему Streamlit не применяем
+    if (e.data && e.data.type === "streamlit:render") { render(e.data.args || {}); }
+  });
+  send("streamlit:componentReady", { apiVersion: 1 });
+  window.addEventListener("resize", setHeight);
+})();
+</script>
+</body>
+</html>

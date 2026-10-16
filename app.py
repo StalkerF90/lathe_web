@@ -13,6 +13,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import yaml
 import tech
+import plan
 import io
 import os
 import csv
@@ -558,6 +559,8 @@ def init_db():
 
     # Таблицы технологического модуля (справочники и журналы tech_*)
     tech.init_tables(c)
+    # План загрузки станков (plan_*): режим смен, календарь, позиции плана
+    plan.init_tables(c)
 
     conn.commit()
     conn.close()
@@ -3942,6 +3945,7 @@ def main():
             "📊 Графики":           "charts",
             "💾 Экспорт CSV":       "export",
             "🛠 Технология":        "tech",
+            "📅 План станков":      "plan",
         }
         pages_viewer = {
             "📊 Графики":           "charts",
@@ -4026,6 +4030,8 @@ def main():
         page_export()
     elif page_key == "tech":
         tech.page_tech(q, tx, audit)
+    elif page_key == "plan":
+        plan.page_plan(q, tx, audit, all_batches, batch_is_archived)
 
 
 if __name__ == "__main__":

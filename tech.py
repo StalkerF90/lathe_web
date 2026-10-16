@@ -15,6 +15,8 @@ from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 
+import workcal
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  РАЗБОР АРТИКУЛА (чистая логика, без БД)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -629,7 +631,16 @@ def parse_machines(text: str) -> tuple:
     return tuple(m.strip() for m in (text or "").split(",") if m.strip())
 
 
-def route_estimate(norms: list[dict], n_pcs: int, parallel: bool) -> dict:
+def machine_hours_per_day(q, day: date | None = None) -> float:
+    """Часы работы станка в рабочие сутки по режиму смен («📅 План станков» → «Режим смен»)."""
+    try:
+        rows = q("SELECT * FROM plan_shifts")
+    except Exception:                                # регистра ещё нет
+        return SHIFT_HOURS_PER_DAY
+    return workcal.hours_per_day(day or date.today(), rows) or SHIFT_HOURS_PER_DAY
+
+
+def route_estimate(norms: list[dict], n_pcs: int, parallel: bool, hours_per_day: float = SHIFT_HOURS_PER_DAY) -> dict:
     """norms: [{machine, setup_h, min_pc}] → часы по станкам и календарь.
     parallel: один оператор ведёт станки одновременно (связка) — календарь по самому загруженному."""
     rows, complete = [], True
@@ -645,7 +656,7 @@ def route_estimate(norms: list[dict], n_pcs: int, parallel: bool) -> dict:
     machine_hours = sum(totals) if totals else 0.0
     wall = (max(totals) if parallel else sum(totals)) if totals else 0.0
     return {"rows": rows, "complete": complete, "machine_hours": machine_hours, "wall_hours": wall,
-            "days": wall / SHIFT_HOURS_PER_DAY, "parallel": parallel}
+            "days": wall / hours_per_day, "hours_per_day": hours_per_day, "parallel": parallel}
 
 
 # ── Себестоимость ──────────────────────────────────────────────────────────
@@ -664,7 +675,8 @@ def effective(rows: list[dict], key_field: str, today: date) -> dict:
 
 
 def cost_breakdown(p: dict, art: dict | None, n_pcs: int, est: dict, prices: dict, mrates: dict,
-                   payroll: dict, work_days: float, with_components: bool | None = None) -> dict:
+                   payroll: dict, work_days: float, with_components: bool | None = None,
+                   machine_hours_day: float = SHIFT_HOURS_PER_DAY) -> dict:
     """Себестоимость партии. prices: {(kind, size): row}; mrates: {machine: row}; payroll: {role: row}.
     with_components: комплектовать гайками и кольцами (по умолчанию — исполнение «в сборе», A).
     Статья без данных → amount None (в итог не входит, показывается как «не задано»)."""
@@ -729,7 +741,7 @@ def cost_breakdown(p: dict, art: dict | None, n_pcs: int, est: dict, prices: dic
         add("Работа оператора", how, op_h * r_op if r_op else None, None if r_op else "нет ФОТ оператора")
     for r in est["rows"]:
         a = (mrates.get(r["machine"]) or {}).get("amort_month")
-        hr = a / (SHIFT_HOURS_PER_DAY * work_days) if a else None
+        hr = a / (machine_hours_day * work_days) if a else None
         if r["total_h"] is None:
             add(f"Амортизация {r['machine']}", "нет нормы времени", None, "нет нормы времени")
         elif hr is None:
@@ -1001,7 +1013,9 @@ def _tab_analysis(q, tx, audit):
         value=bool(p.get("assembled")), key=f"cost_comp_{key}", disabled=not n_tube,
         help="По умолчанию включено для исполнения «в сборе» (A, например -SA). На каждое обжимное соединение — "
              "1 гайка, 1 переднее и 1 заднее кольцо по ценам из регистра.")
-    cb = cost_breakdown(p, art, n_pcs, est, prices, mrates, payroll, work_days, with_components=with_comp)
+    mh_day = machine_hours_per_day(q, today)
+    cb = cost_breakdown(p, art, n_pcs, est, prices, mrates, payroll, work_days, with_components=with_comp,
+                        machine_hours_day=mh_day)
     df_c = pd.DataFrame([{"Статья": l["item"], "Сумма, ₽": l["amount"], "Нет данных": l["missing"] or "",
                           "Как посчитано": l["how"]} for l in cb["lines"]])
     st.dataframe(df_c, use_container_width=True, hide_index=True,
@@ -1012,7 +1026,7 @@ def _tab_analysis(q, tx, audit):
     if not cb["complete"]:
         st.warning("Себестоимость неполная: часть статей без данных (столбец «Нет данных»). "
                    "Цены, амортизацию и ФОТ можно внести на вкладке «💰 Цены и ставки».")
-    st.caption(f"Ставки: амортизация = сумма в месяц ÷ ({SHIFT_HOURS_PER_DAY:g} ч × {work_days:g} раб. дн.); "
+    st.caption(f"Ставки: амортизация = сумма в месяц ÷ ({mh_day:g} ч по режиму смен × {work_days:g} раб. дн.); "
                f"ФОТ = ФОТ в месяц ÷ ({PERSON_HOURS_PER_DAY:g} ч × {work_days:g} раб. дн.). "
                "Цены и ставки — действующие на сегодня (по дате начала действия).")
 
@@ -1031,8 +1045,9 @@ def _tab_rates(q, tx, audit):
             conn.execute("INSERT OR REPLACE INTO tech_settings (key, value) VALUES ('work_days', ?)", (f"{new:g}",))
             audit(conn, "update", "tech_settings", None, {"work_days": cur}, {"work_days": new})
         st.rerun()
-    st.caption(f"Ставка амортизации = сумма в месяц ÷ ({SHIFT_HOURS_PER_DAY:g} ч × рабочие дни); "
-               f"ставка ФОТ = ФОТ в месяц ÷ ({PERSON_HOURS_PER_DAY:g} ч × рабочие дни).")
+    st.caption(f"Ставка амортизации = сумма в месяц ÷ ({machine_hours_per_day(q):g} ч в сутки по режиму смен × рабочие дни); "
+               f"ставка ФОТ = ФОТ в месяц ÷ ({PERSON_HOURS_PER_DAY:g} ч × рабочие дни). "
+               "Режим смен задаётся в «📅 План станков» → «Режим смен».")
     _forging_price_form(q, tx, audit)
     _journal(q, tx, audit, "tech_prices", "Цены: металл, гайки, кольца, поковки",
              ["kind", "size", "price", "valid_from", "notes"],
@@ -1124,7 +1139,33 @@ def _route_section(q, p, key, h, hist, parsed_all, n_pcs):
     labels = [o["label"] for o in options]
     sel = options[labels.index(st.selectbox("Маршрут", labels, index=best, key=f"route_{key}"))]
     ms = sel["machines"]
+    rows = [{"Станок": r["machine"], "Наладка, ч": r["setup_h"], "Мин/шт": r["min_pc"], "Откуда": r["src"]}
+            for r in route_norms(p, key, h, hist, parsed_all, ms)]
+    st.caption("Нормы можно поправить прямо в таблице — расчёт и себестоимость пересчитаются.")
+    edited = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                            disabled=["Станок", "Откуда"], key=f"norms_{key}_{'+'.join(ms)}",
+                            column_config={"Наладка, ч": st.column_config.NumberColumn(min_value=0.0, step=0.25, format="%.2f"),
+                                           "Мин/шт": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.2f")})
+    est = route_estimate([{"machine": r["Станок"], "setup_h": r["Наладка, ч"], "min_pc": r["Мин/шт"]}
+                          for r in edited.to_dict("records")], n_pcs, sel["parallel"], machine_hours_per_day(q))
+    out = pd.DataFrame([{"Станок": r["machine"], "Наладка, ч": r["setup_h"], "Выпуск, ч": r["run_h"],
+                         "Всего, ч": r["total_h"]} for r in est["rows"]])
+    st.dataframe(out, use_container_width=True, hide_index=True,
+                 column_config={c: st.column_config.NumberColumn(format="%.1f") for c in ["Наладка, ч", "Выпуск, ч", "Всего, ч"]})
+    c1, c2 = st.columns(2)
+    c1.metric("Итого станко-часов", f"{est['machine_hours']:,.1f} ч")
+    c2.metric("Календарно", f"≈ {est['days']:.1f} сут",
+              help=("связка: станки работают одновременно, срок — по самому загруженному" if est["parallel"] and len(ms) > 1
+                    else "станки маршрута последовательно") + f"; {est['hours_per_day']:g} ч в сутки по режиму смен")
+    if not est["complete"]:
+        st.warning("Для части станков нет нормы мин/шт — введите её в таблице выше.")
+    st.caption("Медианы по партиям, сделанным ровно по этому маршруту; партии с наладкой > 24 ч исключены как ошибки ввода.")
+    return est
 
+
+def route_norms(p, key, h, hist, parsed_all, ms) -> list[dict]:
+    """Нормы по станкам маршрута: история артикула → похожий артикул → нет (ввести вручную).
+    h — история этого артикула, hist — вся история. Возвращает [{machine, setup_h, min_pc, src}]."""
     # похожие артикулы: тот же тип и размер первого торца, то же семейство (обжимной / резьбовой)
     compression = p["prefix"] in ("FN", "D")
     same_names = [n for n, v in parsed_all.items()
@@ -1149,28 +1190,9 @@ def _route_section(q, p, key, h, hist, parsed_all, n_pcs):
         if setup is None:
             setup = DEFAULT_SETUP_H / len(ms)
             src = (src + "; наладка по умолчанию" if src else f"нет статистики — введите мин/шт; наладка {DEFAULT_SETUP_H:g} ч на маршрут")
-        rows.append({"Станок": m, "Наладка, ч": round(setup, 2), "Мин/шт": None if mpc is None else round(mpc, 2),
-                     "Откуда": src})
-    st.caption("Нормы можно поправить прямо в таблице — расчёт и себестоимость пересчитаются.")
-    edited = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True,
-                            disabled=["Станок", "Откуда"], key=f"norms_{key}_{'+'.join(ms)}",
-                            column_config={"Наладка, ч": st.column_config.NumberColumn(min_value=0.0, step=0.25, format="%.2f"),
-                                           "Мин/шт": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.2f")})
-    est = route_estimate([{"machine": r["Станок"], "setup_h": r["Наладка, ч"], "min_pc": r["Мин/шт"]}
-                          for r in edited.to_dict("records")], n_pcs, sel["parallel"])
-    out = pd.DataFrame([{"Станок": r["machine"], "Наладка, ч": r["setup_h"], "Выпуск, ч": r["run_h"],
-                         "Всего, ч": r["total_h"]} for r in est["rows"]])
-    st.dataframe(out, use_container_width=True, hide_index=True,
-                 column_config={c: st.column_config.NumberColumn(format="%.1f") for c in ["Наладка, ч", "Выпуск, ч", "Всего, ч"]})
-    c1, c2 = st.columns(2)
-    c1.metric("Итого станко-часов", f"{est['machine_hours']:,.1f} ч")
-    c2.metric("Календарно", f"≈ {est['days']:.1f} сут",
-              help=("связка: станки работают одновременно, срок — по самому загруженному" if est["parallel"] and len(ms) > 1
-                    else "станки маршрута последовательно") + f"; {SHIFT_HOURS_PER_DAY:g} ч в сутки (2 смены по 8 ч минус пересменка)")
-    if not est["complete"]:
-        st.warning("Для части станков нет нормы мин/шт — введите её в таблице выше.")
-    st.caption("Медианы по партиям, сделанным ровно по этому маршруту; партии с наладкой > 24 ч исключены как ошибки ввода.")
-    return est
+        rows.append({"machine": m, "setup_h": round(setup, 2), "min_pc": None if mpc is None else round(mpc, 2),
+                     "src": src})
+    return rows
 
 
 def _save_article_field(tx, audit, key, fields: dict, source: str):
