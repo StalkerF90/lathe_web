@@ -2016,6 +2016,39 @@ def page_admin_crud():
                     st.success(f"Оператор «{o_name}» добавлен.")
                     st.rerun()
 
+        st.markdown("#### ✏️ Редактировать оператора")
+        _op_flash = st.session_state.pop("op_edit_flash", None)
+        if _op_flash:
+            (st.success if _op_flash[0] else st.error)(_op_flash[1])
+        if operators:
+            _ops = {o["id"]: o for o in operators}
+            eo_id = st.selectbox("Оператор", list(_ops), key="op_edit_pick",
+                                 format_func=lambda x, _o=_ops: f"#{x} {_o[x]['name']}"
+                                                              + (f" ({_o[x]['rank']})" if _o[x].get("rank") else ""))
+            with st.form(f"edit_op_{eo_id}"):
+                ec1, ec2 = st.columns(2)
+                eo_name = ec1.text_input("ФИО*", value=_ops[eo_id]["name"] or "")
+                eo_rank = ec2.text_input("Разряд", value=_ops[eo_id].get("rank") or "")
+                st.caption("Записи выпуска ссылаются на оператора по номеру — после переименования вся история "
+                           "покажет новое имя.")
+                if st.form_submit_button("💾 Сохранить", type="primary"):
+                    new_name, new_rank = eo_name.strip(), eo_rank.strip()
+                    dup = [o for o in operators if o["id"] != eo_id and (o["name"] or "").strip().lower() == new_name.lower()]
+                    if not new_name:
+                        st.session_state["op_edit_flash"] = (False, "Укажите ФИО.")
+                    elif dup:
+                        st.session_state["op_edit_flash"] = (False, f"Оператор «{new_name}» уже есть (#{dup[0]['id']}).")
+                    elif new_name == (_ops[eo_id]["name"] or "") and new_rank == (_ops[eo_id].get("rank") or ""):
+                        st.session_state["op_edit_flash"] = (True, "Изменений нет.")
+                    else:
+                        with tx() as conn:
+                            old = conn.execute("SELECT * FROM operators WHERE id=?", (eo_id,)).fetchone()
+                            conn.execute("UPDATE operators SET name=?, rank=? WHERE id=?", (new_name, new_rank, eo_id))
+                            audit(conn, "update", "operators", eo_id, dict(old) if old else None,
+                                  {"name": new_name, "rank": new_rank})
+                        st.session_state["op_edit_flash"] = (True, f"✅ Оператор #{eo_id} сохранён: «{new_name}».")
+                    st.rerun()
+
         st.markdown("#### 🗑 Удалить оператора")
         with st.form("del_op", clear_on_submit=True):
             ops_now = q("SELECT id, name FROM operators ORDER BY id")
