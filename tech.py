@@ -1167,6 +1167,21 @@ def _route_section(q, p, key, h, hist, parsed_all, n_pcs):
                             disabled=["Станок", "Откуда"], key=f"norms_{key}_{'+'.join(ms)}",
                             column_config={"Наладка, ч": st.column_config.NumberColumn(min_value=0.0, step=0.25, format="%.2f"),
                                            "Мин/шт": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.2f")})
+    if any(str(r["Откуда"]).startswith("оценка по торцам") or r["Мин/шт"] is None for r in rows):
+        ee = end_estimate(p, hist, parsed_all, ms)
+        if ee and ee.get("ends"):
+            with st.expander("📐 Оценка по торцам — как получена", expanded=True):
+                st.dataframe(pd.DataFrame([{"Торец": e["end"], "Что взято": e["how"], "Партий": e["n"],
+                                            "Мин/шт на торец (медиана)": e["per_end"], "Где встречался": e["examples"]}
+                                           for e in ee["ends"]]), use_container_width=True, hide_index=True)
+                if ee.get("total"):
+                    st.caption(f"По {ee['n_route']} партиям этого маршрута: время на штуку ÷ число торцов фитинга = "
+                               "«время на торец»; сумма по торцам ≈ " + f"{ee['total']:g} мин/шт"
+                               + ("" if len(ms) == 1 else " — делится между станками в обычной доле маршрута: "
+                                  + ", ".join(f"{m} {v:.0%}" for m, v in ee["share"].items()))
+                               + ". Это оценка: размер корпуса и сложность не учитываются — поправьте норму, если нужно.")
+                else:
+                    st.caption("Часть торцов на этом маршруте не делали — оценить нельзя, введите мин/шт вручную.")
     est = route_estimate([{"machine": r["Станок"], "setup_h": r["Наладка, ч"], "min_pc": r["Мин/шт"]}
                           for r in edited.to_dict("records")], n_pcs, sel["parallel"], machine_hours_per_day(q))
     out = pd.DataFrame([{"Станок": r["machine"], "Наладка, ч": r["setup_h"], "Выпуск, ч": r["run_h"],
@@ -1184,6 +1199,105 @@ def _route_section(q, p, key, h, hist, parsed_all, n_pcs):
     return est
 
 
+def _end_size_mm(e: dict) -> float | None:
+    """Размер торца в мм для поиска ближайшего: трубка 10M → 10, дюймовые коды (8 = 1/2") → n/16", M14×1,5 → 14."""
+    if e.get("kind") == "metric":
+        m = re.match(r"M(\d+)", e.get("key") or "")
+        return float(m.group(1)) if m else None
+    m = re.match(r"(\d+)(M?)", e.get("code") or "")
+    if not m:
+        return None
+    return float(m.group(1)) if m.group(2) else int(m.group(1)) * 25.4 / 16
+
+
+def _end_family(e: dict) -> str:
+    """Вид торца для «ближайшего размера»: место (обжим / наружная / внутренняя резьба) + тип резьбы."""
+    if e.get("kind") == "pipe":
+        return f"{e['slot']}:pipe:{e.get('type')}"
+    return f"{e['slot']}:{e.get('kind')}"
+
+
+def end_estimate(p: dict, hist: pd.DataFrame, parsed_all: dict, machines) -> dict | None:
+    """Оценка мин/шт по торцам, когда истории артикула и похожих нет.
+    По партиям, сделанным ровно по этому маршруту: время на штуку (сумма станков маршрута) ÷ число торцов
+    = «время на торец». Для каждого торца артикула — медиана по партиям с таким же торцом (или ближайшего
+    размера того же вида); сумма по торцам — оценка на штуку. Между станками маршрута (235 + 2100) делится
+    в обычной для маршрута доле; для 2105 / АПТ (оба установа на одном станке) — целиком на станок.
+    → {'rows': [{machine, min_pc}], 'ends': [...], 'n_route': N, 'total': мин/шт} или None."""
+    if hist is None or hist.empty or not p.get("ends"):
+        return None
+    want = frozenset(machines)
+    br = batch_routes(hist)
+    bns = [b for b, ms in br.items() if ms == want]
+    lathe = hist[(hist["wc"] == 0) & hist["batch_number"].isin(bns)]
+    if lathe.empty:
+        return None
+    per = lathe.groupby(["batch_number", "machine"]).agg(fact_min=("fact_min", "sum"), qty_max=("qty", "max"),
+                                                       total_qty=("total_qty", "max"), name=("name", "first")).reset_index()
+    pcs = per["total_qty"].where(per["total_qty"] > 0, per["qty_max"])
+    per["min_pc"] = (per["fact_min"] / pcs).where(pcs > 0)
+    per = per[per["min_pc"] > 0]
+    tab = per.pivot_table(index="batch_number", columns="machine", values="min_pc", aggfunc="sum")
+    tab = tab[[m for m in machines if m in tab.columns]].dropna() if all(m in tab.columns for m in machines) else tab.iloc[0:0]
+    if tab.empty:
+        return None
+    names = per.groupby("batch_number")["name"].first()
+    total = tab.sum(axis=1)
+    own = p.get("key")
+    # сравниваем только с деталями того же класса: из поковки с поковками, прямые с прямыми,
+    # гайки — только с гайками того же типа (FNN ≠ монтажная FNUBN)
+    def cls(v):
+        nut = all(e.get("slot") == "nut" for e in (v.get("ends") or [{}]))
+        return bool(v.get("forging")), nut, v.get("type_code") if nut else None
+    my_cls = cls(p)
+    samples = []                                     # (торец, вид, размер мм, время на торец, партия, артикул)
+    for bn, t in total.items():
+        v = parsed_all.get(names[bn]) or {}
+        ends = [e for e in (v.get("ends") or []) if e.get("kind")]
+        if not ends or v.get("key") == own or cls(v) != my_cls:
+            continue
+        per_end = float(t) / len(ends)
+        seen_k = set()
+        for e in ends:                               # одна партия — один голос на торец (FNU-12M: оба торца 12M)
+            if end_key(e) in seen_k:
+                continue
+            seen_k.add(end_key(e))
+            samples.append((end_key(e), _end_family(e), _end_size_mm(e), per_end, bn, v.get("key")))
+    if not samples:
+        return None
+    rows_e, est = [], 0.0
+    for e in p["ends"]:
+        if not e.get("kind"):
+            rows_e.append({"end": e.get("label"), "how": "размер не определён", "n": 0, "per_end": None, "examples": ""})
+            continue
+        k = end_key(e)
+        hit = [s for s in samples if s[0] == k]
+        how = "такой же торец"
+        if not hit:                                  # ближайший размер того же вида (не дальше ±60 %)
+            sz, fam = _end_size_mm(e), _end_family(e)
+            cand = [s for s in samples if s[1] == fam and s[2] and sz and abs(s[2] - sz) <= 0.6 * sz]
+            if cand:
+                best = min(abs(s[2] - sz) for s in cand)
+                hit = [s for s in cand if abs(s[2] - sz) - best < 1e-6]    # равноудалённые размеры — оба
+                how = f"ближайший размер ({hit[0][0].split(':', 1)[1]})"
+        if not hit:
+            rows_e.append({"end": end_label(e), "how": "такой торец на маршруте не делали", "n": 0, "per_end": None,
+                           "examples": ""})
+            continue
+        med = float(pd.Series([s[3] for s in hit]).median())
+        est += med
+        arts = sorted({s[5] for s in hit if s[5]})
+        rows_e.append({"end": end_label(e), "how": how, "n": len({s[4] for s in hit}), "per_end": round(med, 2),
+                       "examples": ", ".join(arts[:4]) + (f" и ещё {len(arts) - 4}" if len(arts) > 4 else "")})
+    if any(r["per_end"] is None for r in rows_e):
+        return {"rows": [], "ends": rows_e, "n_route": len(tab), "total": None}
+    share = (tab.div(total, axis=0)).median()
+    share = share / share.sum()
+    return {"rows": [{"machine": m, "min_pc": round(est * float(share[m]), 2)} for m in machines],
+            "ends": rows_e, "n_route": len(tab), "total": round(est, 2),
+            "share": {m: round(float(share[m]), 2) for m in machines}}
+
+
 def route_norms(p, key, h, hist, parsed_all, ms) -> list[dict]:
     """Нормы по станкам маршрута: история артикула → похожий артикул → нет (ввести вручную).
     h — история этого артикула, hist — вся история. Возвращает [{machine, setup_h, min_pc, src}]."""
@@ -1199,6 +1313,7 @@ def route_norms(p, key, h, hist, parsed_all, ms) -> list[dict]:
     sim_keys = sorted({parsed_all[n]["key"] for n in same_names
                        if n in set(similar_h["name"])}) if not similar_h.empty else []
     rows = []
+    est = None
     for m in ms:
         src, setup, mpc = None, None, None
         for df_, label in ((exact, "история"), (sim, "похожий: " + ", ".join(sim_keys[:3]))):
@@ -1208,6 +1323,15 @@ def route_norms(p, key, h, hist, parsed_all, ms) -> list[dict]:
                     src, mpc = f"{label} ({int(r['batches'])} парт.)", float(r["min_per_pc_med"])
                     setup = None if pd.isna(r["setup_med_h"]) else float(r["setup_med_h"])
                     break
+        if mpc is None:                              # ни истории, ни похожего — оценка по торцам
+            if est is None:
+                est = end_estimate(p, hist, parsed_all, ms) or {}
+            hit = next((r for r in est.get("rows", []) if r["machine"] == m), None)
+            if hit and hit["min_pc"]:
+                mpc = hit["min_pc"]
+                src = "оценка по торцам: " + "; ".join(
+                    f"{e['end'].split(' — ')[-1]} — {e['n']} парт." + ("" if e["how"] == "такой же торец" else f", {e['how']}")
+                    for e in est["ends"])
         if setup is None:
             setup = DEFAULT_SETUP_H / len(ms)
             src = (src + "; наладка по умолчанию" if src else f"нет статистики — введите мин/шт; наладка {DEFAULT_SETUP_H:g} ч на маршрут")
