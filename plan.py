@@ -325,14 +325,22 @@ def item_progress(items: list[dict], fact: list[dict], totals: dict | None = Non
                 per_stage[f["stage"]] = per_stage.get(f["stage"], 0) + int(f["qty"] or 0)
             done = max(per_stage.values()) if per_stage else 0
         before = max(0, int(totals.get(key[0]) or 0) - planned.get(key[0], 0))   # сделано до планирования остатка
-        done = max(0, done - before)
+        raw = done
+        pre = min(raw, before)                       # из выпуска станка — штуки, сделанные до планирования
+        done = max(0, raw - before)
         last = max((str(f["date"])[:10] for f in recs), default="")
         first = min((str(f["date"])[:10] for f in recs), default="")
-        for i in lst:
+        for k, i in enumerate(lst):
             qty = int(i.get("qty") or 0)
             got = min(done, qty) if qty else 0
             done -= got
-            out[i["id"]] = {"done": got, "pct": round(100 * got / qty) if qty else 0, "last": last, "first": first}
+            # для показа: первая позиция станка включает выпуск до планирования (партия 200, в плане остаток 177,
+            # на станке уже 23 → «23 из 200», а не «0 из 177»); «done/pct» — только по остатку (для прогноза)
+            b_i = before if k == 0 else 0
+            s_done, s_qty = (pre if k == 0 else 0) + got, b_i + qty
+            out[i["id"]] = {"done": got, "pct": round(100 * got / qty) if qty else 0, "last": last, "first": first,
+                            "before": pre if k == 0 else 0, "shown_done": s_done, "shown_qty": s_qty,
+                            "shown_pct": round(100 * s_done / s_qty) if s_qty else 0}
     return out
 
 
@@ -699,21 +707,25 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
         if it["kind"] == "партия":
             hrs = item_hours(it)
             pr = prog.get(it["id"], {"done": 0, "pct": 0, "last": ""})
+            sp, sd, sq, bf = (pr.get("shown_pct", pr["pct"]), pr.get("shown_done", pr["done"]),
+                              pr.get("shown_qty", it["qty"] or 0), pr.get("before", 0))
             name = e(f"№{it['batch_number']} {names.get(it['batch_number'], '')}")
             late = it["end"] < now_s and pr["pct"] < 100
             due_late = bool(it.get("due_date")) and it["end"][:10] > it["due_date"] and pr["pct"] < 100
-            content = (f"{name} · {it['qty'] or 0} шт" + (f" · {pr['pct']}%" if pr["done"] else "")
+            content = (f"{name} · {it['qty'] or 0} шт" + (f" · {sp}%" if sd else "")
                        + (" ✔" if pr["pct"] >= 100 else "") + (" ✋" if it.get("hours_manual") is not None else ""))
             title = (f"{name}<br>{it['qty'] or 0} шт · {e(it['route'] or '')}<br>"
                      f"{it['start']} → {it['end']}<br>наладка {it['setup_h'] or 0:g} ч ({e(it['setup_why'] or '')}), "
                      f"выпуск {it['run_h'] or 0:.1f} ч" + (f"<br>длительность задана вручную: {hrs:.1f} ч"
                                                          if it.get("hours_manual") is not None else "")
-                     + f"<br><b>Факт: {pr['done']} из {it['qty'] or 0} шт ({pr['pct']}%)</b>"
+                     + f"<br><b>Факт на станке: {sd} из {sq} шт ({sp}%)</b>"
+                     + (f"<br>из них {bf} шт сделаны до постановки в план; по позиции (остаток {it['qty'] or 0} шт): "
+                        f"{pr['done']} шт ({pr['pct']}%)" if bf else "")
                      + (f", последняя запись {pr['last']}" if pr["last"] else "")
                      + ("<br>⚠️ срок по плану прошёл, партия не закончена" if late else "")
                      + (f"<br>Срок заказа: {_d_ru(it['due_date'])}" if it.get("due_date") else "")
                      + ("<br>⏰ по плану не успевает к сроку" if due_late else ""))
-            col, p = _color(it["batch_number"]), max(0, min(pr["pct"], 100))
+            col, p = _color(it["batch_number"]), max(0, min(sp, 100))
             bg = (f"linear-gradient(90deg, {_shade(col)} 0%, {_shade(col)} {p}%, {col} {p}%, {col} 100%)" if p else col)
             vis_items.append({"id": it["id"], "group": it["machine"], "start": it["start"], "end": it["end"],
                               "title": title, "updateGroup": False,
@@ -824,7 +836,10 @@ def _selected_panel(q, tx, audit, ctx, items, arts, made, it, names):
     unit = [i for i in items if it.get("linked") and i.get("grp") == it.get("grp")] or [it]
     prog = progress(q, items) if it["kind"] == "партия" else {}
     rows = [{"Станок": i["machine"], "Начало": i["start"], "Окончание": i["end"], "Кол-во": i.get("qty"),
-             "Факт, шт": prog.get(i["id"], {}).get("done", 0), "Факт, %": prog.get(i["id"], {}).get("pct", 0),
+             "Факт на станке, шт": prog.get(i["id"], {}).get("shown_done", 0),
+             "Факт, %": prog.get(i["id"], {}).get("shown_pct", 0),
+             "До постановки в план, шт": prog.get(i["id"], {}).get("before", 0),
+             "По остатку, шт": prog.get(i["id"], {}).get("done", 0),
              "Наладка, ч": i.get("setup_h"), "Почему такая наладка": i.get("setup_why") or "",
              "Мин/шт": i.get("min_pc"), "Выпуск, ч": None if i.get("run_h") is None else round(i["run_h"], 2),
              "Вручную, ч": i.get("hours_manual")} for i in unit]
@@ -1150,14 +1165,17 @@ def _tab_list(q):
         late = _dt(it["end"]) < datetime.now()
         status = "" if it["kind"] != "партия" else (
             "выполнено" if it.get("qty") and made_q >= it["qty"] else
-            ("в работе, срок прошёл" if late else "в работе") if made_q else
+            ("в работе, срок прошёл" if late else "в работе") if (made_q or pr.get("first")) else
             "просрочено" if late else "не начато")
         rows.append({"ID": it["id"], "Вид": it["kind"], "Станок": it["machine"],
                      "Партия": it["batch_number"] or "", "Название": names.get(it["batch_number"], ""),
                      "Кол-во": it.get("qty"), "Начало": it["start"], "Окончание": it["end"],
                      "Часы": round(item_hours(it), 2) if it["kind"] == "партия" else None,
-                     "Наладка, ч": it.get("setup_h"), "Факт, шт": made_q if it["kind"] == "партия" else None,
-                     "Факт, %": pr["pct"] if it["kind"] == "партия" else None,
+                     "Наладка, ч": it.get("setup_h"),
+                     "Факт на станке, шт": pr.get("shown_done", made_q) if it["kind"] == "партия" else None,
+                     "Факт, %": pr.get("shown_pct", pr["pct"]) if it["kind"] == "партия" else None,
+                     "До постановки в план, шт": pr.get("before", 0) if it["kind"] == "партия" else None,
+                     "По остатку, шт": made_q if it["kind"] == "партия" else None,
                      "Последняя запись": pr["last"], "Статус": status,
                      "Примечание": it.get("notes") or ""})
     df = pd.DataFrame(rows)
@@ -1165,9 +1183,10 @@ def _tab_list(q):
     if flt != "все":
         df = df[df["Станок"] == flt]
     st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption("Факт — выпуск партии на этом станке по истории выпуска: финальный выпуск, а если его нет — самый "
-               "продвинутый этап. Считаются записи не раньше начала позиции или даты постановки в план (что раньше); "
-               "если партия стоит на станке несколько раз, факт заполняет позиции по порядку.")
+    st.caption("Факт на станке — выпуск партии на этом станке по всем записям: финальный выпуск, а если его нет — самый "
+               "продвинутый этап. Если в план поставлен только остаток партии, уже сделанное до постановки показано "
+               "отдельно («До постановки в план»), а «По остатку» — сколько сделано из поставленного количества. "
+               "Если партия стоит на станке несколько раз, факт заполняет позиции по порядку.")
 
 
 def _tab_shifts(q, tx, audit):
