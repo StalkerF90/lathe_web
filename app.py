@@ -1044,7 +1044,10 @@ def page_machines(role):
             format_func=lambda x: op_map[x],
             key=f"{PF}operator",
         )
-        prod_date    = r1c3.date_input("Дата*", value=date.today(), key=f"{PF}date")
+        # дата могла быть перенесена из прошлой записи (см. сброс после сохранения) — тогда без value=,
+        # иначе Streamlit предупреждает о двойном задании значения
+        prod_date    = r1c3.date_input("Дата*", key=f"{PF}date",
+                                       **({} if f"{PF}date" in st.session_state else {"value": date.today()}))
         produced_qty = r1c4.number_input(
             "Выпущено (шт)", min_value=0, step=1, key=f"{PF}qty",
             help="0 = наладка без выпуска / тестовый прогон")
@@ -1262,10 +1265,19 @@ def page_machines(role):
                 if fact_min:
                     msg += f" | факт {fact_min:.0f} мин"
             # ── Сброс полей формы: новое поколение ключей ───────────────
+            # Количество, наладка, время, примечание и «финальный» очищаются; станок, оператор,
+            # дата и этап переносятся в новую форму — следующую запись обычно вносят на том же станке.
             st.session_state["pf_flash"] = msg
+            keep = {"machine": sel_machine, "operator": sel_operator, "date": prod_date,
+                    "machine_prev": sel_machine}
+            if not is_wc and confirmed_stage:
+                keep["stage_lathe"] = confirmed_stage
             for _k in [k for k in st.session_state if k.startswith(PF)]:
                 del st.session_state[_k]
             st.session_state["pf_gen"] += 1
+            NEW_PF = f"pf{st.session_state['pf_gen']}_"
+            for _f, _v in keep.items():
+                st.session_state[f"{NEW_PF}{_f}"] = _v
             st.rerun()
 
     else:  # repair
