@@ -109,7 +109,10 @@ def init_tables(c):
         c.execute("ALTER TABLE plan_items ADD COLUMN order_id INTEGER")
     if "due_date" not in cols:
         c.execute("ALTER TABLE plan_items ADD COLUMN due_date TEXT")
+    if "setup_manual" not in cols:                  # наладка, заданная вручную (0 — без наладки); NULL — по правилам
+        c.execute("ALTER TABLE plan_items ADD COLUMN setup_manual REAL")
     c.execute("INSERT OR IGNORE INTO plan_settings (key, value) VALUES ('machines', ?)", (", ".join(DEFAULT_MACHINES),))
+    c.execute("INSERT OR IGNORE INTO plan_settings (key, value) VALUES ('saturday_shifts', ?)", (str(workcal.DEFAULT_SAT_SHIFTS),))
     if c.execute("SELECT COUNT(*) FROM plan_shifts").fetchone()[0] == 0:
         c.executemany("INSERT INTO plan_shifts (valid_from, shift_no, shift_start, shift_end, lunch_start, lunch_min, notes) "
                       "VALUES (?,?,?,?,?,?,?)",
@@ -149,7 +152,9 @@ def _d_ru(iso: str | None) -> str:
 def load_ctx(q) -> dict:
     """Режим смен, календарь исключений, станки плана."""
     shifts = [workcal.norm_shift(r) for r in q("SELECT * FROM plan_shifts")]
-    cal ={r["day"]: r["kind"] for r in q("SELECT day, kind FROM plan_calendar")}
+    cal = {r["day"]: r["kind"] for r in q("SELECT day, kind FROM plan_calendar")}
+    sat = q("SELECT value FROM plan_settings WHERE key='saturday_shifts'", fetch="one")
+    cal[workcal.SAT_KEY] = int(sat["value"]) if sat and str(sat.get("value") or "").isdigit() else workcal.DEFAULT_SAT_SHIFTS
     ms = q("SELECT value FROM plan_settings WHERE key='machines'", fetch="one")
     machines = tech.parse_machines(ms["value"]) if ms and ms.get("value") else tuple(DEFAULT_MACHINES)
     return {"shifts": shifts, "cal": cal, "machines": list(machines)}
@@ -259,7 +264,11 @@ def reflow(items: list[dict], ctx: dict, arts: dict, made_hist: set, anchor_grp=
         prev = {}
         for it in sorted([i for i in items if i["kind"] == "партия"], key=lambda i: (_dt(i["start"]), i.get("id") or 0)):
             art = arts.get(it.get("batch_number"))
-            h, why = setup_rule(it["machine"], art, prev.get(it["machine"]), made)
+            if it.get("setup_manual") is not None:   # задано вручную в панели позиции
+                h = float(it["setup_manual"])
+                why = "без наладки (задано вручную)" if h == 0 else "задано вручную"
+            else:
+                h, why = setup_rule(it["machine"], art, prev.get(it["machine"]), made)
             if it.get("setup_h") is None or abs(float(it["setup_h"]) - h) > 1e-9:
                 changed = True
             it["setup_h"], it["setup_why"] = h, why
@@ -351,9 +360,9 @@ def history_items(rows: list[dict], ctx) -> list[dict]:
     по фактическим минутам + наладке (минимум 15 мин, не дальше конца дня); подряд идущие куски одной
     партии на станке (простой между ними меньше 2 рабочих часов) склеиваются в одну полосу."""
     cal = dict(ctx["cal"])
-    for r in rows:                                   # день с записями — рабочий (например, рабочая суббота/воскресенье)
+    for r in rows:                                   # день с записями — работали (все смены режима), даже сб/вс
         d = str(r["date"])[:10]
-        if not workcal.is_working_day(date.fromisoformat(d), cal):
+        if workcal.shift_limit(date.fromisoformat(d), cal) is not None:
             cal[d] = "рабочий"
     c2 = dict(ctx, cal=cal)
     by_md = {}
@@ -527,7 +536,7 @@ def made_from_history(hist: pd.DataFrame) -> set:
 def save_items(tx, audit, before: list[dict], after: list[dict], new_items=(), deleted_ids=()):
     """Записывает изменения плана одной транзакцией (с журналом изменений)."""
     cols = ["kind", "batch_number", "qty", "machine", "grp", "linked", "route", "start", "end", "setup_h", "setup_why",
-            "min_pc", "run_h", "hours_manual", "notes", "order_id", "due_date"]
+            "min_pc", "run_h", "hours_manual", "notes", "order_id", "due_date", "setup_manual"]
     old = {it["id"]: it for it in before if it.get("id")}
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     qc = lambda c: {"start": "start_at", "end": "end_at"}.get(c, c)
@@ -830,6 +839,62 @@ def _on_move(q, tx, audit, ctx, items, arts, made, ev):
                         anchor_grp=it.get("grp") if it.get("linked") else None, anchor_id=it["id"])
 
 
+_SETUP_MODES = ["по правилам", "без наладки", "вручную"]
+
+
+def apply_edit(items: list[dict], unit_ids: set, qty: int, per_machine: dict, note: str | None) -> tuple[list[dict], bool]:
+    """Правка позиции (связки): количество, мин/шт и наладка по станкам. per_machine: {станок: (мин/шт, режим, ч)}.
+    Режим наладки: «по правилам» (setup_manual = NULL), «без наладки» (0), «вручную» (ч).
+    Если меняется то, от чего зависит длительность, ручная длительность (растягивание) сбрасывается.
+    → (новый план, сброшена ли ручная длительность)."""
+    new, reset = [], False
+    for i in items:
+        i = dict(i)
+        if i["id"] in unit_ids:
+            mpc, mode, hrs = per_machine[i["machine"]]
+            sm = None if mode == "по правилам" else 0.0 if mode == "без наладки" else float(hrs)
+            run = int(qty) * float(mpc) / 60
+            changed = (int(i.get("qty") or 0) != int(qty) or float(i.get("min_pc") or 0) != float(mpc)
+                       or i.get("setup_manual") != sm)
+            if changed and i.get("hours_manual") is not None:
+                i["hours_manual"] = None
+                reset = True
+            i.update(qty=int(qty), min_pc=float(mpc), run_h=run, setup_manual=sm)
+            if note is not None:
+                i["notes"] = note
+        new.append(i)
+    return new, reset
+
+
+def _edit_form(q, tx, audit, ctx, items, arts, made, it, unit):
+    with st.expander("✏️ Изменить нормы, наладку, количество"):
+        with st.form(f"plan_edit_{it['id']}"):
+            qty = st.number_input("Количество, шт" + (" (общее для связки)" if len(unit) > 1 else ""), min_value=1, step=10,
+                                  value=int(it.get("qty") or 1))
+            per = {}
+            for i in unit:
+                c1, c2, c3 = st.columns([2, 2, 1.4])
+                mpc = c1.number_input(f"{i['machine']}: мин/шт", min_value=0.01, step=0.1, format="%.2f",
+                                      value=max(float(i.get("min_pc") or 0), 0.01), key=f"pe_mpc_{i['id']}")
+                sm = i.get("setup_manual")
+                mode = c2.selectbox(f"{i['machine']}: наладка", _SETUP_MODES,
+                                    index=0 if sm is None else 1 if float(sm) == 0 else 2, key=f"pe_mode_{i['id']}",
+                                    help=f"Сейчас {i.get('setup_h') or 0:g} ч — {i.get('setup_why') or ''}. «По правилам»: "
+                                         "4 ч с нуля / 2 ч тот же HEX и торец / 30 мин уже делали на станке.")
+                hrs = c3.number_input("ч (если вручную)", min_value=0.0, step=0.25, format="%.2f",
+                                      value=float(sm if sm not in (None, 0) else (i.get("setup_h") or 0)),
+                                      key=f"pe_h_{i['id']}")
+                per[i["machine"]] = (mpc, mode, hrs)
+            note = st.text_input("Примечание", value=it.get("notes") or "")
+            go = st.form_submit_button("Применить", type="primary")
+        if go:
+            new, reset = apply_edit(items, {i["id"] for i in unit}, qty, per, note.strip())
+            ok, msg = apply_change(q, tx, audit, ctx, items, arts, made, changed=new,
+                                   anchor_grp=it.get("grp") if it.get("linked") else None, anchor_id=it["id"])
+            st.session_state["plan_flash"] = (ok, msg + (" Ручная длительность сброшена — время по новым нормам." if ok and reset else ""))
+            st.rerun()
+
+
 def _selected_panel(q, tx, audit, ctx, items, arts, made, it, names):
     st.markdown("#### Выбрано: " + (f"партия №{it['batch_number']} {names.get(it['batch_number'], '')}" if it["kind"] == "партия"
                                     else f"{it['kind']} · {it['machine']}"))
@@ -846,6 +911,8 @@ def _selected_panel(q, tx, audit, ctx, items, arts, made, it, names):
     if it["kind"] != "партия":
         rows = [{"Станок": it["machine"], "Начало": it["start"], "Окончание": it["end"], "Примечание": it.get("notes") or ""}]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    if it["kind"] == "партия":
+        _edit_form(q, tx, audit, ctx, items, arts, made, it, unit)
     c1, c2, c3, c4, c5 = st.columns(5)
     if it["kind"] == "партия":
         has_fact = any(prog.get(i["id"], {}).get("first") for i in unit)
@@ -1219,7 +1286,15 @@ def _tab_shifts(q, tx, audit):
         st.markdown("**Итог по режимам**")
         st.dataframe(pd.DataFrame(summ), use_container_width=True, hide_index=True)
     st.caption("Две смены 07:00–15:30 и 15:00–23:30 с обедом по 30 мин дают 15,5 ч станка в сутки "
-               "(получасовое перекрытие на пересменке считается один раз).")
+               "(получасовое перекрытие на пересменке считается один раз). Суббота по умолчанию — первая смена "
+               "(настройка на вкладке «📆 Праздники и выходные»).")
+    if st.button("↻ Пересчитать план по новому режиму", key="plan_shift_recalc",
+                 help="Стоящие в плане партии остаются на своих местах, длительность и окончание считаются по текущему режиму."):
+        st.session_state["plan_shift_flash"] = recalc_plan(q, tx, audit)
+        st.rerun()
+    m = st.session_state.pop("plan_shift_flash", None)
+    if m:
+        (st.success if m[0] else st.error)(m[1])
 
 
 def _is_hhmm(v: str) -> bool:
@@ -1234,55 +1309,100 @@ _WD = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 _MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
 
 
+def recalc_plan(q, tx, audit) -> tuple[bool, str]:
+    """Пересчитать весь план по текущему календарю и режиму смен (без якоря: позиции остаются на месте,
+    если ни с чем не пересекаются; длительность и окончание — по новому рабочему времени)."""
+    items = load_items(q)
+    if not any(i["kind"] == "партия" for i in items):
+        return True, "План пуст — пересчитывать нечего."
+    batches = q("SELECT batch_number, batch_name, total_qty FROM batches")
+    hist = tech.load_history(q)
+    res = reflow([dict(i) for i in items], load_ctx(q), article_info(q, batches), made_from_history(hist))
+    bad = conflicts(res)
+    if bad:
+        return False, "Не пересчитано: " + "; ".join(bad[:3])
+    changed = sum(1 for r in res for o in items if o["id"] == r["id"] and (o["start"], o["end"]) != (r["start"], r["end"]))
+    save_items(tx, audit, items, res)
+    return True, f"План пересчитан по календарю и режиму смен: изменилось время у {changed} позиций."
+
+
+_DAY_LABEL = {"выходной": "выходной", "1 смена": "1 смена", "рабочий": "2 смены"}
+_LABEL_DAY = {v: k for k, v in _DAY_LABEL.items()}
+
+
 def _tab_calendar(q, tx, audit):
-    st.caption("Рабочая неделя — понедельник–суббота. Снимите галочку у праздника или поставьте у рабочего воскресенья; "
-               "сохраняются только отличия от обычной недели.")
+    st.caption("Пн–пт — все смены режима, суббота — по настройке ниже (по умолчанию 1 смена), воскресенье — выходной. "
+               "Для любого дня можно выбрать «выходной», «1 смена» или «2 смены» (все смены режима); сохраняются только "
+               "отличия от обычной недели. После сохранения стоящие в плане партии пересчитываются.")
+    ctx = load_ctx(q)
+    sat_now = int(ctx["cal"].get(workcal.SAT_KEY, workcal.DEFAULT_SAT_SHIFTS))
+    sat_opts = {0: "выходной", 1: "1 смена", 2: "2 смены"}
+    s1, s2 = st.columns([2, 3])
+    sat_new = s1.selectbox("Суббота по умолчанию", list(sat_opts), index=list(sat_opts).index(min(sat_now, 2)),
+                           format_func=sat_opts.get, key="plan_sat_default")
+    s2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    if s2.button("💾 Сохранить настройку субботы", key="plan_sat_save", disabled=sat_new == min(sat_now, 2)):
+        with tx() as conn:
+            conn.execute("INSERT OR REPLACE INTO plan_settings (key, value) VALUES ('saturday_shifts', ?)", (str(sat_new),))
+            audit(conn, "update", "plan_settings", None, {"saturday_shifts": sat_now}, {"saturday_shifts": sat_new})
+        ok, msg = recalc_plan(q, tx, audit)
+        st.session_state["plan_cal_flash"] = (ok, f"Суббота по умолчанию: {sat_opts[sat_new]}. " + msg)
+        st.rerun()
     c1, c2 = st.columns(2)
     today = date.today()
     y = c1.number_input("Год", min_value=2024, max_value=2035, value=today.year, step=1, key="plan_cal_y")
     mth = c2.selectbox("Месяц", list(range(1, 13)), index=today.month - 1, format_func=lambda m: _MONTHS[m - 1], key="plan_cal_m")
     ex = {r["day"]: r for r in q("SELECT * FROM plan_calendar WHERE day LIKE ?", (f"{int(y):04d}-{mth:02d}-%",))}
-    ctx = load_ctx(q)
     rows, d = [], date(int(y), mth, 1)
     while d.month == mth:
         r = ex.get(d.isoformat())
-        rows.append({"Дата": d, "День": _WD[d.weekday()], "Рабочий": workcal.is_working_day(d, ctx["cal"]),
+        kind = r["kind"] if r and r["kind"] in workcal.DAY_KINDS else workcal.default_kind(d, ctx["cal"])
+        rows.append({"Дата": d, "День": _WD[d.weekday()], "Режим дня": _DAY_LABEL[kind],
                      "Примечание": (r or {}).get("note") or ""})
         d += timedelta(days=1)
     df = pd.DataFrame(rows)
     ed = st.data_editor(df, hide_index=True, use_container_width=True, disabled=["Дата", "День"],
-                        key=f"plan_cal_ed_{int(y)}_{mth}",
+                        key=f"plan_cal_ed_{int(y)}_{mth}_{sat_now}",
                         column_config={"Дата": st.column_config.DateColumn(format="DD.MM.YYYY"),
-                                       "Рабочий": st.column_config.CheckboxColumn()})
-    wd = int(ed["Рабочий"].sum())
-    hrs = sum(workcal.hours_per_day(r["Дата"], ctx["shifts"]) for r in ed.to_dict("records") if r["Рабочий"])
+                                       "Режим дня": st.column_config.SelectboxColumn(options=list(_LABEL_DAY), required=True)})
+    recs = ed.to_dict("records")
+    cal_preview = dict(ctx["cal"])
+    for r in recs:
+        day = r["Дата"].date() if isinstance(r["Дата"], pd.Timestamp) else r["Дата"]
+        cal_preview[day.isoformat()] = _LABEL_DAY.get(r["Режим дня"], "рабочий")
+    wd = sum(1 for r in recs if r["Режим дня"] != "выходной")
+    hrs = workcal.month_work_hours(int(y), mth, ctx["shifts"], cal_preview)
     st.caption(f"Рабочих дней: {wd}; часов станка за месяц по режиму смен: {hrs:,.1f}.")
-    if st.button("💾 Сохранить календарь месяца", type="primary", key=f"plan_cal_save_{int(y)}_{mth}"):
+    b1, b2 = st.columns(2)
+    if b1.button("💾 Сохранить календарь месяца", type="primary", key=f"plan_cal_save_{int(y)}_{mth}"):
         n = 0
         with tx() as conn:
-            for r in ed.to_dict("records"):
-                day = r["Дата"]
-                if isinstance(day, pd.Timestamp):
-                    day = day.date()
-                iso, normal = day.isoformat(), day.weekday() in workcal.WORK_WEEKDAYS
+            for r in recs:
+                day = r["Дата"].date() if isinstance(r["Дата"], pd.Timestamp) else r["Дата"]
+                iso = day.isoformat()
+                kind = _LABEL_DAY.get(r["Режим дня"], "рабочий")
                 note = (r.get("Примечание") or "").strip()
                 old = ex.get(iso)
-                if bool(r["Рабочий"]) == normal:     # как обычно → исключение не нужно
+                if kind == workcal.default_kind(day, ctx["cal"]) and not note:   # как обычно → исключение не нужно
                     if old:
                         conn.execute("DELETE FROM plan_calendar WHERE day=?", (iso,))
                         audit(conn, "delete", "plan_calendar", None, old)
                         n += 1
                     continue
-                new = {"day": iso, "kind": "рабочий" if r["Рабочий"] else "выходной", "note": note}
+                new = {"day": iso, "kind": kind, "note": note}
                 if not old or old["kind"] != new["kind"] or (old.get("note") or "") != note:
                     conn.execute("INSERT OR REPLACE INTO plan_calendar (day, kind, note) VALUES (?,?,?)", tuple(new.values()))
                     audit(conn, "update" if old else "insert", "plan_calendar", None, old, new)
                     n += 1
-        st.session_state["plan_cal_flash"] = f"✅ Сохранено изменений: {n}. Уже стоящие партии пересчитаются при следующем изменении плана."
+        ok, msg = recalc_plan(q, tx, audit) if n else (True, "")
+        st.session_state["plan_cal_flash"] = (ok, f"Сохранено изменений календаря: {n}. " + msg)
+        st.rerun()
+    if b2.button("↻ Пересчитать план по календарю", key=f"plan_cal_recalc_{int(y)}_{mth}"):
+        st.session_state["plan_cal_flash"] = recalc_plan(q, tx, audit)
         st.rerun()
     m = st.session_state.pop("plan_cal_flash", None)
     if m:
-        st.success(m)
+        (st.success if m[0] else st.error)(m[1])
 
 
 # ═══════════════════════════════════════════════════════════════════════════

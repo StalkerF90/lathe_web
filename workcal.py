@@ -5,12 +5,17 @@
 =============================================================================
 Режим смен — записи с датой начала действия: на дату действуют все смены
 с наибольшей valid_from ≤ даты. Смена: начало, конец, обед (начало, минуты).
-Рабочая неделя — пн–сб; исключения (праздник / рабочее воскресенье) —
-отдельным календарём {день: 'выходной' | 'рабочий'}.
+Рабочая неделя — пн–пт все смены режима, суббота — по умолчанию 1 смена (настройка), воскресенье — выходной.
+Исключения — календарём {день: 'выходной' | '1 смена' | 'рабочий' (все смены режима)}; число смен в субботу
+по умолчанию передаётся в том же словаре ключом SAT_KEY.
 """
 from datetime import date, datetime, time, timedelta
 
-WORK_WEEKDAYS = {0, 1, 2, 3, 4, 5}          # пн–сб
+WORK_WEEKDAYS = {0, 1, 2, 3, 4, 5}          # пн–сб — рабочие дни
+SATURDAY = 5
+SAT_KEY = "__saturday_shifts__"             # в календаре: сколько смен в субботу по умолчанию (0 — выходной)
+DEFAULT_SAT_SHIFTS = 1
+DAY_KINDS = ("выходной", "1 смена", "рабочий")   # отметки календаря; «рабочий» — все смены режима
 DEFAULT_SHIFTS = [                           # действует, пока в регистре нет записей
     {"valid_from": "2000-01-01", "shift_no": 1, "start": "07:00", "end": "15:30", "lunch_start": "11:00", "lunch_min": 30},
     {"valid_from": "2000-01-01", "shift_no": 2, "start": "15:00", "end": "23:30", "lunch_start": "19:00", "lunch_min": 30},
@@ -47,13 +52,32 @@ def shifts_for(day: date, shift_rows: list[dict]) -> list[dict]:
     return sorted([r for r in rows if str(r["valid_from"])[:10] == vf], key=lambda r: int(r.get("shift_no") or 0))
 
 
-def is_working_day(day: date, calendar: dict) -> bool:
-    kind = (calendar or {}).get(day.isoformat())
+def shift_limit(day: date, calendar: dict) -> int | None:
+    """Сколько смен режима работает в день: 0 — выходной, None — все, 1 — только первая."""
+    cal = calendar or {}
+    kind = cal.get(day.isoformat())
     if kind == "выходной":
-        return False
+        return 0
+    if kind == "1 смена":
+        return 1
     if kind == "рабочий":
-        return True
-    return day.weekday() in WORK_WEEKDAYS
+        return None
+    wd = day.weekday()
+    if wd == SATURDAY:
+        n = cal.get(SAT_KEY, DEFAULT_SAT_SHIFTS)
+        n = DEFAULT_SAT_SHIFTS if n is None else int(n)
+        return None if n >= 9 else n                 # 9+ — «все смены»
+    return None if wd in WORK_WEEKDAYS else 0
+
+
+def default_kind(day: date, calendar: dict) -> str:
+    """Отметка дня без исключения в календаре (для показа и сохранения только отличий)."""
+    n = shift_limit(day, {SAT_KEY: (calendar or {}).get(SAT_KEY, DEFAULT_SAT_SHIFTS)})
+    return "выходной" if n == 0 else "1 смена" if n == 1 else "рабочий"
+
+
+def is_working_day(day: date, calendar: dict) -> bool:
+    return shift_limit(day, calendar) != 0
 
 
 def _merge(intervals):
@@ -69,10 +93,11 @@ def _merge(intervals):
 def day_periods(day: date, shift_rows: list[dict], calendar: dict) -> list[dict]:
     """Непрерывные периоды работы станка за день (смены, перекрывающиеся на пересменке, сливаются).
     Каждый период: {'start','end','work': [(s,e) рабочие интервалы без обедов]}."""
-    if not is_working_day(day, calendar):
+    lim = shift_limit(day, calendar)
+    if lim == 0:
         return []
     spans, lunches = [], []
-    for r in shifts_for(day, shift_rows):
+    for r in shifts_for(day, shift_rows)[:lim]:
         s = datetime.combine(day, _t(r["start"]))
         e = datetime.combine(day, _t(r["end"]))
         if e <= s:                                   # смена через полночь
@@ -102,8 +127,8 @@ def hours_per_day(day: date, shift_rows: list[dict], calendar: dict | None = Non
     """Рабочие часы станка в обычный рабочий день по режиму на эту дату (для ставок себестоимости)."""
     cal = {} if force_working else (calendar or {})
     d = day
-    if force_working:                                # берём ближайший рабочий день недели
-        while d.weekday() not in WORK_WEEKDAYS:
+    if force_working:                                # берём ближайший будний день (пн–пт, все смены)
+        while d.weekday() >= SATURDAY:
             d += timedelta(days=1)
     return sum((e - s).total_seconds() for p in day_periods(d, shift_rows, cal) for s, e in p["work"]) / 3600
 
