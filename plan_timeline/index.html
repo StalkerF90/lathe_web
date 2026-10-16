@@ -29,6 +29,8 @@
   /* партия: выполненная часть — тёмная полоса слева, поэтому текст светлый с тенью (читается на обеих частях) */
   .vis-item.batch { color: #fff; text-shadow: 0 0 2px #000, 0 0 3px #000; }
   .vis-item.batch.late { border-width: 2px; }
+  /* факт по истории: приглушённая полоса нижней дорожки */
+  .vis-item.fact { background: #4f6b57; border-color: #3b5242; color: #e8efe9; height: 26px; line-height: 20px; font-size: 11px; }
   .vis-labelset .vis-label .vis-inner { min-height: 40px; line-height: 40px; padding: 4px 10px; }
   .vis-current-time { background-color: #ff4b4b; width: 2px; }
   #msg { font-size: 12px; opacity: 0.75; padding: 3px 2px; min-height: 16px; }
@@ -117,11 +119,16 @@
     editable = args.editable !== false;
     timeline.setOptions({ editable: editable ? { add: false, remove: false, updateTime: true, updateGroup: true, overrideItems: false } : false });
     groups.clear();
-    groups.add((args.groups || []).map(function (g, i) { return { id: g.id, content: g.label || g.id, order: i }; }));
+    // дорожки внутри станка: план сверху, факт по истории снизу (перекрываются по времени — поэтому разные дорожки)
+    var sgOrder = function (a, b) { return (a.subgroup === "fact" ? 1 : 0) - (b.subgroup === "fact" ? 1 : 0); };
+    groups.add((args.groups || []).map(function (g, i) {
+      return { id: g.id, content: g.label || g.id, order: i, subgroupOrder: sgOrder };
+    }));
     items.clear();
     items.add((args.items || []).map(function (it) {
       var o = { id: it.id, group: it.group, start: parse(it.start), end: parse(it.end), content: it.content || "",
-                title: it.title || "", className: it.className || "", style: it.style || "" };
+                title: it.title || "", className: it.className || "", style: it.style || "",
+                subgroup: it.type === "background" ? undefined : (it.subgroup || "plan") };
       if (it.type) { o.type = it.type; }
       if (it.editable === false) { o.editable = false; }
       else if (it.updateGroup === false) { o.editable = { updateTime: true, updateGroup: false, remove: false }; }

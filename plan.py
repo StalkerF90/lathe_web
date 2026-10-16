@@ -31,6 +31,7 @@ import workcal
 import xlsxlite
 
 KINDS = ["партия", "ремонт", "обслуживание"]
+FACT_KIND = "факт"          # полосы по истории выпуска (закрытые партии): не двигаются и не мешают планированию
 DEFAULT_MACHINES = ["Lathe 235", "Lathe 2100", "Lathe 2105", "АПТ", "MILL"]
 SETUP_FULL_H, SETUP_SAME_HEX_END_H, SETUP_MADE_H = 4.0, 2.0, 0.5
 MIN_LEFT_H = 2.0
@@ -236,7 +237,7 @@ def reflow(items: list[dict], ctx: dict, arts: dict, made_hist: set, anchor_grp=
     items = [dict(it) for it in items]
     fixed = {}
     for it in items:
-        if it["kind"] != "партия":
+        if it["kind"] in ("ремонт", "обслуживание"):   # «факт» по истории планированию не мешает
             fixed.setdefault(it["machine"], []).append((_dt(it["start"]), _dt(it["end"])))
     units = [u for u in units_of(items) if u[0]["kind"] == "партия"]
 
@@ -275,7 +276,8 @@ def conflicts(items: list[dict]) -> list[str]:
     out = []
     by_m = {}
     for it in items:
-        by_m.setdefault(it["machine"], []).append(it)
+        if it["kind"] != FACT_KIND:                   # история может перекрываться (несколько партий за день)
+            by_m.setdefault(it["machine"], []).append(it)
     for m, lst in by_m.items():
         lst = sorted(lst, key=lambda i: _dt(i["start"]))
         for a, b in zip(lst, lst[1:]):
@@ -287,16 +289,25 @@ def conflicts(items: list[dict]) -> list[str]:
     return out
 
 
-def item_progress(items: list[dict], fact: list[dict]) -> dict:
-    """Факт выпуска по позициям плана: {id: {'done', 'pct', 'last'}}.
+def item_progress(items: list[dict], fact: list[dict], totals: dict | None = None) -> dict:
+    """Факт выпуска по позициям плана: {id: {'done', 'pct', 'last', 'first'}}.
     fact — записи выпуска станков {batch_number, machine, date, stage, fin, qty}. На станке считаем
     финальный выпуск, если он есть, иначе — самый продвинутый этап (записи идут по этапам, сумма этапов
-    дала бы 200 % для двух установов на одном станке). Учитываются записи не раньше даты начала позиции
-    или даты её постановки в план (что раньше) — выпуск до планирования остатка партии не засчитывается.
-    Несколько позиций одной партии на станке заполняются по порядку."""
+    дала бы 200 % для двух установов на одном станке). Учитываются все записи партии, но если в план
+    поставлен только остаток (план партии totals[№] больше суммы позиций плана), разница считается
+    сделанной до планирования и из выпуска на станке вычитается. Несколько позиций одной партии на станке
+    заполняются по порядку."""
+    totals = totals or {}
     by_key = {}
     for f in fact:
         by_key.setdefault((f["batch_number"], f["machine"]), []).append(f)
+    planned, seen = {}, set()
+    for it in items:
+        if it["kind"] == "партия":
+            g = (it["batch_number"], it.get("grp") or it.get("id"))
+            if g not in seen:
+                seen.add(g)
+                planned[it["batch_number"]] = planned.get(it["batch_number"], 0) + int(it.get("qty") or 0)
     out = {}
     groups = {}
     for it in items:
@@ -304,8 +315,7 @@ def item_progress(items: list[dict], fact: list[dict]) -> dict:
             groups.setdefault((it["batch_number"], it["machine"]), []).append(it)
     for key, lst in groups.items():
         lst = sorted(lst, key=lambda i: (i["start"], i["id"]))
-        cut = min(min(i["start"][:10], (i.get("created_at") or i["start"])[:10]) for i in lst)
-        recs = [f for f in by_key.get(key, []) if str(f["date"] or "")[:10] >= cut]
+        recs = by_key.get(key, [])
         fin = [f for f in recs if f["fin"]]
         if fin:
             done = sum(int(f["qty"] or 0) for f in fin)
@@ -314,6 +324,8 @@ def item_progress(items: list[dict], fact: list[dict]) -> dict:
             for f in recs:
                 per_stage[f["stage"]] = per_stage.get(f["stage"], 0) + int(f["qty"] or 0)
             done = max(per_stage.values()) if per_stage else 0
+        before = max(0, int(totals.get(key[0]) or 0) - planned.get(key[0], 0))   # сделано до планирования остатка
+        done = max(0, done - before)
         last = max((str(f["date"])[:10] for f in recs), default="")
         first = min((str(f["date"])[:10] for f in recs), default="")
         for i in lst:
@@ -322,6 +334,84 @@ def item_progress(items: list[dict], fact: list[dict]) -> dict:
             done -= got
             out[i["id"]] = {"done": got, "pct": round(100 * got / qty) if qty else 0, "last": last, "first": first}
     return out
+
+
+def history_items(rows: list[dict], ctx) -> list[dict]:
+    """Факт по истории выпуска → полосы графика (вид «факт»).
+    rows — записи {id, date, batch_number, machine, qty, setup_h, minutes}. В записях есть только дата,
+    поэтому внутри дня записи станка раскладываются подряд от начала рабочего дня (в порядке ввода)
+    по фактическим минутам + наладке (минимум 15 мин, не дальше конца дня); подряд идущие куски одной
+    партии на станке (простой между ними меньше 2 рабочих часов) склеиваются в одну полосу."""
+    cal = dict(ctx["cal"])
+    for r in rows:                                   # день с записями — рабочий (например, рабочая суббота/воскресенье)
+        d = str(r["date"])[:10]
+        if not workcal.is_working_day(date.fromisoformat(d), cal):
+            cal[d] = "рабочий"
+    c2 = dict(ctx, cal=cal)
+    by_md = {}
+    for r in rows:
+        by_md.setdefault((r["machine"], str(r["date"])[:10]), []).append(r)
+    segs = []
+    for (m, d), recs in by_md.items():
+        day_start, day_end = _day_bounds(date.fromisoformat(d), c2)
+        t = day_start
+        for r in sorted(recs, key=lambda x: x["id"]):
+            dur = max(0.25, min(float(r.get("setup_h") or 0), 24.0) + float(r.get("minutes") or 0) / 60)
+            s = min(_rm(workcal.add_work_hours(t, 0, ctx["shifts"], cal)), day_end - timedelta(minutes=15))  # не в обед
+            e = min(_rm(workcal.add_work_hours(s, dur, ctx["shifts"], cal)), day_end)
+            segs.append({"machine": m, "batch_number": r["batch_number"], "start": s, "end": max(e, s + timedelta(minutes=15)),
+                         "qty": int(r.get("qty") or 0), "setup": float(r.get("setup_h") or 0),
+                         "minutes": float(r.get("minutes") or 0), "n": 1, "first": d, "last": d})
+            t = max(e, s + timedelta(minutes=15))
+    out = []
+    for m in sorted({s["machine"] for s in segs}):
+        cur = None
+        for s in sorted((x for x in segs if x["machine"] == m), key=lambda x: (x["start"], x["end"])):
+            # подряд на станке (других партий между ними нет) и простой меньше 2 рабочих часов — одна полоса
+            if cur and s["batch_number"] == cur["batch_number"] and s["start"] >= cur["end"] and \
+                    workcal.work_hours_between(cur["end"], s["start"], ctx["shifts"], cal) < 2.0:
+                cur.update(end=max(cur["end"], s["end"]), qty=cur["qty"] + s["qty"], setup=cur["setup"] + s["setup"],
+                           minutes=cur["minutes"] + s["minutes"], n=cur["n"] + s["n"], last=s["last"])
+                continue
+            if cur:
+                out.append(cur)
+            cur = dict(s)
+        if cur:
+            out.append(cur)
+    return [{"kind": FACT_KIND, "batch_number": s["batch_number"], "qty": s["qty"], "machine": s["machine"],
+             "grp": f"fact:{s['batch_number']}", "linked": 0, "route": "", "start": _s(s["start"]), "end": _s(s["end"]),
+             "setup_h": round(s["setup"], 2), "setup_why": "", "min_pc": None, "run_h": round(s["minutes"] / 60, 2),
+             "hours_manual": None, "notes": f"по истории выпуска: {s['n']} зап., {_d_ru(s['first'])}–{_d_ru(s['last'])}",
+             "order_id": None, "due_date": None} for s in out]
+
+
+def fill_history(q, tx, audit, ctx, batches: list[dict], batch_is_archived) -> tuple[int, int]:
+    """Перестраивает полосы «факт» по истории закрытых партий (станки плана). → (полос, партий)."""
+    closed = [b["batch_number"] for b in batches
+              if batch_is_archived(b.get("archive_state"), b.get("total_qty"), b.get("final_opta"))]
+    rows = []
+    if closed:
+        ms = ctx["machines"]
+        rows = q(f"""SELECT p.id, p.date, p.batch_number, m.name AS machine, COALESCE(p.produced_qty,0) AS qty,
+                            COALESCE(p.setup_time,0) AS setup_h, COALESCE(p.actual_duration_minutes,0) AS minutes
+                     FROM production p JOIN machines m ON m.id = p.machine_id
+                     WHERE COALESCE(p.record_type,'production')='production' AND p.date IS NOT NULL AND p.date != ''
+                       AND m.name IN ({','.join('?' * len(ms))})
+                       AND p.batch_number IN ({','.join('?' * len(closed))})""", (*ms, *closed))
+    new = history_items(rows, ctx)
+    cols = ["kind", "batch_number", "qty", "machine", "grp", "linked", "route", "start", "end", "setup_h", "setup_why",
+            "min_pc", "run_h", "hours_manual", "notes", "order_id", "due_date"]
+    dbc = [{"start": "start_at", "end": "end_at"}.get(c, c) for c in cols]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with tx() as conn:
+        n_old = conn.execute("SELECT COUNT(*) FROM plan_items WHERE kind=?", (FACT_KIND,)).fetchone()[0]
+        conn.execute("DELETE FROM plan_items WHERE kind=?", (FACT_KIND,))
+        conn.executemany(f"INSERT INTO plan_items ({', '.join(dbc)}, created_by, created_at, updated_at) "
+                         f"VALUES ({', '.join('?' * len(cols))}, ?, ?, ?)",
+                         [(*[n.get(c) for c in cols], st.session_state.get("username") or "", now, now) for n in new])
+        audit(conn, "import", "plan_items", None, {"факт: полос было": n_old},
+              {"факт: полос": len(new), "закрытых партий": len({n['batch_number'] for n in new}), "записей": len(rows)})
+    return len(new), len({n["batch_number"] for n in new})
 
 
 def _day_bounds(day: date, ctx) -> tuple[datetime, datetime]:
@@ -342,7 +432,7 @@ def fact_shift(items: list[dict], prog: dict, ctx, now: datetime, only_ids=None)
     for u in units_of([i for i in new if i["kind"] == "партия"]):
         if only_ids is not None and not any(i["id"] in only_ids for i in u):
             continue
-        firsts = [prog[i["id"]]["first"] for i in u if prog.get(i["id"], {}).get("first") and prog[i["id"]]["done"]]
+        firsts = [prog[i["id"]]["first"] for i in u if prog.get(i["id"], {}).get("first")]
         if not firsts:
             continue
         start = _day_bounds(date.fromisoformat(min(firsts)), ctx)[0]
@@ -359,7 +449,7 @@ def fact_shift(items: list[dict], prog: dict, ctx, now: datetime, only_ids=None)
                 if h > 0 and abs(h - planned) > 1e-6:
                     i["hours_manual"] = h
                     moved = True
-            elif pr.get("done"):
+            elif pr.get("first"):                    # начата (есть записи), не закончена
                 worked = workcal.work_hours_between(start, now, ctx["shifts"], ctx["cal"])
                 forecast = worked + item_hours(dict(i, hours_manual=None)) * (1 - pr["pct"] / 100)
                 if forecast > planned + 1e-6:
@@ -368,6 +458,12 @@ def fact_shift(items: list[dict], prog: dict, ctx, now: datetime, only_ids=None)
         if moved:
             notes.append(f"№{u[0]['batch_number']} ({', '.join(i['machine'] for i in u)}): с {_s(start)}")
     return new, notes
+
+
+def progress(q, items: list[dict]) -> dict:
+    """item_progress по базе: записи выпуска + план партий из вкладки «Партии»."""
+    totals = {r["batch_number"]: r["total_qty"] for r in q("SELECT batch_number, total_qty FROM batches")}
+    return item_progress(items, load_fact(q, items), totals)
 
 
 def load_fact(q, items: list[dict]) -> list[dict]:
@@ -551,25 +647,42 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
     made = made_from_history(hist)
     _flash()
 
-    c1, c2, c3 = st.columns([2, 2, 3])
+    c1, c2, c3, c4 = st.columns([2, 2, 1.4, 3])
     today = date.today()
     d0 = c1.date_input("С даты", value=today - timedelta(days=today.weekday()), format="DD.MM.YYYY", key="plan_from")
     span = c2.selectbox("Показать", ["1 неделя", "2 недели", "4 недели"], key="plan_span")
     days = {"1 неделя": 7, "2 недели": 14, "4 недели": 28}[span]
     d1 = d0 + timedelta(days=days - 1)
-    c3.caption("Перетаскивайте партии по времени и тяните за край, чтобы растянуть/сжать. "
+    c3.markdown("<div style='height:30px'></div>", unsafe_allow_html=True)
+    show_fact = c3.checkbox("Факт по истории", value=True, key="plan_show_fact",
+                            help="Серо-зелёные полосы нижней дорожки — как закрытые партии реально шли по записям выпуска.")
+    c4.caption("Перетаскивайте партии по времени и тяните за край, чтобы растянуть/сжать. "
                "Пересекающиеся партии сдвигаются вперёд, ремонт и обслуживание не двигаются. "
                "Серое — нерабочее время, красное — праздник.")
 
     groups = [{"id": m, "label": m} for m in ctx["machines"]]
-    extra = sorted({it["machine"] for it in items} - set(ctx["machines"]))
+    extra = sorted({it["machine"] for it in items if show_fact or it["kind"] != FACT_KIND} - set(ctx["machines"]))
     groups += [{"id": m, "label": m + " (нет в списке станков)"} for m in extra]
     names = {b["batch_number"]: b.get("batch_name") or "" for b in batches}
-    prog = item_progress(items, load_fact(q, items))
+    prog = progress(q, items)
     now_s = _s(datetime.now())
     e = html.escape
+    lo, hi = _s(datetime.combine(d0 - timedelta(days=7), time(0))), _s(datetime.combine(d1 + timedelta(days=21), time(0)))
     vis_items = []
     for it in items:
+        if it["end"] < lo or it["start"] > hi:       # за пределами окна — не передаём (история — тысячи полос)
+            continue
+        if it["kind"] == FACT_KIND:
+            if not show_fact:
+                continue
+            name = e(f"№{it['batch_number']} {names.get(it['batch_number'], '')}")
+            vis_items.append({"id": it["id"], "group": it["machine"], "start": it["start"], "end": it["end"],
+                              "subgroup": "fact", "editable": False, "className": "fact",
+                              "content": f"{name} · {it['qty'] or 0} шт",
+                              "title": f"{name}<br><b>факт</b>: {it['qty'] or 0} шт · {e(it.get('notes') or '')}<br>"
+                                       f"наладка {it['setup_h'] or 0:g} ч, работа {it['run_h'] or 0:g} ч<br>"
+                                       "время внутри дня — по порядку записей и их минутам"})
+            continue
         if it["kind"] == "партия":
             hrs = item_hours(it)
             pr = prog.get(it["id"], {"done": 0, "pct": 0, "last": ""})
@@ -615,7 +728,7 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
             st.session_state["plan_sel"] = ev.get("id")
             st.rerun()
 
-    started = [i for i in items if prog.get(i["id"], {}).get("done")]
+    started = [i for i in items if prog.get(i["id"], {}).get("first")]
     if started and st.button(f"⏩ Сдвинуть по факту все начатые партии ({len({i.get('grp') or i['id'] for i in started})})",
                              key="plan_fact_all",
                              help="Начало — с рабочего дня первой записи выпуска; выполненные — до конца дня последней записи; "
@@ -639,6 +752,16 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
         _add_batch_form(q, tx, audit, ctx, items, arts, made, hist, batches, batch_is_archived)
     with st.expander("🔧 Ремонт / обслуживание"):
         _add_block_form(q, tx, audit, ctx, items, arts, made)
+    with st.expander("📜 Факт по истории закрытых партий"):
+        n_fact = sum(1 for i in items if i["kind"] == FACT_KIND)
+        st.caption("Строит полосы «как было» по записям выпуска закрытых партий (план выполнен или партия в архиве) "
+                   "на станках плана. В записях только дата — внутри дня записи станка ставятся подряд от начала смены "
+                   "по их минутам и наладке. Полосы не двигаются и не мешают планированию. Повторное нажатие "
+                   f"перестраивает их заново (например, после закрытия новых партий). Сейчас полос: {n_fact}.")
+        if st.button("📜 Заполнить график по истории", key="plan_fill_hist"):
+            n, nb = fill_history(q, tx, audit, ctx, batches, batch_is_archived)
+            st.session_state["plan_flash"] = (True, f"График заполнен по истории: {n} полос по {nb} закрытым партиям.")
+            st.rerun()
 
 
 def _on_move(q, tx, audit, ctx, items, arts, made, ev):
@@ -679,7 +802,7 @@ def _selected_panel(q, tx, audit, ctx, items, arts, made, it, names):
     st.markdown("#### Выбрано: " + (f"партия №{it['batch_number']} {names.get(it['batch_number'], '')}" if it["kind"] == "партия"
                                     else f"{it['kind']} · {it['machine']}"))
     unit = [i for i in items if it.get("linked") and i.get("grp") == it.get("grp")] or [it]
-    prog = item_progress(items, load_fact(q, items)) if it["kind"] == "партия" else {}
+    prog = progress(q, items) if it["kind"] == "партия" else {}
     rows = [{"Станок": i["machine"], "Начало": i["start"], "Окончание": i["end"], "Кол-во": i.get("qty"),
              "Факт, шт": prog.get(i["id"], {}).get("done", 0), "Факт, %": prog.get(i["id"], {}).get("pct", 0),
              "Наладка, ч": i.get("setup_h"), "Почему такая наладка": i.get("setup_why") or "",
@@ -690,7 +813,11 @@ def _selected_panel(q, tx, audit, ctx, items, arts, made, it, names):
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     c1, c2, c3, c4, c5 = st.columns(5)
     if it["kind"] == "партия":
-        if any(prog.get(i["id"], {}).get("done") for i in unit) and c5.button("⏩ Сдвинуть по факту", key=f"plan_fact_{it['id']}"):
+        has_fact = any(prog.get(i["id"], {}).get("first") for i in unit)
+        if c5.button("⏩ Сдвинуть по факту", key=f"plan_fact_{it['id']}", disabled=not has_fact,
+                     help="Начало — с рабочего дня первой записи выпуска этой партии на станках позиции; выполненная — до "
+                          "конца дня последней записи, начатая — прогноз." if has_fact else
+                          "По этой партии на станках позиции ещё нет записей выпуска."):
             new, notes = fact_shift(items, prog, ctx, datetime.now(), only_ids={i["id"] for i in unit})
             if not notes:
                 st.session_state["plan_flash"] = (True, "Позиция уже совпадает с фактом.")
@@ -989,10 +1116,12 @@ def _add_block_form(q, tx, audit, ctx, items, arts, made):
 
 def _tab_list(q):
     items = load_items(q)
+    if not st.checkbox("Показывать полосы факта по истории", value=False, key="plan_list_fact"):
+        items = [i for i in items if i["kind"] != FACT_KIND]
     if not items:
         st.info("План пуст.")
         return
-    prog = item_progress(items, load_fact(q, items))
+    prog = progress(q, items)
     names = {r["batch_number"]: r["batch_name"] for r in q("SELECT batch_number, batch_name FROM batches")}
     rows = []
     for it in items:
@@ -1537,6 +1666,8 @@ class _MachineState:
         self.busy, self.end, self.prev = {}, {}, {}
         self.made = set(made)
         for it in sorted(items, key=lambda i: (i["start"], i.get("id") or 0)):
+            if it["kind"] == FACT_KIND:
+                continue
             s, e = _dt(it["start"]), _dt(it["end"])
             self.busy.setdefault(it["machine"], []).append((s, e))
             if it["kind"] == "партия":
