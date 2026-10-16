@@ -27,6 +27,7 @@ COPY app.py           .
 COPY tech.py          .
 COPY plan.py          .
 COPY workcal.py       .
+COPY xlsxlite.py      .
 COPY plan_timeline    ./plan_timeline
 COPY run_streamlit.py .
 COPY manage_users.py  .

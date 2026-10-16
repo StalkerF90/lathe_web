@@ -18,6 +18,7 @@
 import html
 import json
 import os
+import re
 import uuid
 from datetime import date, datetime, time, timedelta
 
@@ -27,6 +28,7 @@ import streamlit.components.v1 as components
 
 import tech
 import workcal
+import xlsxlite
 
 KINDS = ["партия", "ремонт", "обслуживание"]
 DEFAULT_MACHINES = ["Lathe 235", "Lathe 2100", "Lathe 2105", "АПТ", "MILL"]
@@ -86,7 +88,26 @@ def init_tables(c):
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+        CREATE TABLE IF NOT EXISTS plan_orders (       -- заказы на план (импорт из Excel / вручную)
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_number TEXT NOT NULL,
+            qty          INTEGER,
+            route        TEXT DEFAULT '',          -- как указано в файле (название маршрута или станки)
+            not_before   TEXT,                     -- YYYY-MM-DD HH:MM — не начинать раньше
+            due_date     TEXT,                     -- YYYY-MM-DD — срок
+            priority     INTEGER,                  -- 1 — самый срочный; пусто — после всех
+            min_pc       TEXT DEFAULT '',          -- норма мин/шт: число или «Lathe 235=0.5; Lathe 2100=0.2»
+            notes        TEXT DEFAULT '',
+            source       TEXT DEFAULT '',          -- файл импорта
+            created_by   TEXT DEFAULT '',
+            created_at   TEXT
+        );
     """)
+    cols = [r[1] for r in c.execute("PRAGMA table_info(plan_items)")]
+    if "order_id" not in cols:
+        c.execute("ALTER TABLE plan_items ADD COLUMN order_id INTEGER")
+    if "due_date" not in cols:
+        c.execute("ALTER TABLE plan_items ADD COLUMN due_date TEXT")
     c.execute("INSERT OR IGNORE INTO plan_settings (key, value) VALUES ('machines', ?)", (", ".join(DEFAULT_MACHINES),))
     if c.execute("SELECT COUNT(*) FROM plan_shifts").fetchone()[0] == 0:
         c.executemany("INSERT INTO plan_shifts (valid_from, shift_no, shift_start, shift_end, lunch_start, lunch_min, notes) "
@@ -112,6 +133,16 @@ def _s(d: datetime) -> str:
 def _minutes_h(hours: float) -> float:
     """Часы, округлённые до целых минут."""
     return round(hours * 60) / 60
+
+
+def _d_ru(iso: str | None) -> str:
+    """2026-10-31 → 31.10.2026."""
+    if not iso:
+        return ""
+    try:
+        return date.fromisoformat(str(iso)[:10]).strftime("%d.%m.%Y")
+    except ValueError:
+        return str(iso)
 
 
 def load_ctx(q) -> dict:
@@ -284,12 +315,59 @@ def item_progress(items: list[dict], fact: list[dict]) -> dict:
                 per_stage[f["stage"]] = per_stage.get(f["stage"], 0) + int(f["qty"] or 0)
             done = max(per_stage.values()) if per_stage else 0
         last = max((str(f["date"])[:10] for f in recs), default="")
+        first = min((str(f["date"])[:10] for f in recs), default="")
         for i in lst:
             qty = int(i.get("qty") or 0)
             got = min(done, qty) if qty else 0
             done -= got
-            out[i["id"]] = {"done": got, "pct": round(100 * got / qty) if qty else 0, "last": last}
+            out[i["id"]] = {"done": got, "pct": round(100 * got / qty) if qty else 0, "last": last, "first": first}
     return out
+
+
+def _day_bounds(day: date, ctx) -> tuple[datetime, datetime]:
+    """Начало и конец рабочего дня (если день нерабочий — по режиму ближайшего рабочего дня недели)."""
+    p = workcal.day_periods(day, ctx["shifts"], ctx["cal"]) or workcal.day_periods(day, ctx["shifts"], {day.isoformat(): "рабочий"})
+    if not p:
+        return datetime.combine(day, time(7, 0)), datetime.combine(day, time(23, 30))
+    return p[0]["start"], p[-1]["end"]
+
+
+def fact_shift(items: list[dict], prog: dict, ctx, now: datetime, only_ids=None) -> tuple[list[dict], list[str]]:
+    """«Сдвинуть по факту»: начало позиции (связки — общее) = начало рабочего дня первой записи выпуска.
+    Выполненная позиция растягивается до конца дня последней записи; начатая — длительность по прогнозу:
+    отработано с начала + оставшаяся доля плановых часов (если это больше плана).
+    Возвращает (изменённый план, описания изменений)."""
+    new = [dict(i) for i in items]
+    notes = []
+    for u in units_of([i for i in new if i["kind"] == "партия"]):
+        if only_ids is not None and not any(i["id"] in only_ids for i in u):
+            continue
+        firsts = [prog[i["id"]]["first"] for i in u if prog.get(i["id"], {}).get("first") and prog[i["id"]]["done"]]
+        if not firsts:
+            continue
+        start = _day_bounds(date.fromisoformat(min(firsts)), ctx)[0]
+        moved = False
+        for i in u:
+            pr = prog.get(i["id"], {})
+            if _s(start) != i["start"]:
+                i["start"] = _s(start)
+                moved = True
+            planned = item_hours(i) if i.get("hours_manual") is None else float(i["hours_manual"])
+            if pr.get("done") and pr["pct"] >= 100:
+                end = _day_bounds(date.fromisoformat(pr["last"]), ctx)[1]
+                h = _minutes_h(workcal.work_hours_between(start, end, ctx["shifts"], ctx["cal"]))
+                if h > 0 and abs(h - planned) > 1e-6:
+                    i["hours_manual"] = h
+                    moved = True
+            elif pr.get("done"):
+                worked = workcal.work_hours_between(start, now, ctx["shifts"], ctx["cal"])
+                forecast = worked + item_hours(dict(i, hours_manual=None)) * (1 - pr["pct"] / 100)
+                if forecast > planned + 1e-6:
+                    i["hours_manual"] = _minutes_h(forecast)
+                    moved = True
+        if moved:
+            notes.append(f"№{u[0]['batch_number']} ({', '.join(i['machine'] for i in u)}): с {_s(start)}")
+    return new, notes
 
 
 def load_fact(q, items: list[dict]) -> list[dict]:
@@ -344,7 +422,7 @@ def made_from_history(hist: pd.DataFrame) -> set:
 def save_items(tx, audit, before: list[dict], after: list[dict], new_items=(), deleted_ids=()):
     """Записывает изменения плана одной транзакцией (с журналом изменений)."""
     cols = ["kind", "batch_number", "qty", "machine", "grp", "linked", "route", "start", "end", "setup_h", "setup_why",
-            "min_pc", "run_h", "hours_manual", "notes"]
+            "min_pc", "run_h", "hours_manual", "notes", "order_id", "due_date"]
     old = {it["id"]: it for it in before if it.get("id")}
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     qc = lambda c: {"start": "start_at", "end": "end_at"}.get(c, c)
@@ -417,9 +495,12 @@ def page_plan(q, tx, audit, all_batches, batch_is_archived):
         st.error("⛔ План станков доступен только администратору.")
         st.stop()
     st.title("📅 План станков")
-    t_g, t_l, t_s, t_c = st.tabs(["🗓 График", "📋 Список и факт", "⏱ Режим смен", "📆 Праздники и выходные"])
+    t_g, t_o, t_l, t_s, t_c = st.tabs(["🗓 График", "📥 Заказы и импорт из Excel", "📋 Список и факт", "⏱ Режим смен",
+                                       "📆 Праздники и выходные"])
     with t_g:
         _tab_gantt(q, tx, audit, all_batches, batch_is_archived)
+    with t_o:
+        _tab_orders(q, tx, audit, all_batches, batch_is_archived)
     with t_l:
         _tab_list(q)
     with t_s:
@@ -491,6 +572,7 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
             pr = prog.get(it["id"], {"done": 0, "pct": 0, "last": ""})
             name = e(f"№{it['batch_number']} {names.get(it['batch_number'], '')}")
             late = it["end"] < now_s and pr["pct"] < 100
+            due_late = bool(it.get("due_date")) and it["end"][:10] > it["due_date"] and pr["pct"] < 100
             content = (f"{name} · {it['qty'] or 0} шт" + (f" · {pr['pct']}%" if pr["done"] else "")
                        + (" ✔" if pr["pct"] >= 100 else "") + (" ✋" if it.get("hours_manual") is not None else ""))
             title = (f"{name}<br>{it['qty'] or 0} шт · {e(it['route'] or '')}<br>"
@@ -499,13 +581,16 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
                                                          if it.get("hours_manual") is not None else "")
                      + f"<br><b>Факт: {pr['done']} из {it['qty'] or 0} шт ({pr['pct']}%)</b>"
                      + (f", последняя запись {pr['last']}" if pr["last"] else "")
-                     + ("<br>⚠️ срок по плану прошёл, партия не закончена" if late else ""))
+                     + ("<br>⚠️ срок по плану прошёл, партия не закончена" if late else "")
+                     + (f"<br>Срок заказа: {_d_ru(it['due_date'])}" if it.get("due_date") else "")
+                     + ("<br>⏰ по плану не успевает к сроку" if due_late else ""))
             col, p = _color(it["batch_number"]), max(0, min(pr["pct"], 100))
             bg = (f"linear-gradient(90deg, {_shade(col)} 0%, {_shade(col)} {p}%, {col} {p}%, {col} 100%)" if p else col)
             vis_items.append({"id": it["id"], "group": it["machine"], "start": it["start"], "end": it["end"],
-                              "content": content, "title": title, "updateGroup": False,
-                              "className": "batch" + (" late" if late else ""),
-                              "style": f"background:{bg};border-color:{'#ff4b4b' if late else '#444'};"})
+                              "title": title, "updateGroup": False,
+                              "className": "batch" + (" late" if late or due_late else ""),
+                              "content": content + (" ⏰" if due_late else ""),
+                              "style": f"background:{bg};border-color:{'#ff4b4b' if late else '#ffa421' if due_late else '#444'};"})
         else:
             vis_items.append({"id": it["id"], "group": it["machine"], "start": it["start"], "end": it["end"],
                               "content": f"🔧 {e(it['kind'])}" + (f": {e(it['notes'])}" if it.get("notes") else ""),
@@ -526,6 +611,20 @@ def _tab_gantt(q, tx, audit, all_batches, batch_is_archived):
             st.session_state["plan_flash"] = (ok, msg)
             st.session_state["plan_sel"] = ev.get("id")
             st.rerun()
+
+    started = [i for i in items if prog.get(i["id"], {}).get("done")]
+    if started and st.button(f"⏩ Сдвинуть по факту все начатые партии ({len({i.get('grp') or i['id'] for i in started})})",
+                             key="plan_fact_all",
+                             help="Начало — с рабочего дня первой записи выпуска; выполненные — до конца дня последней записи; "
+                                  "начатые — прогноз: отработано + оставшаяся доля плановых часов. Остальные позиции "
+                                  "сдвигаются, если пересекутся."):
+        new, notes = fact_shift(items, prog, ctx, datetime.now())
+        if not notes:
+            st.session_state["plan_flash"] = (True, "План уже совпадает с фактом.")
+        else:
+            ok, msg = apply_change(q, tx, audit, ctx, items, arts, made, changed=new)
+            st.session_state["plan_flash"] = (ok, (msg + " По факту: " + "; ".join(notes)) if ok else msg)
+        st.rerun()
 
     warn = [it for it in items if it["kind"] == "партия" and it["batch_number"] not in names]
     if warn:
@@ -586,8 +685,17 @@ def _selected_panel(q, tx, audit, ctx, items, arts, made, it, names):
     if it["kind"] != "партия":
         rows = [{"Станок": it["machine"], "Начало": it["start"], "Окончание": it["end"], "Примечание": it.get("notes") or ""}]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     if it["kind"] == "партия":
+        if any(prog.get(i["id"], {}).get("done") for i in unit) and c5.button("⏩ Сдвинуть по факту", key=f"plan_fact_{it['id']}"):
+            new, notes = fact_shift(items, prog, ctx, datetime.now(), only_ids={i["id"] for i in unit})
+            if not notes:
+                st.session_state["plan_flash"] = (True, "Позиция уже совпадает с фактом.")
+            else:
+                ok, msg = apply_change(q, tx, audit, ctx, items, arts, made, changed=new,
+                                       anchor_grp=it.get("grp") if it.get("linked") else None, anchor_id=it["id"])
+                st.session_state["plan_flash"] = (ok, (msg + " По факту: " + "; ".join(notes)) if ok else msg)
+            st.rerun()
         if any(i.get("hours_manual") is not None for i in unit) and c1.button("↺ Вернуть расчётную длительность", key=f"plan_reset_{it['id']}"):
             new = [dict(i, hours_manual=None) if i in unit else dict(i) for i in items]
             ok, msg = apply_change(q, tx, audit, ctx, items, arts, made, changed=new, anchor_id=it["id"])
@@ -627,6 +735,129 @@ def _planned_qty(items, batch_number) -> int:
     return total
 
 
+def route_options(q, ctx, p: dict) -> list[dict]:
+    """Маршруты для артикула: из «🛠 Технология → Маршруты» (сначала своего вида — прямой / из поковки)
+    плюс отдельные станки плана, для которых нет одностаночного маршрута (АПТ, MILL …)."""
+    family = "forging" if p.get("forging") else "straight"
+    out = []
+    for r in sorted(q("SELECT * FROM tech_routes ORDER BY is_default DESC, id"), key=lambda r: r["family"] != family):
+        ms = tech.parse_machines(r["machines"])
+        if not ms:
+            continue
+        par = bool(r["parallel"]) and len(ms) > 1
+        out.append({"key": f"r{r['id']}", "name": r["name"], "machines": ms, "parallel": par,
+                    "label": r["name"] + (" · связка, старт одновременно" if par else "")
+                             + ("" if r["family"] == family else " · (маршрут другого вида)")})
+    singles = {o["machines"][0] for o in out if len(o["machines"]) == 1}
+    for m in ctx["machines"]:
+        if m not in singles:
+            out.append({"key": f"m:{m}", "name": m, "machines": (m,), "parallel": False, "label": f"{m} (один станок)"})
+    return out
+
+
+def resolve_route(text: str, options: list[dict], all_machines) -> dict | None:
+    """Маршрут по тексту из файла: название маршрута или станки («235+2100», «Lathe 2105», «MILL»)."""
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    for o in options:
+        if o["name"].strip().lower() == t:
+            return o
+    ms = set()
+    for tok in re.split(r"[+,;/&]| и ", t):
+        tok = tok.strip()
+        if not tok:
+            continue
+        hit = [m for m in all_machines if m.lower() == tok or m.lower().endswith(" " + tok)]
+        if len(hit) != 1:
+            return None
+        ms.add(hit[0])
+    for o in options:
+        if set(o["machines"]) == ms:
+            return o
+    return None
+
+
+def parse_min_pc(text, machines) -> tuple[dict, str]:
+    """Норма из файла: «0.53» (на все станки маршрута) или «235=0.53; 2100=0.2». → ({станок: мин/шт}, ошибка)."""
+    s = str(text if text is not None else "").strip().replace(",", ".")
+    if not s:
+        return {}, ""
+    try:
+        v = float(s)
+        return ({m: v for m in machines}, "") if v >= 0 else ({}, "норма меньше нуля")
+    except ValueError:
+        pass
+    out = {}
+    for part in re.split(r"[;\n]", s):
+        if not part.strip():
+            continue
+        if "=" not in part and ":" not in part:
+            return {}, f"не понял норму «{part.strip()}»"
+        k, v = re.split(r"[=:]", part, maxsplit=1)
+        hit = [m for m in machines if m.lower() == k.strip().lower() or m.lower().endswith(" " + k.strip().lower())]
+        try:
+            val = float(v.strip())
+        except ValueError:
+            return {}, f"не понял норму «{part.strip()}»"
+        if len(hit) != 1:
+            return {}, f"станка «{k.strip()}» нет в маршруте"
+        out[hit[0]] = val
+    return out, ""
+
+
+def batch_norms(hist: pd.DataFrame, p: dict, machines) -> list[dict]:
+    """Нормы мин/шт по станкам маршрута: история артикула → похожий артикул → нет."""
+    if not p.get("type_code"):
+        return [{"machine": m, "min_pc": None, "src": "артикул не распознан"} for m in machines]
+    key = p.get("key")
+    if hist.empty:
+        h = hist
+    else:
+        h = hist[hist["key"] == key] if key else hist.iloc[0:0]
+    return tech.route_norms(p, key, h, hist, hist.attrs.get("parsed", {}) if not hist.empty else {}, machines)
+
+
+def new_batch_items(bn: str, qty: int, route: dict, mpc: dict, note: str, start: datetime,
+                    order_id=None, due=None) -> list[dict]:
+    """Позиции новой постановки партии по маршруту (время уточнит раскладка)."""
+    grp = uuid.uuid4().hex[:12]
+    linked = 1 if route["parallel"] else 0
+    return [{"kind": "партия", "batch_number": bn, "qty": int(qty), "machine": m, "grp": grp, "linked": linked,
+             "route": route["name"], "start": _s(start), "end": _s(start), "setup_h": None, "setup_why": "",
+             "min_pc": float(mpc[m]), "run_h": int(qty) * float(mpc[m]) / 60, "hours_manual": None, "notes": note,
+             "order_id": order_id, "due_date": due, "id": None, "_tmp": f"{grp}:{k}"}
+            for k, m in enumerate(route["machines"])]
+
+
+def place_new(work: list[dict], new: list[dict], ctx, arts, made) -> list[dict]:
+    """Ставит новую постановку в рабочий план (новая — якорь; связка — общий старт;
+    маршрут без связки — станки друг за другом)."""
+    res = work + [dict(n) for n in new]
+    grp = new[0]["grp"]
+    if new[0]["linked"] or len(new) == 1:
+        return reflow(res, ctx, arts, made, anchor_grp=grp)
+    for k in range(len(new)):
+        res = reflow(res, ctx, arts, made, anchor_grp=grp)
+        if k + 1 < len(new):
+            end_k = next(r["end"] for r in res if r.get("_tmp") == new[k]["_tmp"])
+            for r in res:
+                if r.get("_tmp") == new[k + 1]["_tmp"] and _dt(r["start"]) < _dt(end_k):
+                    r["start"] = end_k
+    return res
+
+
+def queue_end(work: list[dict], machines, not_before: datetime | None = None) -> datetime:
+    """Конец очереди станков (не раньше «сейчас» и не раньше not_before)."""
+    ends = [_dt(i["end"]) for i in work if i["machine"] in machines]
+    return max(ends + [datetime.now().replace(second=0, microsecond=0)] + ([not_before] if not_before else []))
+
+
+def save_result(tx, audit, items: list[dict], res: list[dict]):
+    """Сохраняет результат раскладки с новыми позициями (_tmp) одной транзакцией."""
+    save_items(tx, audit, items, [r for r in res if r.get("id")], new_items=[r for r in res if r.get("_tmp")])
+
+
 def _add_batch_form(q, tx, audit, ctx, items, arts, made, hist, batches, batch_is_archived):
     active = [b for b in batches if not batch_is_archived(b.get("archive_state"), b.get("total_qty"), b.get("final_opta"))]
     if not active:
@@ -639,37 +870,29 @@ def _add_batch_form(q, tx, audit, ctx, items, arts, made, hist, batches, batch_i
            for b in active}
     bn = st.selectbox("Партия (из вкладки «Партии», активные)", list(lab), format_func=lab.get, key="plan_add_bn")
     b = next(x for x in active if x["batch_number"] == bn)
-    info = arts.get(bn) or {}
-    p = info.get("parsed") or {}
+    p = (arts.get(bn) or {}).get("parsed") or {}
     if not p.get("key"):
         st.warning("Артикул в названии партии не распознан — нормы из истории не подтянутся, введите мин/шт вручную. "
                    + (p.get("error") or ""))
-    family = "forging" if p.get("forging") else "straight"
-    routes = q("SELECT * FROM tech_routes ORDER BY is_default DESC, id")
-    fit = [r for r in routes if r["family"] == family] or routes
-    if not fit:
-        st.error("Не задано ни одного маршрута («🛠 Технология» → «🛣 Маршруты»).")
+    opts = route_options(q, ctx, p)
+    if not opts:
+        st.error("Не задано ни одного маршрута («🛠 Технология» → «🛣 Маршруты») и нет станков плана.")
         return
-    rl = {r["id"]: r["name"] + (" · связка, старт одновременно" if r["parallel"] and len(tech.parse_machines(r["machines"])) > 1 else "")
-          for r in fit}
+    rl = {o["key"]: o["label"] for o in opts}
     c1, c2 = st.columns([3, 1])
-    rid = c1.selectbox("Маршрут", list(rl), format_func=rl.get, key=f"plan_add_route_{bn}")
-    route = next(r for r in fit if r["id"] == rid)
-    ms = tech.parse_machines(route["machines"])
+    rkey = c1.selectbox("Маршрут", list(rl), format_func=rl.get, key=f"plan_add_route_{bn}")
+    route = next(o for o in opts if o["key"] == rkey)
+    ms = route["machines"]
     default_qty = left(b) or int(b.get("total_qty") or 0) or 1
     qty = c2.number_input("Количество, шт", min_value=1, value=default_qty, step=10, key=f"plan_add_qty_{bn}",
                           help="Можно поставить часть партии, а остаток — на другой маршрут.")
     unknown = [m for m in ms if m not in ctx["machines"]]
     if unknown:
         st.warning(f"Станков {', '.join(unknown)} нет в списке станков плана — они появятся отдельной строкой.")
-
-    key = p.get("key")
-    h = hist[hist["key"] == key] if key and not hist.empty else hist.iloc[0:0] if not hist.empty else hist
-    norms = tech.route_norms(p, key, h, hist, hist.attrs.get("parsed", {}) if not hist.empty else {}, ms) \
-        if p.get("type_code") else [{"machine": m, "setup_h": None, "min_pc": None, "src": "артикул не распознан"} for m in ms]
+    norms = batch_norms(hist, p, ms)
     ed = st.data_editor(pd.DataFrame([{"Станок": n["machine"], "Мин/шт": n["min_pc"], "Откуда норма": n["src"]} for n in norms]),
                         hide_index=True, use_container_width=True, disabled=["Станок", "Откуда норма"],
-                        key=f"plan_add_norms_{bn}_{rid}",
+                        key=f"plan_add_norms_{bn}_{rkey}",
                         column_config={"Мин/шт": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.2f")})
     st.caption("Наладка в плане считается по правилам: 4 ч с нуля, 2 ч — если предыдущая партия на станке с тем же HEX "
                "и обжимным торцом, 30 мин — если этот артикул на станке уже делали. Норма мин/шт — из истории "
@@ -681,29 +904,17 @@ def _add_batch_form(q, tx, audit, ctx, items, arts, made, hist, batches, batch_i
         tm = c2.time_input("Время", value=time(7, 0), step=900, key="plan_add_t")
         earliest = datetime.combine(d, tm)
     else:
-        ends = [_dt(i["end"]) for i in items if i["machine"] in ms]
-        earliest = max(ends + [datetime.now().replace(second=0, microsecond=0)])
+        earliest = queue_end(items, ms)
     note = st.text_input("Примечание", key="plan_add_note")
     mpc = {r["Станок"]: r["Мин/шт"] for r in ed.to_dict("records")}
     missing = [m for m, v in mpc.items() if v is None or pd.isna(v)]
     if missing:
         st.warning("Введите норму мин/шт для: " + ", ".join(missing))
         return
-    grp = uuid.uuid4().hex[:12]
-    linked = 1 if route["parallel"] and len(ms) > 1 else 0
-    new, t = [], earliest
-    for m in ms:
-        new.append({"kind": "партия", "batch_number": bn, "qty": int(qty), "machine": m, "grp": grp, "linked": linked,
-                    "route": route["name"], "start": _s(t), "end": _s(t), "setup_h": None, "setup_why": "",
-                    "min_pc": float(mpc[m]), "run_h": int(qty) * float(mpc[m]) / 60, "hours_manual": None, "notes": note})
-    if not linked and len(ms) > 1:                   # последовательный маршрут: следующий станок — после предыдущего
+    if not route["parallel"] and len(ms) > 1:
         st.caption("Маршрут без связки: станки ставятся друг за другом.")
-    # предпросмотр
-    work = [dict(i) for i in items] + [dict(n, id=None, _tmp=f"new{k}") for k, n in enumerate(new)]
-    if not linked and len(ms) > 1:
-        res = _chain_sequential(work, new, ctx, arts, made, grp)
-    else:
-        res = reflow(work, ctx, arts, made, anchor_grp=grp)
+    new = new_batch_items(bn, qty, route, mpc, note, earliest)
+    res = place_new([dict(i) for i in items], new, ctx, arts, made)
     mine = [r for r in res if r.get("_tmp")]
     pv = pd.DataFrame([{"Станок": r["machine"], "Начало": r["start"], "Окончание": r["end"], "Наладка, ч": r["setup_h"],
                         "Почему": r["setup_why"], "Выпуск, ч": round(r["run_h"], 2)} for r in mine])
@@ -717,24 +928,9 @@ def _add_batch_form(q, tx, audit, ctx, items, arts, made, hist, batches, batch_i
         if bad:
             st.error("Не удалось: " + "; ".join(bad[:3]))
             return
-        by_tmp = {r["_tmp"]: r for r in mine}
-        save_items(tx, audit, items, [r for r in res if r.get("id")],
-                   new_items=[by_tmp[f"new{k}"] for k in range(len(new))])
+        save_result(tx, audit, items, res)
         st.session_state["plan_flash"] = (True, f"Партия №{bn} поставлена: {mine[0]['start']} → {max(r['end'] for r in mine)}.")
         st.rerun()
-
-
-def _chain_sequential(work, new, ctx, arts, made, grp):
-    """Маршрут без связки: каждый следующий станок начинает после окончания предыдущего."""
-    res = work
-    for k in range(len(new)):
-        res = reflow(res, ctx, arts, made, anchor_grp=grp)
-        if k + 1 < len(new):
-            end_k = next(r["end"] for r in res if r.get("_tmp") == f"new{k}")
-            for r in res:
-                if r.get("_tmp") == f"new{k + 1}" and _dt(r["start"]) < _dt(end_k):
-                    r["start"] = end_k
-    return res
 
 
 def _add_block_form(q, tx, audit, ctx, items, arts, made):
@@ -890,3 +1086,375 @@ def _tab_calendar(q, tx, audit):
     m = st.session_state.pop("plan_cal_flash", None)
     if m:
         st.success(m)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ЗАКАЗЫ И ИМПОРТ ИЗ EXCEL
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (поле, заголовок в шаблоне, синонимы заголовка, ширина столбца)
+ORDER_FIELDS = [
+    ("batch_number", "№ партии*", ("№ партии", "номер партии", "партия", "№", "n партии"), 12),
+    ("batch_name", "Название (для новой партии)", ("название", "наименование", "артикул", "название партии"), 30),
+    ("qty", "Количество, шт", ("количество", "кол-во", "кол во", "шт"), 14),
+    ("route", "Маршрут / станок", ("маршрут", "станок", "станки", "маршрут / станок"), 26),
+    ("not_before", "Не раньше", ("не раньше", "начало", "старт", "начать с"), 18),
+    ("due_date", "Срок", ("срок", "срок готовности", "дата готовности", "готовность"), 12),
+    ("priority", "Приоритет", ("приоритет",), 10),
+    ("min_pc", "Мин/шт", ("мин/шт", "норма", "норма мин/шт", "мин на шт"), 24),
+    ("notes", "Примечание", ("примечание", "комментарий"), 30),
+]
+
+
+def _norm_header(h) -> str:
+    return re.sub(r"\s+", " ", str(h or "").replace("*", "").split(",")[0]).strip().lower()
+
+
+def _header_map(row) -> dict:
+    """{поле: индекс столбца} по строке заголовков."""
+    out = {}
+    for ci, h in enumerate(row):
+        hn = _norm_header(h)
+        for f, title, aliases, _w in ORDER_FIELDS:
+            if f not in out and (hn == _norm_header(title) or hn in aliases):
+                out[f] = ci
+    return out
+
+
+def _as_text(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else repr(v)
+    if isinstance(v, datetime):
+        return v.strftime("%d.%m.%Y")
+    return str(v).strip()
+
+
+def _as_dt(v, default_time=time(7, 0)) -> tuple[datetime | None, str]:
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None, ""
+    if isinstance(v, datetime):
+        return (v if (v.hour or v.minute) else datetime.combine(v.date(), default_time)), ""
+    if isinstance(v, float):
+        return None, f"«{_as_text(v)}» — не дата (ожидается ДД.ММ.ГГГГ)"
+    s = str(v).strip()
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%d.%m.%y %H:%M", "%d.%m.%y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            d = datetime.strptime(s, fmt)
+            return (d if "%H" in fmt else datetime.combine(d.date(), default_time)), ""
+        except ValueError:
+            continue
+    return None, f"«{s}» — не дата (ожидается ДД.ММ.ГГГГ или ДД.ММ.ГГГГ ЧЧ:ММ)"
+
+
+def _as_int(v) -> tuple[int | None, str]:
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None, ""
+    try:
+        f = float(str(v).replace(",", ".").replace(" ", "")) if not isinstance(v, (int, float)) else float(v)
+    except ValueError:
+        return None, f"«{v}» — не число"
+    if not f.is_integer():
+        return None, f"«{_as_text(v)}» — нужно целое число"
+    return int(f), ""
+
+
+def parse_orders(rows: list[list], batches: list[dict], routes_for, machines, existing: list[dict],
+                 create_missing: bool) -> list[dict]:
+    """Строки листа → заказы с проверкой. routes_for(parsed) → варианты маршрутов (route_options).
+    Каждый результат: {row, поля…, route_opt, errors[], warnings[], create, status: ok | error | skip}."""
+    hdr_i = next((i for i, r in enumerate(rows[:15]) if "batch_number" in _header_map(r)), None)
+    if hdr_i is None:
+        return [{"row": 0, "errors": ["не найдена строка заголовков со столбцом «№ партии»"], "warnings": [],
+                 "status": "error"}]
+    hm = _header_map(rows[hdr_i])
+    by_bn = {b["batch_number"]: b for b in batches}
+    seen = {(o["batch_number"], o.get("qty"), (o.get("due_date") or "")[:10]) for o in existing}
+    in_file = set()
+    out = []
+    for ri in range(hdr_i + 1, len(rows)):
+        r = rows[ri]
+        get = lambda f: r[hm[f]] if f in hm and hm[f] < len(r) else None
+        if all(_as_text(get(f)) == "" for f, *_ in ORDER_FIELDS):
+            continue
+        o = {"row": ri + 1, "errors": [], "warnings": [], "create": False}
+        bn = _as_text(get("batch_number"))
+        o["batch_number"] = bn
+        o["batch_name"] = _as_text(get("batch_name"))
+        o["notes"] = _as_text(get("notes"))
+        qty, e1 = _as_int(get("qty"))
+        prio, e2 = _as_int(get("priority"))
+        nb, e3 = _as_dt(get("not_before"))
+        due, e4 = _as_dt(get("due_date"))
+        for e, f in ((e1, "Количество"), (e2, "Приоритет"), (e3, "Не раньше"), (e4, "Срок")):
+            if e:
+                o["errors"].append(f"{f}: {e}")
+        if qty is not None and qty <= 0:
+            o["errors"].append("Количество должно быть больше нуля")
+        if prio is not None and prio < 1:
+            o["errors"].append("Приоритет — 1 и больше (1 — самый срочный)")
+        o.update(qty=qty, priority=prio, not_before=_s(nb) if nb else None, due_date=due.date().isoformat() if due else None)
+        b = by_bn.get(bn)
+        if not bn:
+            o["errors"].append("не указан № партии")
+        elif not b:
+            if create_missing and o["batch_name"] and qty:
+                o["create"] = True
+                o["warnings"].append("партии нет во вкладке «Партии» — будет создана")
+            else:
+                o["errors"].append("нет такой партии во вкладке «Партии»"
+                                   + ("" if create_missing else " (можно включить «создавать отсутствующие партии»)")
+                                   + ("" if not create_missing or (o["batch_name"] and qty) else ": для новой нужны название и количество"))
+        name = (b or {}).get("batch_name") or o["batch_name"]
+        p = tech.parse_article(name) if name else {}
+        opts = routes_for(p)
+        rtext = _as_text(get("route"))
+        ropt = resolve_route(rtext, opts, machines) if rtext else (opts[0] if opts else None)
+        if rtext and not ropt:
+            o["errors"].append(f"маршрут «{rtext}» не найден (название маршрута или станки: 235+2100, 2105, MILL)")
+        elif not ropt:
+            o["errors"].append("нет ни одного маршрута")
+        o["route_opt"] = ropt
+        o["route"] = ropt["name"] if ropt else rtext
+        o["route_auto"] = bool(ropt) and not rtext
+        mpc, e5 = parse_min_pc(get("min_pc"), ropt["machines"] if ropt else ())
+        if e5:
+            o["errors"].append(f"Мин/шт: {e5}")
+        o["min_pc"] = _as_text(get("min_pc"))
+        o["mpc"] = mpc
+        o["name"] = name
+        o["parsed"] = p
+        if b and qty and b.get("total_qty") and qty > int(b["total_qty"]):
+            o["warnings"].append(f"количество больше плана партии ({b['total_qty']} шт)")
+        if due and nb and due.date() < nb.date():
+            o["errors"].append("срок раньше даты «Не раньше»")
+        key = (bn, qty, o["due_date"] or "")
+        if bn and key in seen:
+            o["warnings"].append("такой заказ уже загружен — строка будет пропущена")
+            o["status"] = "skip"
+        elif bn and key in in_file:
+            o["warnings"].append("повтор строки в файле — будет пропущена")
+            o["status"] = "skip"
+        in_file.add(key)
+        o.setdefault("status", "error" if o["errors"] else "ok")
+        out.append(o)
+    return out
+
+
+def load_orders(tx, audit, good: list[dict], source: str, user: str) -> int:
+    """Записывает проверенные заказы (и при необходимости создаёт партии) одной транзакцией. → создано партий."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n_new = 0
+    with tx() as conn:
+        for o in good:
+            if o["create"]:
+                cur = conn.execute("INSERT OR IGNORE INTO batches (batch_number, batch_name, total_qty, notes, created_at) "
+                                   "VALUES (?,?,?,?,?)", (o["batch_number"], o["batch_name"], int(o["qty"]),
+                                                          f"создана импортом плана ({source})", now))
+                if cur.rowcount:
+                    n_new += 1
+                    audit(conn, "insert", "batches", cur.lastrowid, None,
+                          {"batch_number": o["batch_number"], "batch_name": o["batch_name"], "total_qty": o["qty"],
+                           "source": "импорт плана"})
+            row = {"batch_number": o["batch_number"], "qty": o["qty"], "route": "" if o["route_auto"] else o["route"],
+                   "not_before": o["not_before"], "due_date": o["due_date"], "priority": o["priority"],
+                   "min_pc": o["min_pc"], "notes": o["notes"], "source": source, "created_by": user, "created_at": now}
+            cur = conn.execute(f"INSERT INTO plan_orders ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                               tuple(row.values()))
+            audit(conn, "insert", "plan_orders", cur.lastrowid, None, row)
+    return n_new
+
+
+def order_planned(items: list[dict]) -> dict:
+    """{order_id: штук в плане} (связка считается один раз)."""
+    seen, out = set(), {}
+    for it in items:
+        oid = it.get("order_id")
+        if oid and it["kind"] == "партия":
+            g = (oid, it.get("grp") or it["id"])
+            if g not in seen:
+                seen.add(g)
+                out[oid] = out.get(oid, 0) + int(it.get("qty") or 0)
+    return out
+
+
+def _order_sort_key(o):
+    return (o.get("priority") is None, o.get("priority") or 0, o.get("due_date") is None, o.get("due_date") or "", o["id"])
+
+
+def place_orders(q, ctx, items: list[dict], orders: list[dict], batches: list[dict], arts: dict, made: set,
+                 hist: pd.DataFrame) -> tuple[list[dict], list[dict]]:
+    """Ставит заказы в план по порядку (приоритет → срок → порядок загрузки), каждый — в конец очереди своих
+    станков, не раньше «Не раньше». Уже стоящие позиции не двигаются. → (новый план, отчёт по заказам)."""
+    work = [dict(i) for i in items]
+    planned = order_planned(items)
+    by_bn = {b["batch_number"]: b for b in batches}
+    report = []
+    for o in sorted(orders, key=_order_sort_key):
+        r = {"Заказ": o["id"], "Партия": o["batch_number"], "Итог": "", "Начало": "", "Окончание": ""}
+        report.append(r)
+        b = by_bn.get(o["batch_number"])
+        left = int(o.get("qty") or (b or {}).get("total_qty") or 0) - planned.get(o["id"], 0)
+        if not b:
+            r["Итог"] = "❌ партии нет во вкладке «Партии»"
+            continue
+        if left <= 0:
+            r["Итог"] = "уже в плане"
+            continue
+        p = (arts.get(o["batch_number"]) or {}).get("parsed") or tech.parse_article(b.get("batch_name") or "")
+        opts = route_options(q, ctx, p)
+        route = resolve_route(o.get("route") or "", opts, ctx["machines"]) if o.get("route") else (opts[0] if opts else None)
+        if not route:
+            r["Итог"] = f"❌ маршрут «{o.get('route')}» не найден"
+            continue
+        mpc, err = parse_min_pc(o.get("min_pc"), route["machines"])
+        if err:
+            r["Итог"] = f"❌ Мин/шт: {err}"
+            continue
+        for n in batch_norms(hist, p, route["machines"]):
+            if n["machine"] not in mpc and n["min_pc"] is not None:
+                mpc[n["machine"]] = n["min_pc"]
+        miss = [m for m in route["machines"] if m not in mpc]
+        if miss:
+            r["Итог"] = "❌ нет нормы мин/шт для " + ", ".join(miss) + " — укажите в столбце «Мин/шт»"
+            continue
+        nb = _dt(o["not_before"]) if o.get("not_before") else None
+        new = new_batch_items(o["batch_number"], left, route, mpc, o.get("notes") or "", queue_end(work, route["machines"], nb),
+                              order_id=o["id"], due=o.get("due_date"))
+        work = place_new(work, new, ctx, arts, made)
+        mine = [w for w in work if w.get("_tmp") in {n["_tmp"] for n in new}]
+        end = max(w["end"] for w in mine)
+        r.update({"Начало": min(w["start"] for w in mine), "Окончание": end,
+                  "Итог": f"✅ {left} шт · {route['name']}" + (f" · ⏰ не успевает к сроку {_d_ru(o['due_date'])}"
+                                                               if o.get("due_date") and end[:10] > o["due_date"] else "")})
+    return work, report
+
+
+def template_xlsx(q, ctx) -> bytes:
+    """Шаблон загрузки плана: лист «План», «Справка» и «Маршруты»."""
+    head = [title for _f, title, _a, _w in ORDER_FIELDS]
+    widths = [w for *_x, w in ORDER_FIELDS]
+    help_rows = [
+        ["Столбец", "Что писать", "Пример"],
+        ["№ партии*", "Номер партии как во вкладке «Партии». Обязательно. Столбец текстовый — номер 311.10 не превратится в 311,1.", "317.4"],
+        ["Название (для новой партии)", "Нужно, только если партии ещё нет и при загрузке включено «создавать отсутствующие партии».", "FNMC12M-8N-SA"],
+        ["Количество, шт", "Сколько поставить в план. Пусто — план партии.", "400"],
+        ["Маршрут / станок", "Название маршрута из технологии или станки: 235+2100, 2105, 2100, АПТ, MILL. Пусто — маршрут по умолчанию для вида фитинга.", "235+2100"],
+        ["Не раньше", "Не начинать раньше этой даты (и времени). Пусто — сразу в конец очереди станков.", "20.10.2026 07:00"],
+        ["Срок", "Срок готовности. В графике партия, которая не успевает к сроку, отмечается ⏰.", "31.10.2026"],
+        ["Приоритет", "1 — самый срочный. Заказы ставятся по приоритету, затем по сроку, затем по порядку строк. Пусто — после всех.", "1"],
+        ["Мин/шт", "Норма времени, если нет истории: одно число на все станки маршрута или по станкам через «;».", "235=0.53; 2100=0.2"],
+        ["Примечание", "Любой текст — попадёт в позицию плана.", "срочно для заказчика"],
+        [],
+        ["Заголовки можно не менять; порядок столбцов любой, лишние столбцы игнорируются. Пустые строки пропускаются."],
+        ["Повторная загрузка того же заказа (партия + количество + срок) пропускается."],
+    ]
+    route_rows = [["Маршрут", "Станки", "Связка (старт одновременно)"]]
+    for o in route_options(q, ctx, {}):
+        route_rows.append([o["name"], " + ".join(o["machines"]), "да" if o["parallel"] else ""])
+    return xlsxlite.write_xlsx([("План", [head], widths, {0}), ("Справка", help_rows, [28, 90, 24]),
+                                ("Маршруты", route_rows, [36, 36, 26])])
+
+
+def _tab_orders(q, tx, audit, all_batches, batch_is_archived):
+    ctx = load_ctx(q)
+    _flash("plan_orders_flash")
+    st.markdown("#### Загрузка плана из Excel")
+    st.caption("Скачайте шаблон, заполните лист «План» (по строке на партию) и загрузите. Система проверит каждую строку; "
+               "загруженные заказы появятся в таблице ниже, откуда их можно поставить в план — по приоритету и сроку, "
+               "в конец очереди станков маршрута.")
+    st.download_button("⬇️ Скачать шаблон Excel", template_xlsx(q, ctx), file_name="шаблон_план_станков.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="plan_tpl")
+    up = st.file_uploader("Файл плана (.xlsx)", type=["xlsx"], key="plan_upload")
+    create_missing = st.checkbox("Создавать отсутствующие партии во вкладке «Партии» (нужны название и количество)",
+                                 key="plan_create_missing")
+    batches = all_batches()
+    orders = q("SELECT * FROM plan_orders ORDER BY id")
+    if up is not None:
+        try:
+            book = xlsxlite.read_xlsx(up.getvalue())
+        except Exception as ex:                      # битый файл — показываем понятную ошибку, а не трассировку
+            st.error(f"Не удалось прочитать файл: {ex}")
+            book = None
+        if book:
+            names = list(book)
+            sheet = "План" if "План" in book else names[0]
+            if len(names) > 1:
+                sheet = st.selectbox("Лист", names, index=names.index(sheet), key="plan_upload_sheet")
+            parsed = parse_orders(book[sheet], batches, lambda p: route_options(q, ctx, p), ctx["machines"], orders,
+                                  create_missing)
+            arch = {b["batch_number"] for b in batches
+                    if batch_is_archived(b.get("archive_state"), b.get("total_qty"), b.get("final_opta"))}
+            for o in parsed:
+                if o.get("batch_number") in arch:
+                    o["warnings"].append("партия в архиве")
+            pv = pd.DataFrame([{"Строка": o["row"], "Партия": o.get("batch_number", ""), "Название": o.get("name", ""),
+                                "Кол-во": o.get("qty"), "Маршрут": (o.get("route") or "") + (" (по умолчанию)" if o.get("route_auto") else ""),
+                                "Не раньше": o.get("not_before") or "", "Срок": _d_ru(o.get("due_date")),
+                                "Приоритет": o.get("priority"), "Мин/шт": o.get("min_pc", ""),
+                                "Итог": {"ok": "✅", "skip": "⏭ пропуск", "error": "❌"}[o["status"]],
+                                "Ошибки / замечания": "; ".join(o["errors"] + o["warnings"])} for o in parsed])
+            st.dataframe(pv, use_container_width=True, hide_index=True)
+            good = [o for o in parsed if o["status"] == "ok"]
+            n_err = sum(o["status"] == "error" for o in parsed)
+            st.caption(f"Строк: {len(parsed)} · к загрузке: {len(good)} · с ошибками: {n_err} · пропуск: "
+                       f"{sum(o['status'] == 'skip' for o in parsed)}. Строки с ошибками не загружаются — исправьте файл и загрузите снова.")
+            if good and st.button(f"📥 Загрузить заказы ({len(good)})", type="primary", key="plan_upload_go"):
+                n_new = load_orders(tx, audit, good, up.name, st.session_state.get("username") or "")
+                st.session_state["plan_orders_flash"] = (True, f"Загружено заказов: {len(good)}" +
+                                                         (f", создано партий: {n_new}" if n_new else "") + ".")
+                st.rerun()
+
+    st.markdown("#### Заказы")
+    if not orders:
+        st.info("Заказов нет. Загрузите файл выше.")
+        return
+    items = load_items(q)
+    planned = order_planned(items)
+    names = {b["batch_number"]: b.get("batch_name") or "" for b in batches}
+    df = pd.DataFrame([{"Выбрать": False, "ID": o["id"], "Партия": o["batch_number"], "Название": names.get(o["batch_number"], "—"),
+                        "Кол-во": o["qty"], "В плане, шт": planned.get(o["id"], 0),
+                        "Статус": ("в плане" if o["qty"] and planned.get(o["id"], 0) >= o["qty"] else
+                                   "частично" if planned.get(o["id"]) else "не в плане"),
+                        "Маршрут": o["route"] or "по умолчанию", "Не раньше": o["not_before"] or "",
+                        "Срок": _d_ru(o["due_date"]), "Приоритет": o["priority"], "Мин/шт": o["min_pc"] or "",
+                        "Примечание": o["notes"] or "", "Файл": o["source"] or ""} for o in sorted(orders, key=_order_sort_key)])
+    ed = st.data_editor(df, hide_index=True, use_container_width=True, key=f"plan_orders_ed_{len(orders)}",
+                        disabled=[c for c in df.columns if c != "Выбрать"],
+                        column_config={"Выбрать": st.column_config.CheckboxColumn(width="small")})
+    sel = [int(r["ID"]) for r in ed.to_dict("records") if r["Выбрать"]]
+    todo = [o for o in orders if not (o["qty"] and planned.get(o["id"], 0) >= o["qty"])]
+    c1, c2, c3 = st.columns(3)
+    go_sel = c1.button(f"📌 Поставить выбранные в план ({len(sel)})", disabled=not sel, key="plan_orders_place_sel")
+    go_all = c2.button(f"📌 Поставить все непоставленные ({len(todo)})", disabled=not todo, key="plan_orders_place_all",
+                       type="primary")
+    with c3.popover(f"🗑 Удалить выбранные заказы ({len(sel)})", disabled=not sel):
+        st.write("Удаляются только строки заказов. Уже поставленные в план позиции остаются в графике.")
+        if st.button("Да, удалить", key="plan_orders_del", type="primary"):
+            with tx() as conn:
+                for oid in sel:
+                    old = conn.execute("SELECT * FROM plan_orders WHERE id=?", (oid,)).fetchone()
+                    conn.execute("DELETE FROM plan_orders WHERE id=?", (oid,))
+                    audit(conn, "delete", "plan_orders", oid, dict(old) if old else None)
+            st.session_state["plan_orders_flash"] = (True, f"Удалено заказов: {len(sel)}.")
+            st.rerun()
+    if go_sel or go_all:
+        chosen = [o for o in orders if o["id"] in set(sel)] if go_sel else todo
+        arts = article_info(q, batches)
+        hist = tech.load_history(q)
+        res, report = place_orders(q, ctx, items, chosen, batches, arts, made_from_history(hist), hist)
+        bad = conflicts(res)
+        if bad:
+            st.session_state["plan_orders_flash"] = (False, "План не сохранён: " + "; ".join(bad[:3]))
+        elif any(r.get("_tmp") for r in res):
+            save_result(tx, audit, items, res)
+            st.session_state["plan_orders_flash"] = (True, "Заказы поставлены в план — см. отчёт ниже и вкладку «🗓 График».")
+        else:
+            st.session_state["plan_orders_flash"] = (False, "Ничего не поставлено — см. отчёт ниже.")
+        st.session_state["plan_orders_report"] = report
+        st.rerun()
+    rep = st.session_state.pop("plan_orders_report", None)
+    if rep:
+        st.markdown("**Отчёт о постановке**")
+        st.dataframe(pd.DataFrame(rep), use_container_width=True, hide_index=True)
